@@ -467,6 +467,13 @@ export const SHELL_ESCAPE_DENYLIST: readonly string[] = [
   'Bash(*--upload-pack*)',
   'Bash(*--receive-pack*)',
   'Bash(*--exec-path*)',
+  // AL-1: `git diff --output=<path>` writes an arbitrary file; `--no-index`
+  // diffs paths outside the repo (bypasses the Read denies); `--ext-diff`/
+  // `--textconv` run a configured external program.
+  'Bash(*--output*)',
+  'Bash(*--no-index*)',
+  'Bash(*--ext-diff*)',
+  'Bash(*--textconv*)',
   // NOT denied here: `git -c …` and `core.hooksPath` in general. The worker's
   // own allow rule is `Bash(git -c core.hooksPath=/dev/null commit -m *)` — it
   // disables repo hooks on purpose — and deny beats allow, so a blanket deny

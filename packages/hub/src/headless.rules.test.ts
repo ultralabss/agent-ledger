@@ -257,3 +257,41 @@ test('triage and worker share one denylist, no drift', () => {
     assert.ok(triage.deny.includes(rule), `triage is missing shell deny rule ${rule}`);
   }
 });
+
+test('AL-1: worker git allowlist is exact read-only forms; --output/--no-index/ext-diff denied', () => {
+  const args = buildWorkerArgs('/home/user/repo');
+  const allowed = args.slice(args.indexOf('--allowedTools') + 1, args.indexOf('--disallowedTools'));
+  for (const wide of ['Bash(git diff*)', 'Bash(git log*)', 'Bash(git show*)', 'Read']) {
+    assert.ok(!allowed.includes(wide), `allowlist still contains ${wide}`);
+  }
+  for (const rule of [
+    'Bash(git status*)',
+    'Bash(git diff --name-only*)',
+    'Bash(git log --oneline*)',
+    'Bash(git show --stat*)',
+    'Read(//home/user/repo/**)',
+  ]) {
+    assert.ok(allowed.includes(rule), `allowlist missing ${rule}`);
+  }
+  for (const rule of ['Bash(*--output*)', 'Bash(*--no-index*)', 'Bash(*--ext-diff*)', 'Bash(*--textconv*)']) {
+    assert.ok(worker.deny.includes(rule), `worker missing deny ${rule}`);
+    assert.ok(triage.deny.includes(rule), `triage missing deny ${rule}`);
+  }
+  for (const cmd of [
+    'git diff --output=/tmp/x',
+    'git diff --name-only --output=/tmp/x',
+    'git diff --no-index /etc/passwd /dev/null',
+    'git diff --name-only --no-index ~/.ssh/id_ed25519 /dev/null',
+    'git log --oneline --ext-diff',
+    'git show --stat --textconv HEAD',
+    'git diff HEAD',
+    'git show HEAD',
+    'git log -p',
+  ]) {
+    assert.notEqual(decide(worker, 'Bash', cmd), 'allow', `worker allowed: ${cmd}`);
+  }
+  assert.equal(decide(worker, 'Bash', 'git diff --name-only HEAD~1'), 'allow');
+  assert.equal(decide(worker, 'Bash', 'git log --oneline -5'), 'allow');
+  assert.equal(decide(worker, 'Read', '/etc/passwd'), 'ask');
+  assert.equal(decide(worker, 'Read', '/home/user/repo/src/x.ts'), 'allow');
+});

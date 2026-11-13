@@ -489,7 +489,7 @@ test('rule 1: the ledger is not edited, `CONTEXT.md` is an exception', async (t)
 
 test('symlink to the ledger does not bypass rule 1, a symlink to CONTEXT.md may pass', async (t) => {
   const fx = await startTestHub();
-  const x = await makeCommittedRepo('xsymlink');
+  const x = await makeCommittedRepo('sl');
   t.after(async () => {
     await fx.cleanup();
     await x.cleanup();

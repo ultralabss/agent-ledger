@@ -312,6 +312,12 @@ test('commits overwrite ONE session.summary instead of adding lines', async () =
   try {
     await fx.api('POST', '/v1/repos', { slug: 'app', prefix: 'AP', path: code.path });
     await fx.hook('session-start', { session_id: 'sess-34', cwd: code.path, source: 'startup' });
+    // Flake guard: the summary window starts at the session's first fact
+    // (`first_at`) and keeps `changes.at >= first_at`. The create route records
+    // its change and only then its activity fact, so on a millisecond boundary
+    // `first_at` lands 1 ms after the change and the item drops out of the
+    // line. Pin `first_at` to before the create.
+    fx.hub.summarizer.noteActivity('sess-34', 'app', Date.now() - 1000);
     const created = await fx.api('POST', '/v1/items', {
       repo: 'app',
       title: 'Add an index on order_id',

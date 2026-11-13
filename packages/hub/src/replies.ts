@@ -621,7 +621,9 @@ export function buildWorkerArgs(cwd: string): string[] {
     '--permission-mode',
     'acceptEdits',
     '--allowedTools',
-    'Read',
+    // AL-1: Read is repo-scoped, not free — a bare `Read` is the second half of
+    // the `git diff --no-index` bypass (reads past the `~/.claude` Read denies).
+    `Read(//${repoAbs}/**)`,
     'Grep',
     'Glob',
     `Edit(//${repoAbs}/**)`,
@@ -645,9 +647,13 @@ export function buildWorkerArgs(cwd: string): string[] {
     'Bash(ledger brief *)',
     'Bash(ledger comment *)',
     'Bash(git status*)',
-    'Bash(git diff*)',
-    'Bash(git log*)',
-    'Bash(git show*)',
+    // AL-1: exact read-only forms only. `git diff*`/`log*`/`show*` also matched
+    // `git diff --output=<path>` (arbitrary write) and `git diff --no-index`
+    // (reads any file, bypassing the Read deny rules). Content-bearing output
+    // is reachable through the repo-scoped `Read` instead.
+    'Bash(git diff --name-only*)',
+    'Bash(git log --oneline*)',
+    'Bash(git show --stat*)',
     // R4-03: explicit paths only (`git add -- <file>`), no `git add -A`/`.` shorthand.
     'Bash(git add -- *)',
     // H23-1: `-m *` only — a bare `commit *` allow also matched `-F <file>`/
