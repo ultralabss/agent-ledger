@@ -12,6 +12,6 @@
     "@agent-ledger/shared": "workspace:*",
     "hono": "^4.9.10",
     "yaml": "^2.8.1",
-    "zod": "^3.25.76"
+    "zod": "^4.6.6"
   }
 }

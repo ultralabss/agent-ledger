@@ -152,7 +152,7 @@ export interface ItemRepair {
 
 function repairFrontmatter(
   raw: unknown,
-  issues: readonly { path: readonly (string | number)[]; message: string }[],
+  issues: readonly { path: readonly PropertyKey[]; message: string }[],
 ): { fm: Record<string, unknown>; repairs: ItemRepair[] } | null {
   if (typeof raw !== 'object' || raw === null) return null;
   const fm: Record<string, unknown> = { ...(raw as Record<string, unknown>) };
@@ -166,7 +166,7 @@ function repairFrontmatter(
         ? (parent as Record<string, unknown>)[String(issue.path[1])]
         : fm[root];
     repairs.push({
-      path: issue.path.join('.'),
+      path: issue.path.map(String).join('.'),
       value: String(before ?? '').slice(0, 200),
       message: issue.message,
     });
