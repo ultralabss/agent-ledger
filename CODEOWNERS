@@ -1,0 +1,26 @@
+# Every path needs an owner's review (branch protection: "Require review from Code Owners").
+# Replace @OWNER with the maintainer's GitHub user or team before publishing (docs/REPO-SETTINGS.md).
+*                              @OWNER
+
+# Supply chain, CI and installers: always the owner.
+/.github/                      @OWNER
+/CODEOWNERS                    @OWNER
+/adapters/                     @OWNER
+/install.sh                    @OWNER
+/uninstall.sh                  @OWNER
+/package.json                  @OWNER
+/pnpm-lock.yaml                @OWNER
+/pnpm-workspace.yaml           @OWNER
+/.gitleaks.toml                @OWNER
+/scripts/                      @OWNER
+/SECURITY.md                   @OWNER
+/CONTRIBUTING.md               @OWNER
+/AGENTS.md                     @OWNER
+/packages/*/package.json       @OWNER
+
+# Security-relevant hub code.
+/packages/hub/src/guard/       @OWNER
+/packages/hub/src/security/    @OWNER
+/packages/hub/src/http/        @OWNER
+/packages/hub/src/gitleaks.ts  @OWNER
+/packages/shared/src/secrets*  @OWNER

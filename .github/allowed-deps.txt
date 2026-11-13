@@ -1,0 +1,36 @@
+# Allowlist for scripts/deps-gate.mjs. Changing this file needs CODEOWNERS review.
+# dep <name>    direct dependency allowed in any package.json
+# build <name>  package allowed to have an install/postinstall script or gypfile
+# Transitive dependencies are covered by the frozen lockfile, `pnpm audit` and
+# `pnpm install --ignore-scripts`; the gate fails on any install script outside `build`.
+
+dep @fontsource-variable/jetbrains-mono
+dep @fontsource-variable/space-grotesk
+dep @hono/node-server
+dep @tailwindcss/vite
+dep @tanstack/react-query
+dep @types/node
+dep @types/react
+dep @types/react-dom
+dep @vitejs/plugin-react
+dep class-variance-authority
+dep cmdk
+dep cn
+dep hono
+dep lucide-react
+dep next-themes
+dep radix-ui
+dep react
+dep react-dom
+dep react-markdown
+dep react-router
+dep shadcn
+dep sonner
+dep tailwindcss
+dep tw-animate-css
+dep typescript
+dep vite
+dep yaml
+dep zod
+
+build esbuild
