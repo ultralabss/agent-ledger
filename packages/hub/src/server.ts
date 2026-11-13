@@ -338,36 +338,73 @@ export async function startHub(opts: StartOptions = {}): Promise<HubHandle> {
     }),
   });
 
-  const server: ServerType = await new Promise((resolvePromise, reject) => {
-    let listening = false;
-    const s = serve({ fetch: app.fetch, port: config.port, hostname: '127.0.0.1' }, () => {
-      listening = true;
-      resolvePromise(s);
-    });
-    s.on('error', (err: NodeJS.ErrnoException) => {
-      // The PostToolUse hook is fire-and-forget — when the marker says
-      // the hub owes it nothing, it closes the socket without reading the
-      // response. The write then fails with EPIPE/ECONNRESET, which is the
-      // *expected* shape of a fast hook, not a fault. Logging it would fill
-      // hub.log with one line per tool call of every session and bury the
-      // errors that matter.
-      if (err.code === 'EPIPE' || err.code === 'ECONNRESET') return;
-      if (listening) {
-        log(`server: ${String(err)}`);
-        return;
-      }
-      // Before `listen` succeeded an error is fatal (port in use, EACCES).
-      reject(err);
-    });
-    // Per-connection errors never reach the server emitter on some Node
-    // versions, so the same tolerance is applied where the socket lives.
-    s.on('connection', (socket) => {
-      socket.on('error', (err: NodeJS.ErrnoException) => {
+  // LH-1: the UI login URL uses `ledger.localhost:<port>`, which a client may
+  // resolve to `::1` first. A hub bound only to 127.0.0.1 would leave `[::1]:<port>`
+  // free for another local account, which would then receive the one-time
+  // login code. So the same port is bound on `::1` too, fail-closed.
+  const listenOne = (port: number, hostname: '127.0.0.1' | '::1'): Promise<ServerType> =>
+    new Promise((resolvePromise, reject) => {
+      let listening = false;
+      const s = serve({ fetch: app.fetch, port, hostname }, () => {
+        listening = true;
+        resolvePromise(s);
+      });
+      s.on('error', (err: NodeJS.ErrnoException) => {
+        // The PostToolUse hook is fire-and-forget — when the marker says
+        // the hub owes it nothing, it closes the socket without reading the
+        // response. The write then fails with EPIPE/ECONNRESET, which is the
+        // *expected* shape of a fast hook, not a fault. Logging it would fill
+        // hub.log with one line per tool call of every session and bury the
+        // errors that matter.
         if (err.code === 'EPIPE' || err.code === 'ECONNRESET') return;
-        log(`socket: ${String(err)}`);
+        if (listening) {
+          log(`server: ${String(err)}`);
+          return;
+        }
+        // Before `listen` succeeded an error is fatal (port in use, EACCES).
+        reject(err);
+      });
+      // Per-connection errors never reach the server emitter on some Node
+      // versions, so the same tolerance is applied where the socket lives.
+      s.on('connection', (socket) => {
+        socket.on('error', (err: NodeJS.ErrnoException) => {
+          if (err.code === 'EPIPE' || err.code === 'ECONNRESET') return;
+          log(`socket: ${String(err)}`);
+        });
       });
     });
-  });
+  const closeOne = (s: ServerType): Promise<void> =>
+    new Promise<void>((resolvePromise) => s.close(() => resolvePromise()));
+
+  const servers: ServerType[] = [];
+  for (let attempt = 0; ; attempt++) {
+    const v4 = await listenOne(config.port, '127.0.0.1');
+    const boundPort = (v4.address() as AddressInfo | null)?.port ?? config.port;
+    try {
+      const v6 = await listenOne(boundPort, '::1');
+      servers.push(v4, v6);
+    } catch (err) {
+      const code = (err as NodeJS.ErrnoException).code;
+      if (code === 'EADDRNOTAVAIL' || code === 'EAFNOSUPPORT') {
+        // No IPv6 loopback on this machine: nothing to squat on.
+        log(`server: ::1 unavailable (${code}), listening on 127.0.0.1 only`);
+        servers.push(v4);
+      } else {
+        await closeOne(v4);
+        // Port 0 = ephemeral: the v4 port was random, try another pair.
+        if (config.port === 0 && code === 'EADDRINUSE' && attempt < 8) continue;
+        if (code === 'EADDRINUSE') {
+          throw new Error(
+            `port ${boundPort} is already in use on ::1 — refusing to start: another process could receive the UI login code`,
+            { cause: err },
+          );
+        }
+        throw err;
+      }
+    }
+    break;
+  }
+  const server = servers[0] as ServerType;
   const address = server.address() as AddressInfo | null;
   guardCfg.port = address?.port ?? config.port;
 
@@ -510,7 +547,7 @@ export async function startHub(opts: StartOptions = {}): Promise<HubHandle> {
       await hooks.settled().catch(() => undefined);
       // A worker run holds a child process; closing under it would leak it.
       await replies.background.catch(() => undefined);
-      await new Promise<void>((resolvePromise) => server.close(() => resolvePromise()));
+      await Promise.all(servers.map(closeOne));
       await ledger.close();
       store.close();
     },
