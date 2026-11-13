@@ -5,7 +5,7 @@
  * subscription, not on an API key. That is the whole reason for the flag choice:
  *   -p                      non-interactive, print and exit
  *   --append-system-prompt  the `ledger-keeper` role, verbatim from the agent file
- *   --allowedTools          `Bash(ledger *)` + `Read` scoped to the ledger dir,
+ *   --allowedTools          the explicit keeper `Bash(ledger <subcmd> *)` list (UL-651) + `Read` scoped to the ledger dir,
  *                           plus `--disallowedTools` for `~/.ssh`, `~/.aws`,
  *                           `.env*`, `~/.claude` (§15, audit H3)
  *   --permission-mode default   no bypass — the allow-list is the permission
@@ -497,6 +497,31 @@ export const SHELL_ESCAPE_DENYLIST: readonly string[] = [
   'Bash(*--template*)',
 ];
 
+/**
+ * UL-651 (AL-3): the headless triage/groom run reads untrusted intake text, so
+ * `Bash(ledger *)` was too wide — an injection could reach `ledger guard off`,
+ * `override`, `adopt`, `intrude`, `dup --into`, `open`. Only the subcommands
+ * the keeper prompts actually use; each as bare + `<cmd> *` form.
+ */
+const KEEPER_LEDGER_SUBCOMMANDS = [
+  'intake ls',
+  'intake show',
+  'intake triage',
+  'add',
+  'ls',
+  'show',
+  'check',
+  'search',
+  'who',
+  'dups',
+  'note',
+  'release',
+] as const;
+export const KEEPER_ALLOWED_BASH: readonly string[] = KEEPER_LEDGER_SUBCOMMANDS.flatMap((c) => [
+  `Bash(ledger ${c})`,
+  `Bash(ledger ${c} *)`,
+]);
+
 export function buildHeadlessArgs(ledgerRoot: string, prompt: string, system: string): string[] {
   const ledgerRootAbs = ledgerRoot.replace(/^\/+/, '');
   return [
@@ -506,7 +531,7 @@ export function buildHeadlessArgs(ledgerRoot: string, prompt: string, system: st
     system,
     // Variadic flag: each tool is its own argv entry, never one joined string.
     '--allowedTools',
-    'Bash(ledger *)',
+    ...KEEPER_ALLOWED_BASH,
     `Read(//${ledgerRootAbs}/**)`,
     '--disallowedTools',
     ...CLAUDE_HOME_READ_DENYLIST,

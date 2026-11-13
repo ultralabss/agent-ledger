@@ -10,6 +10,7 @@ import {
   HeadlessRunner,
   SHELL_ESCAPE_DENYLIST,
   buildHeadlessArgs,
+  KEEPER_ALLOWED_BASH,
   nextMondayNine,
   resultText,
   stripFrontmatter,
@@ -137,10 +138,11 @@ test('runIntake: runs the binary with exact flags, cwd = ledger, headless env', 
   // behaviour in `headless.rules.test.ts`.
   const tail = args.slice(4);
   assert.deepEqual(
-    tail.slice(0, 4),
-    ['--allowedTools', 'Bash(ledger *)', `Read(//${ledgerRoot}/**)`, '--disallowedTools'],
-    'allow list is exactly: ledger commands + the ledger dir',
+    tail.slice(0, KEEPER_ALLOWED_BASH.length + 3),
+    ['--allowedTools', ...KEEPER_ALLOWED_BASH, `Read(//${ledgerRoot}/**)`, '--disallowedTools'],
+    'allow list is exactly: the keeper ledger subcommands + the ledger dir',
   );
+  assert.ok(!tail.includes('Bash(ledger *)'), 'UL-651: no blanket ledger allow');
   const deny = tail.slice(4, tail.indexOf('--permission-mode'));
   for (const rule of CLAUDE_HOME_READ_DENYLIST) {
     assert.ok(deny.includes(rule), `missing shared deny rule ${rule}`);

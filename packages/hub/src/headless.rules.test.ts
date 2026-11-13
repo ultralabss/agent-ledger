@@ -295,3 +295,21 @@ test('AL-1: worker git allowlist is exact read-only forms; --output/--no-index/e
   assert.equal(decide(worker, 'Read', '/etc/passwd'), 'ask');
   assert.equal(decide(worker, 'Read', '/home/user/repo/src/x.ts'), 'allow');
 });
+
+test('UL-651: keeper cannot reach guard/override/adopt/intrude/dup/open/done', () => {
+  for (const cmd of [
+    'ledger guard off',
+    'ledger override ACME-1',
+    'ledger adopt x',
+    'ledger intrude begin x',
+    'ledger dup A-1 --into A-2',
+    'ledger open',
+    'ledger done A-1',
+    'ledger spool retry',
+  ]) {
+    assert.notEqual(decide(triage, 'Bash', cmd), 'allow', `keeper allowed: ${cmd}`);
+  }
+  for (const cmd of ['ledger ls --repo r --open', 'ledger note A-1 "x"', 'ledger intake triage 5 --items a', 'ledger add "t" --repo r --proposed']) {
+    assert.equal(decide(triage, 'Bash', cmd), 'allow', `keeper denied: ${cmd}`);
+  }
+});
