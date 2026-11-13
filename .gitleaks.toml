@@ -1,0 +1,14 @@
+title = "agent-ledger"
+
+[extend]
+useDefault = true
+
+# The secret scanner and its tests contain deliberately fake credentials.
+[[allowlists]]
+description = "fake credentials in test fixtures"
+paths = [
+  '''packages/shared/src/secrets\.test\.ts''',
+  '''packages/hub/src/gitleaks\.test\.ts''',
+  '''packages/hub/src/http/hub50\.test\.ts''',
+  '''packages/hub/src/security/origin\.test\.ts''',
+]

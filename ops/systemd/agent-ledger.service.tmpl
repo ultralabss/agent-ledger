@@ -1,0 +1,35 @@
+# Template. `install.sh` renders it to
+# ~/.config/systemd/user/<label>.service (default label io.agent-ledger.hub)
+# and substitutes:
+#   @NODE@       absolute path to node (quoted, `%` and `$` escaped)
+#   @HUB@        absolute path to packages/hub/src/bin.ts
+#   @LEDGER@     absolute path to the ledger dir
+#   @PORT@       LEDGER_HUB_PORT
+#   @LOG@        <ledger>/.hub/hub.log
+#   @EXTRA_ENV@  extra Environment= lines: optional-feature flags that were set
+#                in the installer's environment and, with `--headless`,
+#                LEDGER_HEADLESS / LEDGER_CLAUDE_BIN (see the plist template).
+# No shell is involved: ExecStart runs node directly with an absolute path.
+[Unit]
+Description=Agent Ledger hub (shared memory for parallel coding agents)
+After=network.target
+
+[Service]
+Type=simple
+# --disable-warning must come BEFORE the script path to be a node flag.
+ExecStart="@NODE@" --disable-warning=ExperimentalWarning "@HUB@"
+Environment="PATH=/usr/local/bin:/usr/bin:/bin"
+Environment="LEDGER_DIR=@LEDGER@"
+Environment="LEDGER_HUB_PORT=@PORT@"
+Environment="NODE_ENV=production"
+@EXTRA_ENV@
+Restart=on-failure
+RestartSec=10
+# SIGTERM commits the ledger (a git commit + secret scan can take a few
+# seconds); the default 90 s is plenty, but keep it explicit and bounded.
+TimeoutStopSec=30
+StandardOutput=append:@LOG@
+StandardError=append:@LOG@
+
+[Install]
+WantedBy=default.target

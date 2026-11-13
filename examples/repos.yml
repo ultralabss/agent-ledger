@@ -1,0 +1,30 @@
+# Example `repos.yml` for the ledger directory (default ~/.ledger/repos.yml).
+# You normally do not write this by hand: `ledger repo add` maintains it.
+#   ledger repo add acme --path /home/user/projects/acme --prefix ACME
+# Keys are repo slugs ([a-z0-9-]+). `next` is the next item number; the hub
+# owns it, so leave it alone once the repo exists.
+
+acme:
+  prefix: ACME                       # 2-4 uppercase letters; items become ACME-1, ACME-2, ...
+  path: /home/user/projects/acme     # git checkout the hub watches (null for a virtual repo)
+  next: 1
+  # docs: [docs/architecture.md]     # files `ledger brief` points new sessions at
+  # graphify: /home/user/projects/acme/graphify-out
+  #
+  # Optional cross-repo features (off unless the matching flag is enabled in the hub):
+  # contracts:                       # repo-relative globs whose change is a public contract change
+  #   - "src/api/**"
+  #   - "openapi.yml"
+  # consumers: [web]                 # slugs that are told when a contract changes
+  #                                  # (see LEDGER_INTRUDE in examples/README.md)
+
+web:
+  prefix: WEB
+  path: /home/user/projects/acme-web
+  next: 1
+
+ops:
+  kind: system                       # virtual repo for infrastructure items; no path, no git
+  prefix: OPS
+  path: null
+  next: 1

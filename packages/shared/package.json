@@ -1,0 +1,14 @@
+{
+  "name": "@agent-ledger/shared",
+  "version": "0.1.0",
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts",
+    "./api": "./src/api.ts",
+    "./snowflake": "./src/snowflake.ts"
+  },
+  "dependencies": {
+    "yaml": "^2.8.1",
+    "zod": "^3.25.76"
+  }
+}

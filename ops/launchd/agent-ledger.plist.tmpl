@@ -1,0 +1,81 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Template. `install.sh` renders it to
+  ~/Library/LaunchAgents/<label>.plist (default label io.agent-ledger.hub)
+  and substitutes:
+    @LABEL@      the service label (AGENT_LEDGER_LABEL)
+    @NODE@       absolute path to node (launchd has no PATH of its own)
+    @HUB@        absolute path to packages/hub/src/bin.ts
+    @LEDGER@     absolute path to the ledger dir
+    @PORT@       LEDGER_HUB_PORT
+    @LOG@        <ledger>/.hub/hub.log
+    @EXTRA_ENV@  extra <key>/<string> pairs: optional-feature flags that were
+                 set in the installer's environment (LEDGER_PUSH,
+                 LEDGER_INTRUDE, ...) and, with `install.sh --headless`,
+                 LEDGER_HEADLESS and LEDGER_CLAUDE_BIN. With
+                 `--trust-claude-group` it also carries
+                 LEDGER_TRUST_CLAUDE_GROUP, LEDGER_TRUST_CLAUDE_GID and
+                 LEDGER_TRUST_CLAUDE_REALPATH: the opt-in only applies to the
+                 group and the path the installer saw. Editing any of them by
+                 hand turns headless off with a message, not a wider trust.
+-->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>@LABEL@</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>@NODE@</string>
+    <!-- node:sqlite prints an ExperimentalWarning at every start, which is the
+         first thing in hub.log after each restart and buries the real boot
+         lines. Node 22.22 supports --disable-warning; it must come BEFORE the
+         script path to be a node flag and not an argv entry. -->
+    <string>--disable-warning=ExperimentalWarning</string>
+    <string>@HUB@</string>
+  </array>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <!-- node/git are absolute (@NODE@, and git.ts resolves git itself), so the
+         hub needs nothing from /opt/homebrew or /usr/local. -->
+    <string>/usr/bin:/bin:/usr/sbin:/sbin</string>
+    <key>LEDGER_DIR</key>
+    <string>@LEDGER@</string>
+    <key>LEDGER_HUB_PORT</key>
+    <string>@PORT@</string>
+    <key>NODE_ENV</key>
+    <string>production</string>
+@EXTRA_ENV@
+  </dict>
+
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>ThrottleInterval</key>
+  <integer>10</integer>
+  <!-- `Background` would put the hub AND its children into the throttled CPU/IO
+       band (macOS lowers their scheduling and disk priority). Measured effect:
+       a ~100 ms synchronous FTS rebuild grew into a 764 ms event-loop stall,
+       and the gitleaks child hit its 10 s timeout after every wake — so the
+       ledger stopped committing and the hook reported a hub that is actually
+       running as down. `Standard` is the band for a process that must answer a
+       request on time; this one has a 1 s hook budget. It is not
+       `Interactive`: the hub is not UI. -->
+  <key>ProcessType</key>
+  <string>Standard</string>
+  <!-- SIGTERM commits the ledger (bin.ts) — a git commit + gitleaks scan can
+       take a few seconds, and launchd's default 20 s would SIGKILL it
+       mid-commit on logout/reinstall. -->
+  <key>ExitTimeOut</key>
+  <integer>30</integer>
+
+  <key>StandardOutPath</key>
+  <string>@LOG@</string>
+  <key>StandardErrorPath</key>
+  <string>@LOG@</string>
+</dict>
+</plist>

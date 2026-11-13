@@ -1,0 +1,14 @@
+# H6-1 — fixed config gitleaks is always invoked with (`--config`).
+#
+# gitleaks auto-discovers a `.gitleaks.toml`/`gitleaks.toml` at the root of the
+# scanned repo when no `--config` is given. The scanned repo here is the
+# ledger, which agents write files into — a planted config could redefine
+# `allowlist` or set `[extend] useDefault = false` with no rules and silently
+# disable the second line of defence. Pointing `--config` at THIS file (a path
+# outside the ledger, shipped with the hub) always wins over repo discovery,
+# so a forged ledger-local config can never take effect.
+#
+# `useDefault = true` extends gitleaks' own built-in ruleset — same detection
+# coverage as running with no config at all, just not sourced from the repo.
+[extend]
+useDefault = true

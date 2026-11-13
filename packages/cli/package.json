@@ -1,0 +1,17 @@
+{
+  "name": "@agent-ledger/cli",
+  "version": "0.1.0",
+  "type": "module",
+  "bin": {
+    "ledger": "./src/bin.ts"
+  },
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "dependencies": {
+    "@agent-ledger/shared": "workspace:*"
+  },
+  "devDependencies": {
+    "@agent-ledger/hub": "workspace:*"
+  }
+}

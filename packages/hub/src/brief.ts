@@ -1,0 +1,280 @@
+/** Briefing for a new session — SPEC §9.
+ *
+ *  F1 adds the live header: `repo · branch ↑n · last release v0.x (MM-DD)`
+ *  plus a `Live:` line per other live session with its item, idle time and
+ *  claimed paths. Hard cap 30 lines (`full` lifts it to the whole open list +
+ *  14 days). `live` is optional so `GET /v1/brief` without a session (and every
+ *  F0 test) still works. */
+
+import {
+  isOpen,
+  parseStamp,
+  repoKindOf,
+  type Decision,
+  type GitHeadView,
+  type Item,
+  type JournalEvent,
+  type ReleaseView,
+  type SessionView,
+  type TouchedView,
+} from '@agent-ledger/shared';
+
+/** Header tag for repos without a git checkout. A plain `repo` with no
+ *  path stays "virtual repo" (old behaviour); system / vps are first-class,
+ *  not a failure to find a checkout. */
+function kindLabel(cfg: { kind?: 'repo' | 'system' | 'vps'; host?: string; path: string | null }): string {
+  const kind = repoKindOf(cfg);
+  if (kind === 'system') return ' · system';
+  if (kind === 'vps') return cfg.host ? ` · vps ${cfg.host}` : ' · vps';
+  return cfg.path ? '' : ' · virtual repo';
+}
+import { sessionTag } from './sessions.ts';
+import type { Ledger } from './ledger/ledger.ts';
+
+export interface BriefLive {
+  sessions: SessionView[];
+  /** The session the briefing is for — it is not listed as "somebody else". */
+  self?: string | undefined;
+  git?: GitHeadView | null | undefined;
+  release?: ReleaseView | null | undefined;
+  orphans?: TouchedView[] | undefined;
+}
+
+export interface BriefOptions {
+  repo?: string | undefined;
+  full?: boolean | undefined;
+  live?: BriefLive | undefined;
+  /** `CONTEXT.md may be stale …`, computed by the caller (it
+   *  needs an fs stat, and the brief is synchronous below this line). */
+  staleContext?: string | null | undefined;
+  /** `startup` shows 3 queue rows instead of 5. `resume` with nothing
+   *  new never reaches here — `sessionStart` answers with one line. */
+  lean?: boolean | undefined;
+}
+
+const MAX_LINES = 30;
+
+/** Rows of `Up next` in a lean (startup) brief. The full list is one
+ *  `ledger brief --full` away, and it was the single biggest block in the
+ *  measured brief. */
+const LEAN_QUEUE = 3;
+const RECENT_TYPES = new Set(['item.status', 'decision', 'session.summary', 'release']);
+
+function recent(events: JournalEvent[], days: number): JournalEvent[] {
+  const cutoff = Date.now() - days * 86_400_000;
+  return events.filter((ev) => {
+    if (!RECENT_TYPES.has(ev.type)) return false;
+    if (ev.type === 'item.status' && !ev.fields.some((f) => f.includes('→done'))) return false;
+    const t = parseStamp(ev.at);
+    return t === null || t.getTime() >= cutoff;
+  });
+}
+
+function eventDigest(ev: JournalEvent): string {
+  const head = ev.at.slice(5, 10);
+  const body = ev.fields.join(' ').replace(/\s+/g, ' ').trim();
+  const text = body.length > 60 ? `${body.slice(0, 59)}…` : body;
+  return `${head} ${text || ev.type}`;
+}
+
+function shortTitle(item: Item, max = 52): string {
+  const t = item.fm.title.replace(/\s+/g, ' ').trim();
+  return t.length > max ? `${t.slice(0, max - 1)}…` : t;
+}
+
+/** `↑2 ↓1` — ahead/behind, omitted when zero or unknown. */
+function aheadBehind(git: GitHeadView | null | undefined): string {
+  if (!git) return '';
+  const parts: string[] = [];
+  if (git.ahead && git.ahead > 0) parts.push(`↑${git.ahead}`);
+  if (git.behind && git.behind > 0) parts.push(`↓${git.behind}`);
+  return parts.length > 0 ? ` ${parts.join(' ')}` : '';
+}
+
+function liveLines(live: BriefLive, full: boolean): string[] {
+  const lines: string[] = [];
+  const others = live.sessions.filter((s) => s.id !== live.self && s.liveness !== 'ended');
+  for (const s of others.slice(0, full ? others.length : 4)) {
+    const mins = Math.round(s.idle_ms / 60_000);
+    const items = s.items.length > 0 ? ` ${s.items.join(',')}` : '';
+    const agents = s.agents.length > 0 ? ` [${s.agents.slice(0, 3).join(',')}]` : '';
+    lines.push(
+      `Live: ${sessionTag(s)}${items} ${s.liveness}${agents} · ${
+        mins === 0 ? 'just now' : `${mins} min`
+      } · ${s.touched_count} files`,
+    );
+  }
+  const orphans = live.orphans ?? [];
+  if (orphans.length > 0) {
+    lines.push(
+      `Orphans (${orphans.length}): ${orphans
+        .slice(0, 4)
+        .map((o) => o.rel_path)
+        .join(', ')}${orphans.length > 4 ? ' …' : ''} — ledger adopt`,
+    );
+  }
+  return lines;
+}
+
+function repoBrief(
+  ledger: Ledger,
+  repo: string,
+  full: boolean,
+  context: string | null,
+  live?: BriefLive | undefined,
+  extra: { staleContext?: string | null | undefined; lean?: boolean | undefined } = {},
+): string[] {
+  const cfg = ledger.repo(repo);
+  const items = ledger.listItems({ repo });
+  const open = items.filter((i) => isOpen(i.fm.status));
+  const doing = open.filter((i) => i.fm.status === 'doing');
+  const lines: string[] = [];
+
+  // SPEC §9 header: `acme · main ↑2 · last release v0.26.0 (09-28)`.
+  // Without a git reader (no live context, virtual repo, unreadable checkout)
+  // there is nothing to put there, so the counts stay on line 1 — that is the
+  // F0 shape and the CLI/`brief` tests pin it.
+  const git = live?.git;
+  const release = live?.release;
+  const gitBits = [
+    git?.branch ? `${git.branch}${aheadBehind(git)}` : git ? 'detached HEAD' : null,
+    release ? `last release ${release.tag}${release.at ? ` (${release.at.slice(5, 10)})` : ''}` : null,
+  ].filter((p): p is string => p !== null && p !== '');
+  const counts = `${open.length} open, ${doing.length} doing, ${items.length} total${
+    kindLabel(cfg)
+  }${cfg.onboarded === false ? ' · onboarded=false' : ''}`;
+
+  if (gitBits.length > 0) {
+    lines.push(`${repo} · ${gitBits.join(' · ')}`);
+    lines.push(`${cfg.prefix} · ${counts}`);
+  } else {
+    lines.push(`${repo} · ${cfg.prefix} · ${counts}`);
+  }
+
+  const docs = cfg.docs && cfg.docs.length > 0 ? cfg.docs.join(', ') : 'none';
+  lines.push(
+    `Context: ${context ? 'CONTEXT.md' : 'CONTEXT.md missing'} · graphify: ${
+      cfg.graphify ? cfg.graphify : 'no'
+    } · docs: ${docs}`,
+  );
+
+  // Right under the `Context:` line it is about CONTEXT.md; anywhere
+  // else it reads as an unrelated warning.
+  if (extra.staleContext) lines.push(extra.staleContext);
+
+  if (live) lines.push(...liveLines(live, full));
+
+  const mine = open.filter((i) => i.fm.owner === 'human');
+  if (mine.length > 0) {
+    lines.push(`Needs you (${mine.length}):`);
+    for (const i of mine.slice(0, full ? mine.length : 5)) {
+      lines.push(`  ${i.fm.id} [${i.fm.kind}] ${i.fm.priority} ${shortTitle(i)}`);
+    }
+  }
+
+  const queue = full
+    ? open.filter((i) => i.fm.owner !== 'human')
+    : open.filter(
+        (i) =>
+          i.fm.owner !== 'human' &&
+          (i.fm.priority === 'P0' || i.fm.priority === 'P1') &&
+          (i.fm.status === 'open' || i.fm.status === 'doing'),
+      );
+  if (queue.length > 0) {
+    const cap = full ? queue.length : extra.lean ? LEAN_QUEUE : 5;
+    lines.push(`Up next (${queue.length}):`);
+    for (const i of queue.slice(0, cap)) {
+      lines.push(`  ${i.fm.id} ${i.fm.priority} ${i.fm.status} ${shortTitle(i)}`);
+    }
+    if (queue.length > cap) lines.push(`  … +${queue.length - cap} — ledger ls --open`);
+  }
+
+  const unprocessed = ledger.listIntakeUnprocessed();
+  if (unprocessed.length > 0) {
+    const last = unprocessed[0];
+    lines.push(
+      `Intake: ${unprocessed.length} unprocessed · last ${last?.channel ?? '?'} ${
+        last?.at.slice(0, 16) ?? ''
+      } (${last?.id ?? ''})`,
+    );
+  }
+
+  const events = recent(ledger.listJournal(repo), full ? 14 : 7);
+  if (events.length > 0) {
+    lines.push(`${full ? '14' : '7'} days: ${events.slice(0, full ? 20 : 4).map(eventDigest).join(' · ')}`);
+  }
+
+  const decisions: Decision[] = ledger.listDecisions(repo).slice(0, 3);
+  if (decisions.length > 0) {
+    lines.push('Decisions:');
+    for (const d of decisions) lines.push(`  D${d.n} ${d.date} ${d.title}`);
+  }
+
+  return lines;
+}
+
+function globalBrief(ledger: Ledger, full: boolean, live?: BriefLive | undefined): string[] {
+  const repos = ledger.repos();
+  const all = ledger.listItems();
+  const open = all.filter((i) => isOpen(i.fm.status));
+  const lines: string[] = [];
+  lines.push(
+    `ledger · ${Object.keys(repos).length} repos · ${open.length} open · ${
+      all.length
+    } items total`,
+  );
+  if (live) lines.push(...liveLines(live, full));
+  for (const slug of Object.keys(repos).sort()) {
+    const mine = open.filter((i) => i.fm.repo === slug);
+    const human = mine.filter((i) => i.fm.owner === 'human').length;
+    lines.push(
+      `  ${slug}: ${mine.length} open${human > 0 ? ` · for you ${human}` : ''}`,
+    );
+  }
+  const human = open.filter((i) => i.fm.owner === 'human');
+  if (human.length > 0) {
+    lines.push(`Needs you (${human.length}):`);
+    for (const i of human.slice(0, full ? human.length : 5)) {
+      lines.push(`  ${i.fm.id} [${i.fm.kind}] ${i.fm.priority} ${shortTitle(i)}`);
+    }
+  }
+  const queue = open.filter(
+    (i) => i.fm.owner !== 'human' && (full || i.fm.priority === 'P0' || i.fm.priority === 'P1'),
+  );
+  if (queue.length > 0) {
+    lines.push(`Up next (${queue.length}):`);
+    for (const i of queue.slice(0, full ? queue.length : 5)) {
+      lines.push(`  ${i.fm.id} ${i.fm.priority} ${i.fm.repo} ${shortTitle(i)}`);
+    }
+  }
+  const unprocessed = ledger.listIntakeUnprocessed();
+  if (unprocessed.length > 0) {
+    lines.push(
+      `Intake: ${unprocessed.length} unprocessed · last ${
+        unprocessed[0]?.at.slice(0, 16) ?? ''
+      }`,
+    );
+  }
+  const events = recent(ledger.listJournal(), full ? 14 : 7);
+  if (events.length > 0) {
+    lines.push(`${full ? '14' : '7'} days: ${events.slice(0, full ? 20 : 4).map(eventDigest).join(' · ')}`);
+  }
+  return lines;
+}
+
+export async function buildBrief(ledger: Ledger, opts: BriefOptions = {}): Promise<string> {
+  const full = opts.full ?? false;
+  const lines = opts.repo
+    ? repoBrief(ledger, opts.repo, full, await ledger.contextFor(opts.repo), opts.live, {
+        staleContext: opts.staleContext,
+        lean: opts.lean,
+      })
+    : globalBrief(ledger, full, opts.live);
+  const footer = 'More: ledger brief --full · ledger history --since 14d';
+  const body = full ? lines : lines.slice(0, MAX_LINES - 1);
+  if (!full && lines.length > MAX_LINES - 1) {
+    body[MAX_LINES - 2] = `… +${lines.length - (MAX_LINES - 2)} lines — ledger brief --full`;
+  }
+  body.push(footer);
+  return `${body.join('\n')}\n`;
+}

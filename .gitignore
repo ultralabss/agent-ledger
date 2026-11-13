@@ -1,0 +1,12 @@
+node_modules/
+.claude/
+.env
+.env.*
+*.db
+*.db-wal
+*.db-shm
+*.log
+dist/
+.DS_Store
+.tmp/
+.wt/

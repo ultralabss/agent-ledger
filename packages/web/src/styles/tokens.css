@@ -1,0 +1,80 @@
+/* Design tokens */
+
+:root {
+  --font-display: 'Space Grotesk Variable', 'Space Grotesk', system-ui, sans-serif;
+  --font-mono: 'JetBrains Mono Variable', 'JetBrains Mono', ui-monospace, monospace;
+  --radius: 2px;
+  --sidebar-w: 248px;
+  --sidebar-w-collapsed: 56px;
+}
+
+[data-theme='dark'] {
+  color-scheme: dark;
+  --background: oklch(0.165 0.006 255);
+  --card: oklch(0.195 0.006 255);
+  --popover: oklch(0.215 0.007 255);
+  --muted: oklch(0.235 0.007 255);
+  --muted-foreground: oklch(0.7 0.01 255);
+  --foreground: oklch(0.95 0.004 255);
+  --border: oklch(0.285 0.008 255);
+  --input: oklch(0.33 0.009 255);
+  --ring: oklch(0.74 0.11 235);
+  --primary: oklch(0.94 0.004 255);
+  --primary-foreground: oklch(0.18 0.006 255);
+  --accent: oklch(0.25 0.008 255);
+  --grid: oklch(0.195 0.006 255);
+  --ok: oklch(0.76 0.15 155);
+  --k-blocking: oklch(0.69 0.19 25);
+  --k-deploy: oklch(0.8 0.15 80);
+  --k-risk: oklch(0.71 0.19 350);
+  --k-unverified: oklch(0.72 0.15 295);
+  --k-backlog: oklch(0.66 0.01 255);
+  --scrim: oklch(0.08 0.004 255 / 0.6);
+
+  --repo-0: oklch(0.7 0.15 235);
+  --repo-1: var(--ok);
+  --repo-2: var(--k-deploy);
+  --repo-3: var(--k-risk);
+  --repo-4: var(--k-unverified);
+  --repo-5: oklch(0.72 0.12 200);
+  --repo-6: oklch(0.75 0.14 100);
+  --repo-7: var(--k-blocking);
+}
+
+[data-theme='light'] {
+  color-scheme: light;
+  --background: oklch(0.985 0.002 255);
+  --card: oklch(1 0 0);
+  --popover: oklch(1 0 0);
+  --muted: oklch(0.96 0.003 255);
+  --muted-foreground: oklch(0.47 0.012 255);
+  --foreground: oklch(0.2 0.008 255);
+  --border: oklch(0.9 0.004 255);
+  --input: oklch(0.85 0.006 255);
+  --ring: oklch(0.52 0.13 245);
+  --primary: oklch(0.21 0.008 255);
+  --primary-foreground: oklch(0.98 0.002 255);
+  --accent: oklch(0.95 0.004 255);
+  --grid: oklch(0.955 0.003 255);
+  --ok: oklch(0.52 0.14 155);
+  --k-blocking: oklch(0.55 0.2 25);
+  --k-deploy: oklch(0.58 0.14 70);
+  --k-risk: oklch(0.55 0.2 350);
+  --k-unverified: oklch(0.53 0.18 295);
+  --k-backlog: oklch(0.5 0.01 255);
+  --scrim: oklch(0.2 0.01 255 / 0.35);
+
+  --repo-0: oklch(0.52 0.13 245);
+  --repo-1: var(--ok);
+  --repo-2: var(--k-deploy);
+  --repo-3: var(--k-risk);
+  --repo-4: var(--k-unverified);
+  --repo-5: oklch(0.5 0.1 200);
+  --repo-6: oklch(0.55 0.13 100);
+  --repo-7: var(--k-blocking);
+}
+
+/* default to dark until App reads persisted preference / system pref */
+:root:not([data-theme]) {
+  color-scheme: dark;
+}
