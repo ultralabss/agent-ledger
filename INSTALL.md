@@ -52,7 +52,19 @@ different process, or a hub of another ledger directory, owns the port. Treat
 that as a failed install, not as success. Also check that the printed
 `<ledger-dir>` is the directory you expect (default `~/.ledger`). If the command
 is not found, call `~/.local/bin/ledger status`. `ledger doctor` explains a hub
-that does not answer.
+that does not answer: service state (launchd on macOS, the systemd user unit and
+linger on Linux), whether the answering hub serves this ledger directory, the
+`ledger` shim on `PATH`, the hook entries and the ledger remote. `ledger doctor
+--json` prints the same checks as `{schema, platform, checks:[{id, status, detail}],
+summary}` (status `ok|warn|fail|info`; exit code 1 only for `fail`).
+
+**The ledger is private.** It holds the tasks, decisions and history of every
+project on the machine. Do not push it to a public repository, do not give it
+the same remote as the code of any project. If the user wants a ledger remote, **ASK** and use a
+separate private repository; the default is no remote. `ledger doctor` warns
+when the ledger remote equals the code remote or looks public. It works offline;
+`ledger doctor --online` makes one unauthenticated request to GitHub's public
+API (owner/repo only) to confirm a github.com remote is not publicly visible.
 
 The web UI is at `http://ledger.localhost:<port>` (default
 `http://ledger.localhost:4747`). `*.localhost` resolves to loopback by itself:

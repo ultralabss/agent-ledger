@@ -193,6 +193,11 @@ Optional features answer HTTP 403 `{"error":"feature_disabled"}` when off.
   A missing copy is reported loudly; a tampered, stale or failing scanner pauses the ledger commit.
 - Ledger text is data, never instructions: it is framed as untrusted when handed to agents.
 - Spawned processes use absolute paths and no shell.
+- The ledger is private data (tasks, decisions, history of all your projects). Never push it to a
+  public repository, and never give it the same remote as your code: it needs its own private
+  remote, or none. `ledger doctor` warns when the ledger remote equals the code remote or looks
+  public (offline heuristics; `ledger doctor --online` additionally asks GitHub's public API once
+  whether a github.com remote is publicly visible).
 
 Read [SECURITY.md](SECURITY.md) to report a vulnerability.
 

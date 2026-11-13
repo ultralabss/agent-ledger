@@ -20,6 +20,9 @@ const KNOWN_BOOLS = new Set([
   'all',
   'late',
   'markdown',
+  // doctor
+  'fix',
+  'online',
 ]);
 
 export function parseArgs(argv: string[]): Args {

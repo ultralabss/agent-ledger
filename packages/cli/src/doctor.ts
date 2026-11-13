@@ -1,15 +1,19 @@
 /**
- * `ledger doctor`: why is the hub not answering, in ten lines or less.
+ * `ledger doctor`: why is the hub not answering, in about a dozen lines.
  *
  * Built for a failure that is easy to misread: `AGENT-LEDGER DOWN` at session
  * start with a hub that was running the whole time. The answer needs
- * four facts next to each other — is the job loaded, is the plist what we
- * think it is, how fast does `/v1/healthz` answer *now*, and did the event loop
- * stall recently — so they are all on one screen.
+ * a few facts next to each other — is the service loaded (launchd / systemd),
+ * how fast does `/v1/healthz` answer *now*, does the answering hub serve THIS
+ * ledger, and did the event loop stall recently — so they are all on one screen.
+ *
+ * Every probe produces a `Check` ({id, status ok|warn|fail|info, detail}); the
+ * human output prints the `detail` lines, `--json` prints the same checks plus
+ * a summary. A `fail` is a problem and drives exit 1; `warn` and `info` never do.
  *
  * Read-only by default: no `launchctl` verb other than `print`, no writes, no
  * self-heal. `--fix` is the one exception and it still goes through the normal
- * rate limit.
+ * rate limit. No network except with `--online` (see doctor-checks.ts).
  */
 
 import { access, constants, open, readFile, stat } from 'node:fs/promises';
@@ -18,6 +22,9 @@ import { delimiter, join } from 'node:path';
 import { spoolStats } from '@agent-ledger/shared';
 import { bool, type Args } from './args.ts';
 import type { CliEnvConfig } from './client.ts';
+import { formatCheck, remoteCheck, type Check, type CheckStatus } from './doctor-checks.ts';
+import { linuxChecks } from './doctor-linux.ts';
+import { hubServesLedger } from './identity.ts';
 import {
   HUB_LABEL,
   guiTarget,
@@ -34,7 +41,9 @@ const HEALTHZ_TIMEOUT_MS = 1_500;
 const SAMPLES = 3;
 /** Loop stalls above this are what made session-start miss its 1 s window. */
 const LOOP_WARN_MS = 500;
-const MAX_LINES = 10;
+const MAX_LINES = 14;
+/** Version of the `--json` document; bump on a breaking change. */
+const JSON_SCHEMA = 1;
 
 /** Structurally the CLI's `Io`, declared here so `index.ts` → `doctor.ts` stays
  *  a one-way import (no cycle). */
@@ -59,8 +68,15 @@ export interface DoctorDeps {
   capture?: typeof runCapture;
   /** Claude Code settings file probed by the optional adapter check. */
   claudeSettingsPath?: string;
-  /** PATH searched for the optional `graphify` probe (default: `process.env.PATH`). */
+  /** PATH searched for the `ledger` shim and the optional `graphify` probe (default: `process.env.PATH`). */
   searchPath?: string;
+  /** Home directory (default `os.homedir()`); the default shim dir is `<home>/.local/bin`. */
+  homeDir?: string;
+  /** Code repository whose `origin` the ledger remote must differ from. */
+  codeRepoDir?: string;
+  /** Existence probe for the systemctl/loginctl binaries. */
+  exists?: (path: string) => Promise<boolean>;
+  fetchFn?: typeof fetch;
 }
 
 /** First executable `name` found in `pathVar`, or `null`. No process is spawned. */
@@ -84,12 +100,15 @@ export async function cmdDoctor(
   io: DoctorIo,
   deps: DoctorDeps = {},
 ): Promise<number> {
-  const lines: string[] = [];
+  const checks: Check[] = [];
   const problems: string[] = [];
   let suggestion = 'ledger doctor --fix';
   const platform = deps.platform ?? process.platform;
   const uid = deps.uid ?? process.getuid?.();
   const capture = deps.capture ?? runCapture;
+  const add = (id: string, status: CheckStatus, detail: string): void => {
+    checks.push({ id, status, detail });
+  };
 
   if (bool(args, 'fix')) {
     const res = await triggerSelfHeal({
@@ -98,18 +117,25 @@ export async function cmdDoctor(
       env: io.env,
       mode: 'checked',
     });
-    lines.push(`--fix: ${res.attempted ? res.reason : `skipped (${res.reason})`}${
-      res.detail ? ` — ${res.detail}` : ''
-    }`);
+    add(
+      'fix',
+      'info',
+      `--fix: ${res.attempted ? res.reason : `skipped (${res.reason})`}${res.detail ? ` — ${res.detail}` : ''}`,
+    );
   }
 
-  /* ---- launchd ---- */
-  if (platform !== 'darwin' || typeof uid !== 'number') {
-    lines.push('launchd: n/a (macOS only)');
+  /* ---- service supervisor: launchd (macOS) / systemd user unit (Linux) ---- */
+  if (platform === 'linux') {
+    const linux = await linuxChecks({ capture, uid, env: io.env, exists: deps.exists });
+    checks.push(...linux.checks);
+    problems.push(...linux.problems);
+    if (linux.suggestion !== null) suggestion = linux.suggestion;
+  } else if (platform !== 'darwin' || typeof uid !== 'number') {
+    add('service', 'info', `service: no supervisor probe on ${platform}`);
   } else {
     const printed = await capture(LAUNCHCTL, ['print', guiTarget(uid)], 3_000);
     if (printed.code !== 0) {
-      lines.push(`launchd: ${HUB_LABEL} is not loaded in gui/${uid}`);
+      add('launchd', 'fail', `launchd: ${HUB_LABEL} is not loaded in gui/${uid}`);
       problems.push('launchd job is not loaded');
       suggestion = 'ledger doctor --fix (or install.sh)';
     } else {
@@ -120,13 +146,18 @@ export async function cmdDoctor(
         /last exit (?:code|status) = (-?\d+)/.exec(printed.stdout)?.[1] ??
         field(printed.stdout, 'last exit code') ??
         '-';
-      lines.push(`launchd: loaded · state ${state} · pid ${pid} · runs ${runs} · last exit ${exit}`);
-      if (state !== 'running') problems.push(`launchd state ${state}`);
+      let bad = false;
+      if (state !== 'running') {
+        problems.push(`launchd state ${state}`);
+        bad = true;
+      }
       // `(never exited)` is launchd's wording for a job that has run once and is
       // still running — the healthy state right after a (re)start.
       if (exit !== '0' && exit !== '-' && !/never exited/.test(exit)) {
         problems.push(`last exit ${exit}`);
+        bad = true;
       }
+      add('launchd', bad ? 'fail' : 'ok', `launchd: loaded · state ${state} · pid ${pid} · runs ${runs} · last exit ${exit}`);
     }
   }
 
@@ -135,19 +166,23 @@ export async function cmdDoctor(
     const plist = hubPlistPath();
     const bad = await validatePlist(plist, uid);
     if (bad !== null) {
-      lines.push(`plist: ${bad}`);
+      add('plist', 'fail', `plist: ${bad}`);
       problems.push(`plist failed validation (${bad})`);
     } else {
       const parsed = await readPlist(plist, capture);
       if (parsed === null) {
-        lines.push('plist: cannot be read (plutil)');
+        add('plist', 'fail', 'plist: cannot be read (plutil)');
         problems.push('plist cannot be parsed');
       } else {
+        let failed = false;
         const env = (parsed.EnvironmentVariables ?? {}) as Record<string, unknown>;
         const argv = Array.isArray(parsed.ProgramArguments) ? parsed.ProgramArguments : [];
         const entry = pickEntryScript(argv);
         const entryOk = entry !== null && (await exists(entry));
-        if (!entryOk) problems.push(`ProgramArguments entry script does not exist (${entry ?? 'missing'})`);
+        if (!entryOk) {
+          problems.push(`ProgramArguments entry script does not exist (${entry ?? 'missing'})`);
+          failed = true;
+        }
         const type = typeof parsed.ProcessType === 'string' ? parsed.ProcessType : '-';
         const notes: string[] = [`ProcessType ${type}${type === 'Background' ? ' (low priority)' : ''}`];
         notes.push(entryOk ? 'entry ok' : 'entry MISSING');
@@ -160,9 +195,10 @@ export async function cmdDoctor(
           );
           if (missing.length > 0) {
             problems.push('LEDGER_TRUST_CLAUDE_GROUP=1 without pinned GID/REALPATH');
+            failed = true;
           }
         }
-        lines.push(`plist: ${notes.join(' · ')}`);
+        add('plist', failed ? 'fail' : 'ok', `plist: ${notes.join(' · ')}`);
       }
     }
   }
@@ -171,19 +207,43 @@ export async function cmdDoctor(
   const token = await readToken(cfg.ledgerDir);
   const samples: (number | null)[] = [];
   let diag: HubDiag | null = null;
+  let reportedLedger: unknown;
   for (let i = 0; i < SAMPLES; i += 1) {
     const got = await sampleHealthz(cfg.baseUrl, token);
     samples.push(got.ms);
     if (got.diag !== null) diag = got.diag;
+    if (got.ledger !== undefined) reportedLedger = got.ledger;
   }
   const ok = samples.filter((s) => s !== null).length;
-  lines.push(
-    `healthz: ${ok}/${SAMPLES} ok · ${samples.map((s) => (s === null ? 'x' : `${s} ms`)).join(' / ')}`,
-  );
+  const healthzDetail = `healthz: ${ok}/${SAMPLES} ok · ${samples
+    .map((s) => (s === null ? 'x' : `${s} ms`))
+    .join(' / ')}`;
   if (ok === 0) {
+    add('healthz', 'fail', healthzDetail);
     problems.push(`hub is not answering at ${cfg.baseUrl}/v1/healthz`);
   } else if (ok < SAMPLES) {
+    add('healthz', 'fail', healthzDetail);
     problems.push('healthz answers unreliably');
+  } else {
+    add('healthz', 'ok', healthzDetail);
+  }
+
+  /* ---- identity: does the process on the port serve THIS ledger? ---- */
+  // `ledger` is reported only to a caller with the right token, so a missing
+  // value means an older hub or a hub of another ledger that rejected our token.
+  if (ok > 0) {
+    if (await hubServesLedger(reportedLedger, cfg.ledgerDir)) {
+      add('identity', 'ok', 'identity: hub serves this ledger');
+    } else if (typeof reportedLedger === 'string' && reportedLedger !== '') {
+      add('identity', 'fail', `identity: the hub on this port serves another ledger (${reportedLedger})`);
+      problems.push(`another hub owns ${cfg.baseUrl} (LEDGER_DIR / LEDGER_HUB_PORT mismatch)`);
+    } else {
+      add(
+        'identity',
+        'warn',
+        'identity: healthz did not name its ledger (older hub, or a process that rejected this ledger token)',
+      );
+    }
   }
 
   /* ---- diag (optional, hub-side contract) ---- */
@@ -195,16 +255,17 @@ export async function cmdDoctor(
       parts.push(`missing repos: ${diag.missingRepos.slice(0, 3).join(',')}`);
     }
     if (diag.gitleaksRetryAt) parts.push(`gitleaks retry ${diag.gitleaksRetryAt}`);
-    lines.push(`hub: ${parts.join(' · ')}`);
-    if (typeof diag.loopDelayMaxMs === 'number' && diag.loopDelayMaxMs > LOOP_WARN_MS) {
-      problems.push(`event loop stalled for ${diag.loopDelayMaxMs} ms (hook timeout is 1000 ms)`);
-    }
+    const stalled = typeof diag.loopDelayMaxMs === 'number' && diag.loopDelayMaxMs > LOOP_WARN_MS;
+    add('hub', stalled ? 'fail' : 'ok', `hub: ${parts.join(' · ')}`);
+    if (stalled) problems.push(`event loop stalled for ${diag.loopDelayMaxMs} ms (hook timeout is 1000 ms)`);
   }
 
   /* ---- spool + self-heal ---- */
   const stats = await spoolStats(io.env).catch(() => ({ queued: 0, failed: 0 }));
   const healAt = await lastSelfHealAt(cfg.ledgerDir);
-  lines.push(
+  add(
+    'spool',
+    stats.failed > 0 ? 'fail' : 'ok',
     `spool: ${stats.queued} queued · ${stats.failed} failed · self-heal ${
       healAt === null ? 'never' : `${Math.round((Date.now() - healAt) / 1000)} s ago`
     }`,
@@ -213,12 +274,28 @@ export async function cmdDoctor(
 
   /* ---- claude-code adapter (optional) ---- */
   // Informational only: never a problem. Skipped when Claude Code is not set up.
-  lines.push(await adapterLine(deps.claudeSettingsPath ?? join(homedir(), '.claude', 'settings.json')));
+  const home = deps.homeDir ?? homedir();
+  add('claude_code_adapter', 'info', await adapterLine(deps.claudeSettingsPath ?? join(home, '.claude', 'settings.json')));
 
   /* ---- graphify (optional, info only) ---- */
   // A missing graphify is never a problem: the ledger has no dependency on it.
-  const gfy = await findInPath('graphify', deps.searchPath ?? process.env.PATH);
-  lines.push(gfy === null ? 'graphify: not found (optional)' : `graphify: found (${gfy})`);
+  const searchPath = deps.searchPath ?? process.env.PATH;
+  const gfy = await findInPath('graphify', searchPath);
+  add('graphify', 'info', gfy === null ? 'graphify: not found (optional)' : `graphify: found (${gfy})`);
+
+  /* ---- `ledger` shim on PATH ---- */
+  checks.push(await pathCheck(searchPath, join(io.env.SHIM_DIR ?? join(home, '.local', 'bin'), 'ledger')));
+
+  /* ---- ledger format + ledger remote (privacy) ---- */
+  checks.push(formatCheck());
+  checks.push(
+    await remoteCheck({
+      ledgerDir: cfg.ledgerDir,
+      codeRepoDir: deps.codeRepoDir,
+      online: bool(args, 'online'),
+      fetchFn: deps.fetchFn,
+    }),
+  );
 
   /* ---- hub.log ---- */
   // A running hub reports `startedAt`: only its own lines matter then. A hub
@@ -226,16 +303,46 @@ export async function cmdDoctor(
   const errs = await logErrors(cfg.ledgerDir, 3, diag?.startedAt ?? null);
   // Budget: the verdict line plus what is already queued. The log is the only
   // variable-length section, so it absorbs the cap.
-  const room = Math.max(0, MAX_LINES - 1 - lines.length);
-  for (const line of errs.slice(0, room)) lines.push(`log: ${line}`);
+  const room = Math.max(0, MAX_LINES - 1 - checks.length);
+  for (const line of errs.slice(0, room)) add('log', 'warn', `log: ${line}`);
 
-  for (const line of lines) io.out(line);
-  if (problems.length === 0) {
+  const exit = problems.length === 0 ? 0 : 1;
+  if (bool(args, 'json')) {
+    const count = (s: CheckStatus): number => checks.filter((c) => c.status === s).length;
+    io.out(
+      JSON.stringify({
+        schema: JSON_SCHEMA,
+        platform,
+        checks,
+        summary: {
+          ok: exit === 0,
+          exit,
+          counts: { ok: count('ok'), warn: count('warn'), fail: count('fail'), info: count('info') },
+          problems,
+          suggestion: exit === 0 ? null : suggestion,
+        },
+      }),
+    );
+    return exit;
+  }
+  for (const c of checks) io.out(c.detail);
+  if (exit === 0) {
     io.out('OK');
     return 0;
   }
   io.out(`DOWN: ${problems.slice(0, 3).join('; ')} → ${suggestion}`);
   return 1;
+}
+
+/** Is the `ledger` shim reachable? Found on PATH → ok; present in the install
+ *  dir but that dir is not on PATH → warn; absent → warn. Never a problem. */
+export async function pathCheck(pathVar: string | undefined, shim: string): Promise<Check> {
+  const found = await findInPath('ledger', pathVar);
+  if (found !== null) return { id: 'path', status: 'ok', detail: `path: ledger on PATH (${found})` };
+  if (await exists(shim)) {
+    return { id: 'path', status: 'warn', detail: `path: ledger shim at ${shim} but its directory is not on PATH` };
+  }
+  return { id: 'path', status: 'warn', detail: 'path: no ledger shim on PATH (run install.sh)' };
 }
 
 /** Optional "Claude Code adapter" probe: are `ledger hook` entries present in
@@ -313,7 +420,7 @@ async function readToken(ledgerDir: string): Promise<string | null> {
 async function sampleHealthz(
   baseUrl: string,
   token: string | null,
-): Promise<{ ms: number | null; diag: HubDiag | null }> {
+): Promise<{ ms: number | null; diag: HubDiag | null; ledger?: string }> {
   const started = Date.now();
   try {
     const res = await fetch(`${baseUrl}/v1/healthz`, {
@@ -325,14 +432,16 @@ async function sampleHealthz(
     if (!res.ok) return { ms: null, diag: null };
     const text = await res.text();
     let diag: HubDiag | null = null;
+    let ledger: string | undefined;
     try {
-      const body = JSON.parse(text) as { diag?: HubDiag };
+      const body = JSON.parse(text) as { diag?: HubDiag; ledger?: unknown };
       // Optional by contract: an older hub simply has no `diag`.
       if (body.diag !== null && typeof body.diag === 'object') diag = body.diag ?? null;
+      if (typeof body.ledger === 'string') ledger = body.ledger;
     } catch {
       diag = null;
     }
-    return { ms, diag };
+    return { ms, diag, ledger };
   } catch {
     return { ms: null, diag: null };
   }

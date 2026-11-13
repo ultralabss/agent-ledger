@@ -18,6 +18,8 @@ Agent Ledger is a single-user, local tool.
   obtained with a short-lived one-time code.
 - Anyone who can read the token file or run code as your user can use the hub; that is
   outside the threat model.
+- The ledger directory is private data. Keeping its git remote private and separate from
+  your code repositories is the user's responsibility; `ledger doctor` only warns.
 - Text from the ledger, git and web replies is untrusted data and is framed as such
   when given to agents. Prompt injection through that text is a known risk class; reports
   of bypasses of the framing, guards or the secret scanner are welcome.

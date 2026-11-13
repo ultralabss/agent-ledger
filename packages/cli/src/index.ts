@@ -5,10 +5,10 @@
  */
 
 import { spawn } from 'node:child_process';
-import { realpath } from 'node:fs/promises';
 import { DONE_REF_HINT, isDoneRef, TITLE_MAX, TITLE_WARN } from '@agent-ledger/shared';
 import { bool, csv, flag, flagList, parseArgs, type Args } from './args.ts';
 import { CliError, HubClient, readEnvConfig, type CliEnvConfig, type HubTimeouts } from './client.ts';
+import { hubServesLedger } from './identity.ts';
 import { OFFLINE_HEADER, offlineBrief, offlineLs, offlineShow } from './offline.ts';
 import {
   SpoolError,
@@ -81,7 +81,7 @@ const USAGE = `ledger — shared ledger and intake for parallel AI agent session
   ledger check "<text>" [--repo]            do we have this already? (writes nothing)
   ledger reply <ID> "<text>" [--mode auto|session|worker]
   ledger wait [--timeout 600]               wait for the hub to come up and flush the queue
-  ledger doctor [--fix]                     hub diagnostics (service, healthz, optional adapter)
+  ledger doctor [--fix] [--json] [--online] hub diagnostics (service, healthz, identity, ledger remote)
   ledger spool failed                       failed spool records (method, path, time, body)
   ledger spool retry <file> --confirm       re-sign and resend the records of one failed file
   ledger hook <event>                       hook transport (Claude Code adapter protocol, §10)
@@ -657,17 +657,7 @@ function session(cfg: CliEnvConfig): string | null {
 
 /* ---------------- commands ---------------- */
 
-/**
- * Is the answering hub the one that serves OUR ledger directory? `/v1/healthz`
- * reports `ledger` only to a caller with the right token, so a foreign process
- * (or a hub of another ledger) on the port yields `undefined` or a different
- * path. Paths are compared by realpath (a symlinked $HOME must still match).
- */
-export async function hubServesLedger(reported: unknown, ledgerDir: string): Promise<boolean> {
-  if (typeof reported !== 'string' || reported === '') return false;
-  const real = (p: string): Promise<string> => realpath(p).catch(() => p);
-  return (await real(reported)) === (await real(ledgerDir));
-}
+export { hubServesLedger };
 
 async function cmdStatus(
   client: HubClient,
