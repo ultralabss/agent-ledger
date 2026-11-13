@@ -1087,6 +1087,14 @@ export class RuntimeStore {
     );
   }
 
+  /** `ledger why`: the most recently active session summaries of a repo. */
+  sessionFactsRecent(repo: string, limit: number): SessionFactsRow[] {
+    return this.rows<SessionFactsRow>(
+      'SELECT * FROM session_facts WHERE repo = ? ORDER BY last_at DESC LIMIT ?',
+      [repo, limit],
+    );
+  }
+
   /**
    * Record activity for the rolling summary. Commits are merged as a set (a
    * redelivered commit must not double up) and `why` only ever overwrites when
@@ -1194,6 +1202,24 @@ export class RuntimeStore {
     return this.rows<{ path: string; n: number }>(
       'SELECT path, n FROM item_files WHERE repo = ? AND item_id = ? ORDER BY last_at DESC, n DESC, path LIMIT ?',
       [repo, itemId, limit],
+    );
+  }
+
+  /** `ledger why`: item files whose path starts with `prefix` (plain string, LIKE
+   *  wildcards escaped; SQLite LIKE is ASCII case-insensitive, so the caller
+   *  re-matches exactly). Newest first, capped. Scans one repo's rows — the table
+   *  is `ITEM_FILES_CAP` rows per item, and there is deliberately no new index
+   *  (no schema change for a read-only lookup). */
+  itemFilesUnder(
+    repo: string,
+    prefix: string,
+    limit: number,
+  ): { item_id: string; path: string; n: number; last_at: number }[] {
+    return this.rows<{ item_id: string; path: string; n: number; last_at: number }>(
+      `SELECT item_id, path, n, last_at FROM item_files
+        WHERE repo = ? AND path LIKE ? ESCAPE '\\'
+        ORDER BY last_at DESC, n DESC LIMIT ?`,
+      [repo, `${prefix.replace(/[\\%_]/g, (ch) => `\\${ch}`)}%`, limit],
     );
   }
 

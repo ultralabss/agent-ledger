@@ -23,6 +23,10 @@ import type { Io } from './index.ts';
 
 /** macOS launcher, absolute path — no `PATH` lookup. */
 const OPEN_BIN = '/usr/bin/open';
+/** The friendly name the UI is opened under. `*.localhost` resolves to loopback
+ *  in browsers (RFC 6761); the hub accepts exactly this label and nothing else
+ *  under `.localhost`. */
+const UI_HOST = 'ledger.localhost';
 const NEXT_MAX_LEN = 256;
 const NEXT_RE = /^\/[A-Za-z0-9\-._~!$&'()*+,;=:@/?%#]*$/;
 
@@ -54,8 +58,11 @@ function portOf(u: URL): string {
 }
 
 /**
- * The hub may only return a loopback `http://<same port>/login`. Otherwise the
- * browser is not launched.
+ * The hub may only return a loopback `http://<same port>/login` (`127.0.0.1`,
+ * `localhost` or `ledger.localhost`). Otherwise the browser is not launched.
+ * The URL that is returned (and opened) always uses `ledger.localhost`: the UI
+ * cookie is host-only, so the host the browser logs in on is the host it keeps
+ * using — a uniform, recognisable one.
  * The port is also checked against `LEDGER_HUB_URL` — otherwise a broken or
  * spoofed hub could make the browser open another local service and hand it
  * the navigation (and `next` with it).
@@ -70,7 +77,8 @@ function assertLoginUrl(raw: unknown, baseUrl: string): string {
   } catch {
     throw new CliError(4, 'hub returned an invalid login URL');
   }
-  const loopback = u.hostname === '127.0.0.1' || u.hostname === 'localhost';
+  const loopback =
+    u.hostname === '127.0.0.1' || u.hostname === 'localhost' || u.hostname === UI_HOST;
   if (u.protocol !== 'http:' || !loopback || u.pathname !== '/login') {
     // No URL value in the message — it contains the one-time code.
     throw new CliError(4, 'hub returned a login URL outside loopback — refused');
@@ -81,7 +89,9 @@ function assertLoginUrl(raw: unknown, baseUrl: string): string {
   if ((u.searchParams.get('code') ?? '').length === 0) {
     throw new CliError(4, 'hub returned a login URL without a code');
   }
-  return raw;
+  // Only the host part changes; path, query (the one-time code) and port are
+  // taken from the URL that was just validated.
+  return `http://${UI_HOST}:${portOf(u)}${u.pathname}${u.search}`;
 }
 
 /** `spawn` with an argument array, no shell — the URL never passes an interpreter. */

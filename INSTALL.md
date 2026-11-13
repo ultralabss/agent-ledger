@@ -56,8 +56,10 @@ that does not answer.
 
 The web UI is at `http://ledger.localhost:<port>` (default
 `http://ledger.localhost:4747`). `*.localhost` resolves to loopback by itself:
-no `/etc/hosts` entry and no `sudo` needed. `ledger open` gives a one-time
-sign-in code.
+no `/etc/hosts` entry and no `sudo` needed. `ledger open` opens it and signs
+you in with a one-time code. The hub also answers on `127.0.0.1:<port>` and
+`localhost:<port>`, but on no other `*.localhost` name. If a browser or client
+cannot resolve `ledger.localhost`, use `http://127.0.0.1:<port>` instead.
 
 ## 4. Register the user's project
 

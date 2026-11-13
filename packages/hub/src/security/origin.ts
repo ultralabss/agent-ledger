@@ -63,14 +63,23 @@ function eqSafe(a: string, b: string): boolean {
   return timingSafeEqual(ab, bb);
 }
 
+/** The one friendly name the web UI is served under. `*.localhost` is resolved
+ *  to loopback by browsers and `curl` themselves (RFC 6761), so it needs no
+ *  hosts entry. Exactly this label — never a wildcard over `*.localhost`: any
+ *  other name under it is attacker-chosen and must not pass the Host gate. */
+export const LEDGER_LOCALHOST = 'ledger.localhost';
+
+/** The ONLY list behind both the Host gate and the Origin check, so a browser
+ *  origin passes exactly where the same-named Host passes, and nowhere else. */
 function allowedAuthorities(port: number): string[] {
-  return [`127.0.0.1:${port}`, `localhost:${port}`];
+  return [`127.0.0.1:${port}`, `localhost:${port}`, `${LEDGER_LOCALHOST}:${port}`];
 }
 
 /**
- * Exact match of `127.0.0.1:<port>` / `localhost:<port>` (host case-insensitive).
- * Everything else (other name, missing port, other port, `[::1]`, trailing dot,
- * userinfo, whitespace) is rejected, so DNS rebinding has no valid Host.
+ * Exact match of `127.0.0.1:<port>` / `localhost:<port>` / `ledger.localhost:<port>`
+ * (host case-insensitive). Everything else (other name, other `*.localhost`,
+ * missing port, other port, `[::1]`, trailing dot, userinfo, whitespace) is
+ * rejected, so DNS rebinding has no valid Host.
  */
 export function isAllowedHost(host: string | undefined, port: number): boolean {
   if (typeof host !== 'string' || host.length === 0 || host.length > 64) return false;
@@ -115,6 +124,10 @@ export function uiCookieValue(cfg: UiAuthConfig): string | null {
 /**
  * Set-Cookie for the UI on the same origin. Issued only by `GET /login` after
  * consuming a one-time code (`http/ui.ts`).
+ *
+ * No `Domain` attribute, deliberately: the cookie is host-only, so it is sent to
+ * the exact host that was logged into (`ledger.localhost` OR `127.0.0.1`, which
+ * are separate cookie jars) and never to a sibling name under `*.localhost`.
  *
  * No `Secure`: the hub runs only on http://127.0.0.1 (loopback, the packet never
  * leaves the machine), and some browsers drop a `Secure` cookie from an http

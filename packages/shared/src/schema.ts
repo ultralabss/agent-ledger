@@ -435,6 +435,13 @@ export const whoseQuerySchema = z.object({
   format: z.enum(['json', 'line']).optional(),
 });
 
+/** `GET /v1/repos/:slug/why?path=` — a file, directory or simple glob, either
+ *  absolute (inside the repo) or repo-relative. The hub validates it again after
+ *  `realpath`; this is only the shape. */
+export const whyQuerySchema = z.object({
+  path: singleLine(z.string().min(1).max(400)),
+});
+
 /* ---------- F2: guard, intrude, inbox, orphans (SPEC §10, §11) ---------- */
 
 /** An absolute path from a hook or the CLI. Never trusted before `realpath`. */

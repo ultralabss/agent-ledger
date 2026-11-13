@@ -2,6 +2,12 @@
 
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) · versioning: [SemVer](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+- `ledger why <path|dir|glob>` and `GET /v1/repos/:slug/why?path=`: items, live claims with intent, decisions, session summaries and git trailers behind a path. Metadata only; gitignored paths answer nothing; output is framed as data.
+- The hub accepts `ledger.localhost:<port>` (exactly that name) next to `127.0.0.1` and `localhost`; `ledger open` and the installer banner use it.
+
 ## [0.1.0] — 2026-11-13
 
 First public release.

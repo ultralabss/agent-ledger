@@ -20,7 +20,10 @@ PreToolUse · denied: apps/web/** is held by session a9f2 (ACME-41)
 - **Claims and guards.** A session claims an item and the paths it will change. A
   guard (an agent hook, optional) denies edits to files another live session holds.
 - **Coordination.** `ledger who <repo>` shows live sessions, their files and checkout
-  state; `ledger whose <path>` tells you who owns an uncommitted file.
+  state; `ledger whose <path>` tells you who owns an uncommitted file;
+  `ledger why <path|dir|glob>` tells you which items, claims, decisions and commits
+  stand behind a path (metadata only, never file content; gitignored paths answer
+  nothing).
 - **Memory.** `ledger brief` gives a new session what is running, what is next, what
   happened recently and the decisions taken. `ledger history` and `ledger search`
   (SQLite FTS5) dig deeper.
@@ -70,7 +73,25 @@ The agent checks prerequisites, runs `./install.sh`, verifies that the hub on th
 port is this ledger's hub, and asks you before it registers a project, edits your
 `AGENTS.md`, installs Claude Code hooks, or touches graphify. The web UI is at
 `http://ledger.localhost:4747` (or your port): `*.localhost` resolves to loopback by
-itself, so it needs no `/etc/hosts` entry and no `sudo`.
+itself, so it needs no `/etc/hosts` entry and no `sudo`. `ledger open` signs you in
+there with a one-time code.
+
+The hub accepts exactly three `Host` values, each with its own port and nothing else:
+`127.0.0.1`, `localhost` and `ledger.localhost`. Any other name, including every
+other `*.localhost`, is refused (DNS-rebinding defence). The sign-in cookie is
+host-only, so a browser signed in on `ledger.localhost` is a separate session from
+one on `127.0.0.1`.
+
+- **Name resolution.** Safari, Chrome and Firefox map `*.localhost` to loopback
+  themselves, and so does `curl`. The hub listens on `127.0.0.1` only. A client that
+  resolves `ledger.localhost` to `::1` first (some resolvers return both) gets
+  "connection refused" on IPv6 and should fall back to IPv4; if a client does not,
+  use `http://127.0.0.1:<port>` (same UI, accepted by the hub). Resolvers without
+  `*.localhost` support (some Linux setups) need the same fallback.
+- **Port.** The default `4747` is not reserved; pick another with `LEDGER_HUB_PORT`
+  (for example in the service unit) and the URL becomes
+  `http://ledger.localhost:<port>`. A port-less URL would need port 80 (root or a
+  reverse proxy), which this project deliberately does not set up.
 
 ### Connect an agent
 
@@ -99,6 +120,7 @@ ledger note ACME-41 "cart total needs the tax field from the API"
 ledger decide --repo acme-shop "Prices are integer cents" --why "no float rounding in totals"
 ledger who acme-shop                  # who works where, which files
 ledger whose apps/web/cart.tsx        # owner of an uncommitted file
+ledger why apps/web/cart.tsx          # items, claims, decisions, commits behind a path
 ledger done ACME-41 --ref a1b2c3d     # or commit with a `Closes: ACME-41` trailer
 ledger brief acme-shop                # what a new session should know
 ledger history --repo acme-shop --since 7d

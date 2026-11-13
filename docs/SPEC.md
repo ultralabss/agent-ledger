@@ -306,6 +306,7 @@ Node 22 LTS, TypeScript, Hono + `@hono/node-server`, `node:sqlite`, zod, `fs.wat
 | GET | `/repos/:slug/who` | compact text for `ledger who` |
 | GET | `/repos/:slug/{context,decisions,release-notes}` | `CONTEXT.md`, decisions, release notes from `Closes:` trailers |
 | GET | `/whose?path=` | owner of a file |
+| GET | `/repos/:slug/why?path=` | items, live claims, decisions, sessions and git trailers behind a path/dir/simple glob; metadata only, ignored paths answer nothing, strings sanitized and framed as data |
 | GET / POST | `/items`, `/items/:id` | list with filters, detail, create |
 | PATCH | `/items/:id` | status, owner, kind, priority, title, plan |
 | POST | `/items/:id/{claim,release,done,drop,dup,block,reopen,comments,steps}` | transitions and comments |
@@ -332,7 +333,7 @@ Node 22 LTS, TypeScript, Hono + `@hono/node-server`, `node:sqlite`, zod, `fs.wat
 
 ### 6.5 Server security
 
-- Listens on `127.0.0.1` only. `Host` must be `127.0.0.1:PORT` or `localhost:PORT` (DNS rebinding).
+- Listens on `127.0.0.1` only. `Host` must be `127.0.0.1:PORT`, `localhost:PORT` or `ledger.localhost:PORT` (exactly that name, no other `*.localhost`; DNS rebinding). The `Origin` check uses the same three authorities; the UI cookie is host-only (no `Domain`).
 - Reads (everything under `/v1/*` except the bare `GET /v1/healthz`): `X-Hub-Token` **or** a valid UI cookie `hub_ui`. Without it any local process, or another account on the machine, could read the ledger.
 - Writes: the `X-Hub-Token` header (file `.hub/token`, mode 0600, generated on first start) **or** `Origin` = hub + `Sec-Fetch-Site: same-origin` + a `SameSite=Strict` cookie issued exclusively by `GET /login` after consuming a one-time code.
 - **Authorization path (`authPath`):** the `guard()` middleware is the only place that decides which credential authorized a request, and it records the result (`token` | `cookie`) in the request context. Routes only read it — they never infer it from whether an `x-hub-token` header is *present*. (Inferring it could be flipped both ways: a valid cookie plus a bogus header looked like an "agent", no header looked like a "human".)
@@ -373,6 +374,7 @@ A thin hub client. The session hook sets `LEDGER_SESSION` and `LEDGER_REPO` (in 
 | `ledger release · done [--ref] · drop --why · dup --into · block --by/--on · reopen --why` | transitions |
 | `ledger who <repo>` | who works there, on what, which files, checkout state |
 | `ledger whose <path>` | owner of an uncommitted file |
+| `ledger why <path\|dir\|glob>` | what stands behind a path (`--json`, `--repo`) |
 | `ledger sessions [--repo] [--live]` | sessions |
 | `ledger intrude begin --repo --item --paths` · `commit <sha>` · `end` | protocol §11 (needs `LEDGER_INTRUDE=1` on the hub) |
 | `ledger adopt <path\|ID>` · `ledger override <path> --reason` | orphans, deliberate override |

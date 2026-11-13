@@ -12,7 +12,8 @@ without a bug bounty.
 
 Agent Ledger is a single-user, local tool.
 
-- The hub listens on `127.0.0.1` only and validates the `Host` header.
+- The hub listens on `127.0.0.1` only and validates the `Host` header: exactly
+  `127.0.0.1`, `localhost` or `ledger.localhost` with the hub's own port; no other name.
 - API access needs a bearer token (file mode 0600 in `<ledger>/.hub/`) or a UI cookie
   obtained with a short-lived one-time code.
 - Anyone who can read the token file or run code as your user can use the hub; that is

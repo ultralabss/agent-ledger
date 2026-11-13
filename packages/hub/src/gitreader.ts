@@ -3,7 +3,7 @@
  *
  * Hard rules, enforced here and nowhere else:
  *  - only `status`, `worktree list`, `for-each-ref`, `log`, `diff --name-only`,
- *    `rev-list --count`, `rev-parse`. Nothing that mutates, ever.
+ *    `rev-list --count`, `rev-parse`, `check-ignore -q`. Nothing that mutates, ever.
  *  - every invocation goes through `git()` in `git.ts`, which supplies the
  *    absolute binary, `--no-optional-locks` and `-c core.fsmonitor=false`.
  *  - a git failure is never fatal: the caller gets `null`/empty and the UI
@@ -378,8 +378,13 @@ export async function readPathCommits(
     5_000,
   );
   if (res.code !== 0) return [];
+  return parseLog(res.stdout);
+}
+
+/** Parse `git log --format=FORMAT` output into commits (no files). */
+function parseLog(stdout: string): Omit<CommitInfo, 'files'>[] {
   const out: Omit<CommitInfo, 'files'>[] = [];
-  for (const chunk of res.stdout.split(RS)) {
+  for (const chunk of stdout.split(RS)) {
     const rec = chunk.replace(/^\n+/, '');
     if (rec.trim() === '') continue;
     const f = rec.split(NUL);
@@ -397,6 +402,57 @@ export async function readPathCommits(
     });
   }
   return out;
+}
+
+/**
+ * `ledger why`: the newest commits that touched a path, a directory or a simple
+ * glob — no date window, a hard count instead. The pathspec is built HERE from
+ * a repo-relative string the caller already validated: `:(literal)` makes a
+ * file named `*.ts` or `:(top)x` mean exactly that file, `:(glob)` is the one
+ * magic we hand out on purpose (`*`/`?` stay inside a segment, `**` crosses).
+ * `--` ends the options before it either way. Failure is an empty answer.
+ */
+export async function readPathHistory(
+  checkout: string,
+  rel: string,
+  mode: 'literal' | 'glob',
+  limit: number,
+): Promise<Omit<CommitInfo, 'files'>[]> {
+  const res = await git(
+    checkout,
+    [
+      'log',
+      `--max-count=${Math.max(1, Math.min(limit, 200))}`,
+      '--no-merges',
+      `--format=${FORMAT}`,
+      '--',
+      `:(${mode})${rel}`,
+    ],
+    5_000,
+  );
+  if (res.code !== 0) return [];
+  return parseLog(res.stdout);
+}
+
+/**
+ * Is `rel` (a plain repo-relative path, never a pathspec) matched by a
+ * gitignore rule? `check-ignore -q` exits 0 = ignored, 1 = not ignored; a
+ * tracked file is reported as not ignored. Anything else (git failure,
+ * timeout, a path beyond a symlink) is `unknown` — the caller treats it like
+ * `ignored`: a privacy filter must fail closed.
+ */
+export async function checkIgnored(
+  checkout: string,
+  rel: string,
+): Promise<'ignored' | 'not-ignored' | 'unknown'> {
+  try {
+    const res = await git(checkout, ['check-ignore', '-q', '--', rel], 3_000);
+    if (res.code === 0) return 'ignored';
+    if (res.code === 1) return 'not-ignored';
+    return 'unknown';
+  } catch {
+    return 'unknown';
+  }
 }
 
 async function readCommitFiles(checkout: string, sha: string): Promise<string[]> {

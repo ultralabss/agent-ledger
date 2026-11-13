@@ -59,6 +59,8 @@ const USAGE = `ledger — shared ledger and intake for parallel AI agent session
   ledger history [--repo] [--since 7d] [--type <t>]
   ledger who <repo>                         who works there, files, checkout state
   ledger whose <path>                       owner of an uncommitted file
+  ledger why <path|dir|glob> [--repo <slug>] [--json]
+                                          who touched it and why (items, claims, decisions, git)
   ledger search "<q>" [--repo] [--limit]    full text
   ledger sessions [--repo] [--live]         live sessions
   ledger open [/path] [--print]             sign in to the web UI (one-time code)
@@ -192,6 +194,8 @@ async function dispatch(
       return cmdWho(args, client, cfg, io);
     case 'whose':
       return cmdWhose(args, client, io);
+    case 'why':
+      return cmdWhy(args, client, cfg, io);
     case 'search':
       return cmdSearch(args, client, cfg, io);
     case 'sessions':
@@ -1334,6 +1338,30 @@ async function cmdWhose(args: Args, client: HubClient, io: Io): Promise<number> 
   const abs = resolve(raw);
   const res = await client.get(`/v1/whose?format=line&path=${encodeURIComponent(abs)}`);
   printLines(res.text, io);
+  return 0;
+}
+
+/**
+ * `ledger why <path|dir|glob>` — metadata about a path, never its content. The
+ * path is made absolute against the shell's cwd here (the hub does not know it)
+ * and the hub re-validates it against the repo's real checkout. The output is
+ * DATA from the ledger and git: it is sanitized again on this side and the
+ * first line says it is not instructions.
+ */
+async function cmdWhy(args: Args, client: HubClient, cfg: CliEnvConfig, io: Io): Promise<number> {
+  const raw = requireArg(args.positional[1], 'path, directory or glob');
+  const repo = flag(args, 'repo') ?? (await resolveRepo(args, client, cfg, io));
+  const { resolve } = await import('node:path');
+  const abs = resolve(io.cwd, raw);
+  const res = await client.get(
+    `/v1/repos/${encodeURIComponent(repo as string)}/why?path=${encodeURIComponent(abs)}`,
+  );
+  if (bool(args, 'json')) {
+    io.out(JSON.stringify(res.json));
+    return 0;
+  }
+  const { formatWhy } = await import('./why.ts');
+  for (const line of formatWhy(res.json as import('@agent-ledger/shared').WhyView)) io.out(line);
   return 0;
 }
 

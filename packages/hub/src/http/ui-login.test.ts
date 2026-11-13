@@ -139,6 +139,91 @@ test('login: invalid code, HEAD does not consume the code, foreign Host fails', 
   assert.equal(loopback.status, 401, 'a loopback Host gets through to the code check');
 });
 
+test('login: ledger.localhost:<port> signs in, every other .localhost name does not', async (t) => {
+  const fx = await startTestHub();
+  t.after(fx.cleanup);
+  const mint = async (): Promise<string> => {
+    const res = await fetch(`${fx.url}/v1/ui/login-code`, {
+      method: 'POST',
+      headers: { 'x-hub-token': fx.token, 'content-type': 'application/json' },
+      body: '{}',
+    });
+    assert.equal(res.status, 200);
+    return codeOf(((await res.json()) as { url: string }).url);
+  };
+  const code = await mint();
+
+  // (A wrong port is not tested here: the test hub has `guard.port === 0`, where
+  // `/login` accepts any loopback port by design; `isAllowedHost` covers it.)
+  for (const bad of [
+    'ledger.localhost',
+    'evil.localhost:' + fx.hub.port,
+    `ledger.localhost.evil.com:${fx.hub.port}`,
+    `xledger.localhost:${fx.hub.port}`,
+    `ledger.localhost.:${fx.hub.port}`,
+  ]) {
+    const res = await rawGet(fx.hub.port, `/login?code=${code}`, bad);
+    assert.equal(res.status, 403, bad);
+    assert.equal(res.cookie, undefined, bad);
+  }
+
+  // The rejected attempts did not burn the code.
+  // (Lower case only: the HTTP server itself answers 400 to a Host whose
+  // hostname is not already lower case; `isAllowedHost` is case-insensitive anyway.)
+  const ok = await rawGet(fx.hub.port, `/login?code=${code}`, `ledger.localhost:${fx.hub.port}`);
+  assert.equal(ok.status, 303);
+  assert.match(ok.cookie ?? '', /^hub_ui=/);
+  assert.equal(/domain\s*=/i.test(ok.cookie ?? ''), false, 'host-only cookie');
+});
+
+test('UI cookie from ledger.localhost reads /v1 and writes with a ledger.localhost Origin', async (t) => {
+  const fx = await startTestHub();
+  t.after(fx.cleanup);
+  const res = await fetch(`${fx.url}/v1/ui/login-code`, {
+    method: 'POST',
+    headers: { 'x-hub-token': fx.token, 'content-type': 'application/json' },
+    body: '{}',
+  });
+  const code = codeOf(((await res.json()) as { url: string }).url);
+  const host = `ledger.localhost:${fx.hub.port}`;
+  const login = await rawGet(fx.hub.port, `/login?code=${code}`, host);
+  const cookie = (login.cookie ?? '').split(';')[0] ?? '';
+  assert.match(cookie, /^hub_ui=/);
+
+  const send = (method: string, path: string, origin?: string): Promise<number> =>
+    new Promise((resolvePromise, reject) => {
+      const req = request(
+        {
+          host: '127.0.0.1',
+          port: fx.hub.port,
+          path,
+          method,
+          headers: {
+            host,
+            cookie,
+            'sec-fetch-site': 'same-origin',
+            ...(origin ? { origin } : {}),
+            ...(method === 'GET' ? {} : { 'content-type': 'application/json' }),
+          },
+        },
+        (r) => {
+          r.resume();
+          r.on('end', () => resolvePromise(r.statusCode ?? 0));
+        },
+      );
+      req.on('error', reject);
+      req.end(method === 'GET' ? undefined : '{}');
+    });
+
+  assert.equal(await send('GET', '/v1/repos'), 200, 'cookie read from ledger.localhost');
+  // A write: past the auth gates the body is rejected by validation (not 401/403).
+  const own = await send('POST', '/v1/items', `http://ledger.localhost:${fx.hub.port}`);
+  assert.notEqual(own, 401);
+  assert.notEqual(own, 403);
+  assert.equal(await send('POST', '/v1/items', 'http://evil.localhost:' + fx.hub.port), 401);
+  assert.equal(await send('POST', '/v1/items'), 401, 'no Origin');
+});
+
 test('login-code: requires X-Hub-Token, a cookie is not enough', async (t) => {
   const fx = await startTestHub();
   t.after(fx.cleanup);

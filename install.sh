@@ -941,7 +941,7 @@ cat <<EOF
 Agent Ledger is installed.
   ledger CLI:   $SHIM
   ledger data:  $LEDGER   (git repository; delete nothing by hand)
-  web UI:       http://127.0.0.1:$PORT/
+  web UI:       http://ledger.localhost:$PORT/   (sign in: ledger open)
 
 Optional: Claude Code hooks (adds entries to ~/.claude/settings.json only after you confirm).
 Preview first, it writes nothing:

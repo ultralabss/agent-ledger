@@ -202,7 +202,7 @@ function loginHostAllowed(host: string | undefined, deps: UiDeps): boolean {
   if (deps.guard.port > 0 && isAllowedHost(host, deps.guard.port)) return true;
   if (typeof host !== 'string' || host.length === 0 || host.length > 64) return false;
   if (/[\s/@\\[\]]/.test(host)) return false;
-  return /^(?:127\.0\.0\.1|localhost):[0-9]{1,5}$/.test(host.toLowerCase());
+  return /^(?:127\.0\.0\.1|localhost|ledger\.localhost):[0-9]{1,5}$/.test(host.toLowerCase());
 }
 
 /**

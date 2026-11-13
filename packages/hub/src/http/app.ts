@@ -46,6 +46,7 @@ import {
   timelineQuerySchema,
   triageSchema,
   whoseQuerySchema,
+  whyQuerySchema,
   adoptSchema,
   groomSchema,
   guardSetSchema,
@@ -110,6 +111,7 @@ import { RepliesError, type Replies } from '../replies.ts';
 import { realpathOrParent, sessionTag, type Sessions } from '../sessions.ts';
 import { staleContextLine } from '../stalecontext.ts';
 import type { Summarizer } from '../summary.ts';
+import { whyOfPath } from '../why.ts';
 import { authPathOf, guard, isCookieCaller, type GuardConfig } from './guard.ts';
 import { uiHandler } from './ui.ts';
 
@@ -1464,6 +1466,25 @@ export function createApp(deps: AppDeps) {
       claims,
       known: true,
     });
+  });
+
+  /* ---------- `ledger why`: who touched a path and why (metadata only) ---------- */
+
+  // Behind the same `guard()` as every `/v1/*` route (token or UI cookie). The
+  // answer is DATA drawn from the ledger and git; `whyOfPath` validates the path
+  // against the checkout, hides ignored paths and sanitizes every string.
+  v1.get('/repos/:slug/why', async (c) => {
+    const parsed = slugSchema.safeParse(c.req.param('slug'));
+    if (!parsed.success) throw new LedgerError(422, 'INVALID', 'slug must match [a-z0-9-]+');
+    ledger.repo(parsed.data);
+    const q = query(c, whyQuerySchema, { path: c.req.query('path') });
+    const view = await whyOfPath(
+      { ledger, store: need(deps.store, 'why'), sessions: need(deps.sessions, 'why') },
+      parsed.data,
+      q.path,
+    );
+    c.header('cache-control', 'no-store');
+    return c.json(view);
   });
 
   /* ---------- F1: search & timeline ---------- */

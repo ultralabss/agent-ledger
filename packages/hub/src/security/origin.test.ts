@@ -73,6 +73,33 @@ test('isAllowedHost: rejects everything else (DNS rebinding)', () => {
   for (const h of bad) assert.equal(isAllowedHost(h, PORT), false, String(h));
 });
 
+test('isAllowedHost: ledger.localhost with exactly the hub port, nothing else under .localhost', () => {
+  for (const ok of ['ledger.localhost:4747', 'LEDGER.LOCALHOST:4747', 'Ledger.LocalHost:4747']) {
+    assert.equal(isAllowedHost(ok, PORT), true, ok);
+  }
+  const bad = [
+    'ledger.localhost',
+    'ledger.localhost:4748',
+    'ledger.localhost:04747',
+    'ledger.localhost.:4747',
+    'ledger.localhost.evil.com:4747',
+    'xledger.localhost:4747',
+    'sub.ledger.localhost:4747',
+    'evil.localhost:4747',
+    'a.localhost:4747',
+    '.localhost:4747',
+    'localhost.localhost:4747',
+    'ledger.localhost:4747 ',
+    ' ledger.localhost:4747',
+    'user@ledger.localhost:4747',
+    'ledger.localhost:4747\r\nX: y',
+    'ledger.localhost\u0000:4747',
+    'ledger%2elocalhost:4747',
+    'ledger.localhost:4747:4747',
+  ];
+  for (const h of bad) assert.equal(isAllowedHost(h, PORT), false, h);
+});
+
 test('isAllowedHost: a nonsensical port does not pass', () => {
   assert.equal(isAllowedHost('localhost:0', 0), false);
   assert.equal(isAllowedHost('localhost:99999', 99999), false);
@@ -143,6 +170,47 @@ test('UI path: correct Origin + cookie passes', () => {
     ),
     true,
   );
+});
+
+test('UI path: the ledger.localhost Origin passes exactly where 127.0.0.1 does, no wider', () => {
+  const cookieHeader = `${UI_COOKIE_NAME}=${cookieOf()}`;
+  const origin = `http://ledger.localhost:${PORT}`;
+  const host = `ledger.localhost:${PORT}`;
+  assert.equal(isAllowedWrite(req({ host, origin, cookieHeader }), cfg), true);
+  // Token path from that Host works too; a foreign Host never does.
+  assert.equal(isAllowedWrite(req({ host, tokenHeader: TOKEN }), cfg), true);
+  // Same gates as for 127.0.0.1: Origin and Sec-Fetch-Site are still required.
+  assert.equal(isAllowedWrite(req({ host, cookieHeader }), cfg), false, 'no Origin');
+  assert.equal(
+    isAllowedWrite(req({ host, origin, cookieHeader, secFetchSite: 'cross-site' }), cfg),
+    false,
+  );
+  for (const bad of [
+    `http://ledger.localhost:${PORT + 1}`,
+    `https://ledger.localhost:${PORT}`,
+    `http://ledger.localhost:${PORT}/`,
+    `http://ledger.localhost.:${PORT}`,
+    `http://ledger.localhost.evil.com:${PORT}`,
+    `http://xledger.localhost:${PORT}`,
+    `http://evil.localhost:${PORT}`,
+    `http://sub.ledger.localhost:${PORT}`,
+    'http://ledger.localhost',
+  ]) {
+    assert.equal(isAllowedWrite(req({ host, origin: bad, cookieHeader }), cfg), false, bad);
+  }
+  // A cookie-path write whose Host is some other `*.localhost` fails on the Host gate.
+  assert.equal(
+    isAllowedWrite(req({ host: `evil.localhost:${PORT}`, origin, cookieHeader }), cfg),
+    false,
+  );
+});
+
+test('UI cookie is host-only: no Domain attribute', () => {
+  const c = uiCookie(UI, PORT);
+  assert.ok(c !== null);
+  assert.equal(/domain\s*=/i.test(c), false);
+  assert.match(c, /HttpOnly/);
+  assert.match(c, /SameSite=Strict/);
 });
 
 test('UI path: cookie without Origin fails (CSRF)', () => {
