@@ -1,6 +1,7 @@
 # Allowlist for scripts/deps-gate.mjs. Changing this file needs CODEOWNERS review.
 # dep <name>    direct dependency allowed in any package.json
 # build <name>  package allowed to have an install/postinstall script or gypfile
+# bundle <name> package allowed to ship bundledDependencies (opaque nested code)
 # Transitive dependencies are covered by the frozen lockfile, `pnpm audit` and
 # `pnpm install --ignore-scripts`; the gate fails on any install script outside `build`.
 
@@ -34,3 +35,6 @@ dep yaml
 dep zod
 
 build esbuild
+
+# wasm32 fallback of tailwind oxide bundles its own wasi runtime deps
+bundle @tailwindcss/oxide-wasm32-wasi

@@ -53,7 +53,7 @@ test("gypfile package outside allowlist fails", () => {
 
 test("lockfile tarball resolution fails", () => {
   const d = repo({}, { lock: "packages:\n  x@1.0.0:\n    resolution: {tarball: https://evil.example.com/x.tgz}\n" });
-  assert.match(runGate(d, ALLOW).join("\n"), /non-registry resolution/);
+  assert.match(runGate(d, ALLOW).join("\n"), /resolution must be only/);
 });
 
 test("malformed allowlist throws", () => {
@@ -73,12 +73,12 @@ test("owner/repo shorthand, jsr, catalog and path specifiers fail", () => {
 
 test("block-style lockfile tarball resolution fails", () => {
   const d = repo({}, { lock: "packages:\n  x@1.0.0:\n    resolution:\n      tarball: https://evil.example.com/x.tgz\n" });
-  assert.match(runGate(d, ALLOW).join("\n"), /non-registry resolution/);
+  assert.match(runGate(d, ALLOW).join("\n"), /resolution must be only/);
 });
 
 test("git resolution and git package keys in lockfile fail", () => {
-  assert.match(runGate(repo({}, { lock: "packages:\n  x@1.0.0:\n    resolution: {type: git, repo: https://evil.example.com/x.git, commit: abc}\n" }), ALLOW).join("\n"), /non-registry/);
-  assert.match(runGate(repo({}, { lock: "packages:\n  x@https://evil.example.com/x.tgz:\n    resolution: {integrity: sha512-aaa}\n" }), ALLOW).join("\n"), /non-registry reference/);
+  assert.match(runGate(repo({}, { lock: "packages:\n  x@1.0.0:\n    resolution: {type: git, repo: https://evil.example.com/x.git, commit: abc}\n" }), ALLOW).join("\n"), /resolution must be only/);
+  assert.match(runGate(repo({}, { lock: "packages:\n  x@https://evil.example.com/x.tgz:\n    resolution: {integrity: sha512-aaa}\n" }), ALLOW).join("\n"), /not a registry package/);
 });
 
 test("overrides, patches, pnpmfile and unlisted allowBuilds fail", () => {
@@ -102,4 +102,47 @@ test("SC-4: quoted-key resolution fields fail (flow and block style)", () => {
 test("SC-4: plain integrity resolutions pass (flow and block)", () => {
   const lock = "packages:\n  x@1.0.0:\n    resolution: {integrity: sha512-aaa}\n  y@1.0.0:\n    resolution:\n      integrity: sha512-bbb\n    engines: {node: '>=18'}\n";
   assert.deepEqual(runGate(repo({}, { lock }), ALLOW), []);
+});
+
+const lockOf = (body) => `lockfileVersion: '9.0'\n${body}`;
+const bad = (body) => runGate(repo({}, { lock: lockOf(body) }), ALLOW).join("\n");
+
+test("SC-4 round 3: YAML-escaped / quoted / flow keys cannot smuggle a source", () => {
+  assert.match(bad("packages:\n  x@1.0.0:\n    resolution: {integrity: sha512-aaa, \"\\u0074arball\": 'https://evil.example.com/x.tgz'}\n"), /resolution must be only/);
+  assert.match(bad("packages:\n  x@1.0.0:\n    resolution: {integrity: sha512-aaa, 'tarball': https://evil.example.com/x.tgz}\n"), /resolution must be only/);
+  assert.match(bad("packages:\n  x@1.0.0:\n    resolution:\n      integrity: sha512-aaa\n      \"tar\\x62all\": ../x.tgz\n"), /resolution must be only/);
+});
+
+test("SC-4 round 3: anchors, aliases and merge keys are resolved before checking", () => {
+  const body = "packages:\n  a@1.0.0:\n    resolution: &r {integrity: sha512-aaa, tarball: 'https://evil.example.com/x.tgz'}\n  b@1.0.0:\n    resolution: *r\n";
+  assert.match(bad(body), /packages\["b@1\.0\.0"\] resolution must be only/);
+  const merge = "x-base: &base {tarball: 'https://evil.example.com/x.tgz'}\npackages:\n  a@1.0.0:\n    resolution:\n      <<: *base\n      integrity: sha512-aaa\n";
+  assert.match(bad(merge), /resolution must be only/);
+});
+
+test("SC-4 round 3: multiline values, missing or non-sha integrity fail", () => {
+  assert.match(bad("packages:\n  a@1.0.0:\n    resolution:\n      integrity: >-\n        sha512-aaa\n        https://evil\n"), /resolution must be only/);
+  assert.match(bad("packages:\n  a@1.0.0:\n    engines: {node: '>=18'}\n"), /no resolution object/);
+  assert.match(bad("packages:\n  a@1.0.0:\n    resolution: {integrity: md5-aaa}\n"), /resolution must be only/);
+});
+
+test("SC-4 round 3: package keys, snapshots and importers pointing at git/url fail", () => {
+  assert.match(bad("packages:\n  'x@git+https://evil.example.com/x.git#abc':\n    resolution: {integrity: sha512-aaa}\n"), /not a registry package/);
+  assert.match(bad("snapshots:\n  'x@https://evil.example.com/x.tgz': {}\n"), /snapshots/);
+  assert.match(bad("importers:\n  .:\n    dependencies:\n      zod:\n        specifier: github:evil/zod\n        version: github.com/evil/zod/abc\n"), /outside the registry/);
+  assert.match(bad("importers:\n  .:\n    dependencies:\n      zod:\n        specifier: ^1.0.0\n        version: link:../../etc\n"), /outside the registry/);
+});
+
+test("SC-4 round 3: requiresBuild and bundledDependencies need an allowlist entry", () => {
+  const p = (extra) => `packages:\n  evil@1.0.0:\n    resolution: {integrity: sha512-aaa}\n    ${extra}\n`;
+  assert.match(bad(p("requiresBuild: true")), /requiresBuild/);
+  assert.match(bad(p("bundledDependencies: [x]")), /bundledDependencies/);
+  assert.deepEqual(runGate(repo({}, { lock: lockOf(`packages:\n  esbuild@1.0.0:\n    resolution: {integrity: sha512-aaa}\n    requiresBuild: true\n`) }), ALLOW), []);
+  assert.deepEqual(runGate(repo({}, { lock: lockOf(p("bundledDependencies: [x]")) }), ALLOW + "bundle evil\n"), []);
+});
+
+test("SC-4 round 3: unparsable or bomb lockfiles fail closed", () => {
+  assert.match(bad("packages: [unclosed\n"), /cannot be parsed safely/);
+  assert.match(bad("a: &a [x]\n" + Array.from({ length: 60 }, (_, i) => `k${i}: *a\n`).join("")), /cannot be parsed safely/);
+  assert.match(bad("packages:\n  a@1.0.0: {}\n  a@1.0.0: {}\n"), /cannot be parsed safely/);
 });

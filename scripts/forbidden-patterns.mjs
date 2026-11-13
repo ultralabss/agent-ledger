@@ -52,7 +52,7 @@ export const ALLOW = {
   ],
   "http-request": ["packages/cli/src/hook-send.ts"],
   eval: ["packages/hub/src/guard/worker-guard.ts", "packages/hub/src/guard/worker-guard.test.ts", "packages/hub/src/headless.ts", "packages/hub/src/replies.ts"],
-  "dynamic-code": ["packages/cli/src/hook-bash.test.ts", "packages/cli/src/doctor.ts"],
+  "dynamic-code": ["packages/cli/src/hook-bash.test.ts", "packages/cli/src/doctor.ts", "scripts/deps-gate.mjs"], // deps-gate: resolves the yaml parser
   net: ["packages/hub/src/server.ts"],
   "curl-pipe-sh": [
     "packages/hub/src/guard/worker-guard.ts",

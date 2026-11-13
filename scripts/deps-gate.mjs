@@ -4,12 +4,15 @@
 //     .github/allowed-deps.txt, or one that is not a registry range (git/url/file/link),
 //  2. a workspace package.json defines preinstall/install/postinstall/prepare,
 //  3. pnpm-lock.yaml resolves anything from a tarball URL or git repo,
+//  3b. the lockfile is parsed (not regexed): every package resolution is only a sha integrity,
+//      requiresBuild needs `build`, bundledDependencies needs `bundle`, no non-registry keys;
 //  4. an installed package (node_modules/.pnpm) has an install script or gypfile and is
 //     not listed as `build <name>`.
 // Usage: node scripts/deps-gate.mjs [root]   (default: repo root, run after `pnpm install --ignore-scripts`)
 import { readFileSync, readdirSync, existsSync, statSync } from "node:fs";
 import { join, resolve, dirname } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
+import { createRequire } from "node:module";
 
 const DEP_FIELDS = ["dependencies", "devDependencies", "optionalDependencies", "peerDependencies"];
 const LIFECYCLE = ["preinstall", "install", "postinstall", "prepare", "preprepare", "postprepare", "pnpm:devPreinstall"];
@@ -19,20 +22,79 @@ const REGISTRY_RANGE = /^[\w.\-^~<>=*|+\s]+$/;
 export function parseAllow(text) {
   const dep = new Set();
   const build = new Set();
+  const bundle = new Set();
   for (const raw of text.split("\n")) {
     const line = raw.replace(/#.*/, "").trim();
     if (!line) continue;
     const [kind, name] = line.split(/\s+/);
     if (kind === "dep" && name) dep.add(name);
     else if (kind === "build" && name) build.add(name);
+    else if (kind === "bundle" && name) bundle.add(name);
     else throw new Error(`allowed-deps: bad line "${raw}"`);
   }
-  return { dep, build };
+  return { dep, build, bundle };
 }
 
 function checkOverride(errors, rel, label, value, isBuild = false) {
   if (isBuild) return; // allowBuilds values are booleans; names are checked against `build` below
   if (!REGISTRY_RANGE.test(String(value))) errors.push(`${rel}: ${label}=${value} is not a registry range`);
+}
+
+// The YAML parser is `yaml`, already an allowlisted dependency of packages/shared. It is
+// resolved from this repo (not from the scanned root) so the gate can scan fixtures.
+const HERE = dirname(fileURLToPath(import.meta.url));
+function loadYaml() {
+  return createRequire(join(HERE, "..", "packages", "shared", "package.json"))("yaml");
+}
+
+const INTEGRITY = /^sha(?:256|384|512)-[A-Za-z0-9+/=]+$/;
+const SOURCE_IN_KEY = /@(?:https?:|git[+:@]|github:|gitlab:|bitbucket:|file:|link:|ssh:|jsr:|npm:)|(?:^|\/)(?:git\+|https?:\/\/)/;
+const SOURCE_VERSION = /^(?:git|github:|gitlab:|bitbucket:|https?:|file:|ssh:|jsr:|npm:|catalog:)|^link:(?!\.\.\/[\w-]+$)/;
+
+/** Structured check of pnpm-lock.yaml (fail closed on any parse problem). */
+export function checkLockfile(text, build, bundle = new Set()) {
+  const errors = [];
+  let doc;
+  try {
+    // Anchors and aliases are resolved by the parser; a low alias cap stops expansion bombs.
+    doc = loadYaml().parse(text, { maxAliasCount: 50, uniqueKeys: true });
+  } catch (e) {
+    return [`pnpm-lock.yaml: cannot be parsed safely (${String(e.message).split("\n")[0].slice(0, 80)})`];
+  }
+  if (!doc || typeof doc !== "object" || Array.isArray(doc)) return ["pnpm-lock.yaml: unexpected structure"];
+
+  for (const [key, entry] of Object.entries(doc.packages ?? {})) {
+    if (SOURCE_IN_KEY.test(key)) errors.push(`pnpm-lock.yaml: packages["${key}"] is not a registry package`);
+    const res = entry?.resolution;
+    if (!res || typeof res !== "object" || Array.isArray(res)) {
+      errors.push(`pnpm-lock.yaml: packages["${key}"] has no resolution object`);
+    } else {
+      const keys = Object.keys(res);
+      if (keys.length !== 1 || keys[0] !== "integrity" || !INTEGRITY.test(String(res.integrity))) {
+        errors.push(`pnpm-lock.yaml: packages["${key}"] resolution must be only a sha integrity (found: ${keys.join(",") || "none"})`);
+      }
+    }
+    const name = key.replace(/^(@?[^@]+)@.*$/, "$1");
+    if (entry?.requiresBuild && !build.has(name)) errors.push(`pnpm-lock.yaml: packages["${key}"] requiresBuild and "${name}" is not listed as "build ${name}"`);
+    for (const f of ["bundledDependencies", "bundleDependencies"]) {
+      if (entry && f in entry && !bundle.has(name) && !(Array.isArray(entry[f]) && entry[f].length === 0)) errors.push(`pnpm-lock.yaml: packages["${key}"] has ${f}`);
+    }
+  }
+  for (const key of Object.keys(doc.snapshots ?? {})) {
+    if (SOURCE_IN_KEY.test(key)) errors.push(`pnpm-lock.yaml: snapshots["${key}"] is not a registry package`);
+  }
+  for (const [imp, body] of Object.entries(doc.importers ?? {})) {
+    for (const f of DEP_FIELDS) {
+      for (const [name, v] of Object.entries(body?.[f] ?? {})) {
+        const ver = String(v?.version ?? "");
+        const spec = String(v?.specifier ?? "");
+        if (SOURCE_VERSION.test(ver) || (SOURCE_VERSION.test(spec) && !spec.startsWith("workspace:"))) {
+          errors.push(`pnpm-lock.yaml: importers["${imp}"].${f}.${name} points outside the registry (${ver || spec})`);
+        }
+      }
+    }
+  }
+  return errors;
 }
 
 function readJson(p) {
@@ -70,7 +132,7 @@ function installedPackages(root) {
 }
 
 export function runGate(root, allowText) {
-  const { dep, build } = parseAllow(allowText);
+  const { dep, build, bundle } = parseAllow(allowText);
   const errors = [];
 
   for (const f of workspaceManifests(root)) {
@@ -114,37 +176,7 @@ export function runGate(root, allowText) {
   }
 
   const lock = join(root, "pnpm-lock.yaml");
-  if (existsSync(lock)) {
-    let blockIndent = -1; // indent of a block-style `resolution:` line, -1 when outside one
-    readFileSync(lock, "utf8").split("\n").forEach((line, i) => {
-      const n = i + 1;
-      const indent = line.length - line.trimStart().length;
-      if (blockIndent >= 0) {
-        if (line.trim() && indent > blockIndent) {
-          const key = /^\s*['"]?([\w.-]+)['"]?\s*:/.exec(line)?.[1];
-          if (key !== "integrity") errors.push(`pnpm-lock.yaml:${n}: unexpected resolution field: ${line.trim().slice(0, 100)}`);
-        } else blockIndent = -1;
-      }
-      if (/^\s*resolution:\s*$/.test(line)) blockIndent = indent;
-      // Flow style: `resolution: {integrity: ...}` may contain only `integrity`.
-      const flow = /^\s*resolution:\s*\{(.*)\}\s*$/.exec(line);
-      if (flow) {
-        for (const m of flow[1].matchAll(/(?:^|,)\s*['"]?([\w.-]+)['"]?\s*:/g)) {
-          if (m[1] !== "integrity") errors.push(`pnpm-lock.yaml:${n}: unexpected resolution field "${m[1]}"`);
-        }
-      }
-      // Any tarball/repo/commit/directory/type key, in flow or block style, anywhere in the lockfile.
-      if (/(?:^|[\s{,])['"]?(?:tarball|repo|commit|directory|type)['"]?\s*:/.test(line)) {
-        errors.push(`pnpm-lock.yaml:${n}: non-registry resolution: ${line.trim().slice(0, 100)}`);
-      }
-      // Package keys / versions that point outside the registry.
-      if (/@(?:https?:|git[+:@]|github:|file:|link:|ssh:)|(?:^|\s)(?:'?[^\s]*@)?(?:git\+|https?:\/\/)/.test(line) && !/^\s*resolution:/.test(line) && !/integrity/.test(line)) {
-        if (/^\s+'?[^\s]+'?:\s*(?:'?(?:git\+|https?:|github:|file:|link:)[^\s]*'?)?\s*$/.test(line) || /@(?:https?:|git[+:@]|github:|file:)/.test(line)) {
-          errors.push(`pnpm-lock.yaml:${n}: non-registry reference: ${line.trim().slice(0, 100)}`);
-        }
-      }
-    });
-  }
+  if (existsSync(lock)) errors.push(...checkLockfile(readFileSync(lock, "utf8"), build, bundle));
 
   const seen = new Set();
   for (const { name, pj } of installedPackages(root)) {

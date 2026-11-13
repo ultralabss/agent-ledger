@@ -5,8 +5,9 @@ made public, then tick them off. Nothing here is changed by code or CI.
 
 ## 0. Files to finish
 
-- [ ] Replace `@OWNER` in `CODEOWNERS` with your user or team (an unknown owner
-      silently disables the rule).
+- [x] `CODEOWNERS` names `@fiuipko` (organization `ultralabss`, repo `agent-ledger`). Make sure
+      this account has write access, otherwise code-owner review is silently skipped; add a
+      second owner or a team once there is one.
 - [ ] Enable GitHub Actions only after the pinned workflows are on `main`.
 
 ## 1. Account

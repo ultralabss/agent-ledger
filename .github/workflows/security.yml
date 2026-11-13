@@ -30,7 +30,8 @@ jobs:
       - name: CODEOWNERS has a real owner
         run: |
           test -s CODEOWNERS
-          if grep -q '@OWNER' CODEOWNERS; then echo "CODEOWNERS still contains @OWNER" >&2; exit 1; fi
+          test ! -e .github/CODEOWNERS
+          if grep -q '^[^#]*@OWNER' CODEOWNERS; then echo "CODEOWNERS still contains the @OWNER placeholder" >&2; exit 1; fi
 
   deps-gate:
     name: deps-gate

@@ -1,26 +1,26 @@
 # Every path needs an owner's review (branch protection: "Require review from Code Owners").
-# Replace @OWNER with the maintainer's GitHub user or team before publishing (docs/REPO-SETTINGS.md).
-*                              @OWNER
+# Owner: the maintainer's GitHub account (CI fails if the OWNER placeholder is ever put back).
+*                              @fiuipko
 
 # Supply chain, CI and installers: always the owner.
-/.github/                      @OWNER
-/CODEOWNERS                    @OWNER
-/adapters/                     @OWNER
-/install.sh                    @OWNER
-/uninstall.sh                  @OWNER
-/package.json                  @OWNER
-/pnpm-lock.yaml                @OWNER
-/pnpm-workspace.yaml           @OWNER
-/.gitleaks.toml                @OWNER
-/scripts/                      @OWNER
-/SECURITY.md                   @OWNER
-/CONTRIBUTING.md               @OWNER
-/AGENTS.md                     @OWNER
-/packages/*/package.json       @OWNER
+/.github/                      @fiuipko
+/CODEOWNERS                    @fiuipko
+/adapters/                     @fiuipko
+/install.sh                    @fiuipko
+/uninstall.sh                  @fiuipko
+/package.json                  @fiuipko
+/pnpm-lock.yaml                @fiuipko
+/pnpm-workspace.yaml           @fiuipko
+/.gitleaks.toml                @fiuipko
+/scripts/                      @fiuipko
+/SECURITY.md                   @fiuipko
+/CONTRIBUTING.md               @fiuipko
+/AGENTS.md                     @fiuipko
+/packages/*/package.json       @fiuipko
 
 # Security-relevant hub code.
-/packages/hub/src/guard/       @OWNER
-/packages/hub/src/security/    @OWNER
-/packages/hub/src/http/        @OWNER
-/packages/hub/src/gitleaks.ts  @OWNER
-/packages/shared/src/secrets*  @OWNER
+/packages/hub/src/guard/       @fiuipko
+/packages/hub/src/security/    @fiuipko
+/packages/hub/src/http/        @fiuipko
+/packages/hub/src/gitleaks.ts  @fiuipko
+/packages/shared/src/secrets*  @fiuipko
