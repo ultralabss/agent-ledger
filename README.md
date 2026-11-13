@@ -63,10 +63,10 @@ ledger open                           # sign in to the web UI (one-time code)
 
 ### Install with your AI agent
 
-Paste this into your coding agent (the repo is private for now, so replace `<repo-url>`):
+Paste this into your coding agent:
 
 ```text
-Install Agent Ledger from <repo-url>: follow INSTALL.md
+Install Agent Ledger from https://github.com/ultralabss/agent-ledger : follow INSTALL.md
 ```
 
 The agent checks prerequisites, runs `./install.sh`, verifies that the hub on the
