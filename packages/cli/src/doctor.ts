@@ -12,9 +12,9 @@
  * rate limit.
  */
 
-import { open, readFile, stat } from 'node:fs/promises';
+import { access, constants, open, readFile, stat } from 'node:fs/promises';
 import { homedir } from 'node:os';
-import { join } from 'node:path';
+import { delimiter, join } from 'node:path';
 import { spoolStats } from '@agent-ledger/shared';
 import { bool, type Args } from './args.ts';
 import type { CliEnvConfig } from './client.ts';
@@ -59,6 +59,23 @@ export interface DoctorDeps {
   capture?: typeof runCapture;
   /** Claude Code settings file probed by the optional adapter check. */
   claudeSettingsPath?: string;
+  /** PATH searched for the optional `graphify` probe (default: `process.env.PATH`). */
+  searchPath?: string;
+}
+
+/** First executable `name` found in `pathVar`, or `null`. No process is spawned. */
+export async function findInPath(name: string, pathVar: string | undefined): Promise<string | null> {
+  for (const dir of (pathVar ?? '').split(delimiter)) {
+    if (dir === '') continue;
+    const candidate = join(dir, name);
+    try {
+      await access(candidate, constants.X_OK);
+      if ((await stat(candidate)).isFile()) return candidate;
+    } catch {
+      // not here
+    }
+  }
+  return null;
 }
 
 export async function cmdDoctor(
@@ -197,6 +214,11 @@ export async function cmdDoctor(
   /* ---- claude-code adapter (optional) ---- */
   // Informational only: never a problem. Skipped when Claude Code is not set up.
   lines.push(await adapterLine(deps.claudeSettingsPath ?? join(homedir(), '.claude', 'settings.json')));
+
+  /* ---- graphify (optional, info only) ---- */
+  // A missing graphify is never a problem: the ledger has no dependency on it.
+  const gfy = await findInPath('graphify', deps.searchPath ?? process.env.PATH);
+  lines.push(gfy === null ? 'graphify: not found (optional)' : `graphify: found (${gfy})`);
 
   /* ---- hub.log ---- */
   // A running hub reports `startedAt`: only its own lines matter then. A hub

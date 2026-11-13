@@ -1,0 +1,25 @@
+# Agent Ledger
+
+> Shared memory for parallel AI coding agents: tasks, decisions, file claims and
+> history as plain markdown in git, behind a local hub (127.0.0.1 only). Works
+> with any agent that can run a shell command (`ledger` CLI) or call the local
+> HTTP API. Local only, no cloud.
+
+## Install
+
+- [INSTALL.md](INSTALL.md): step-by-step instructions for an AI agent (prerequisites, `./install.sh`, verification, questions to ask the user, uninstall)
+- [README.md](README.md): overview, usage, configuration
+
+## Use
+
+- [examples/AGENTS.md.snippet](examples/AGENTS.md.snippet): instructions to paste into a project's `AGENTS.md` / `CLAUDE.md`
+- [adapters/claude-code/README.md](adapters/claude-code/README.md): optional Claude Code hooks (installed only with consent)
+
+## Develop
+
+- [AGENTS.md](AGENTS.md): rules for agents changing this repo
+- [CONTRIBUTING.md](CONTRIBUTING.md), [docs/SPEC.md](docs/SPEC.md), [SECURITY.md](SECURITY.md)
+
+## Optional
+
+- graphify (Python) can be used alongside; `ledger doctor` reports whether it is in PATH. Never installed without the user's consent.

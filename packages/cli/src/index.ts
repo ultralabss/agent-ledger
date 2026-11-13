@@ -5,6 +5,7 @@
  */
 
 import { spawn } from 'node:child_process';
+import { realpath } from 'node:fs/promises';
 import { DONE_REF_HINT, isDoneRef, TITLE_MAX, TITLE_WARN } from '@agent-ledger/shared';
 import { bool, csv, flag, flagList, parseArgs, type Args } from './args.ts';
 import { CliError, HubClient, readEnvConfig, type CliEnvConfig, type HubTimeouts } from './client.ts';
@@ -150,7 +151,7 @@ async function dispatch(
 ): Promise<number> {
   switch (cmd) {
     case 'status':
-      return cmdStatus(client, io, io.env);
+      return cmdStatus(client, cfg, io, io.env);
     case 'brief':
       return cmdBrief(args, client, cfg, io);
     case 'repo':
@@ -652,7 +653,24 @@ function session(cfg: CliEnvConfig): string | null {
 
 /* ---------------- commands ---------------- */
 
-async function cmdStatus(client: HubClient, io: Io, env: NodeJS.ProcessEnv): Promise<number> {
+/**
+ * Is the answering hub the one that serves OUR ledger directory? `/v1/healthz`
+ * reports `ledger` only to a caller with the right token, so a foreign process
+ * (or a hub of another ledger) on the port yields `undefined` or a different
+ * path. Paths are compared by realpath (a symlinked $HOME must still match).
+ */
+export async function hubServesLedger(reported: unknown, ledgerDir: string): Promise<boolean> {
+  if (typeof reported !== 'string' || reported === '') return false;
+  const real = (p: string): Promise<string> => realpath(p).catch(() => p);
+  return (await real(reported)) === (await real(ledgerDir));
+}
+
+async function cmdStatus(
+  client: HubClient,
+  cfg: CliEnvConfig,
+  io: Io,
+  env: NodeJS.ProcessEnv,
+): Promise<number> {
   const res = await client.get('/v1/healthz');
   const h = res.json as {
     ok: boolean;
@@ -676,6 +694,16 @@ async function cmdStatus(client: HubClient, io: Io, env: NodeJS.ProcessEnv): Pro
     gitleaks?: { state: 'unknown' | 'ok' | 'untrusted' | 'missing' | 'mismatch'; detail: string | null };
     warnings: { file: string; reason: string }[];
   };
+  if (!(await hubServesLedger(h.ledger, cfg.ledgerDir))) {
+    // Never report success for a stranger on the port: nothing below would be
+    // about THIS ledger. Exit 3 = "the hub (of this ledger) is not running".
+    io.err(
+      `status: ${cfg.baseUrl} does not answer for ledger ${cfg.ledgerDir}` +
+        (typeof h.ledger === 'string' ? ` (it serves ${h.ledger})` : ' (it did not accept this ledger token)') +
+        ' — another process or another hub owns the port; check LEDGER_DIR / LEDGER_HUB_PORT (`ledger doctor`)',
+    );
+    return 3;
+  }
   io.out(
     `hub ${h.ok ? 'ok' : 'warnings'} · port ${h.port} · ledger ${h.ledger} · ${h.repos} repos · ${
       h.items

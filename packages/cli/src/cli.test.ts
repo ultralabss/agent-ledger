@@ -2,6 +2,8 @@
 
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
+import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { createServer } from 'node:http';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
@@ -271,4 +273,43 @@ test('S2: a foreign/https LEDGER_HUB_URL is exit 4, not an unhandled exception',
     LEDGER_DIR: tmpdir(),
   });
   assert.equal(https.code, 4, https.stderr);
+});
+
+test('status: a foreign process or a hub of another ledger on the port is NOT reported as ok', async (t) => {
+  const fx = await startTestHub();
+  t.after(fx.cleanup);
+  const mine = await ledger(['status'], { LEDGER_HUB_URL: fx.url, LEDGER_DIR: fx.dir });
+  assert.equal(mine.code, 0, mine.stderr);
+
+  // Same hub, but the CLI believes in another ledger directory (same token file).
+  const other = await mkdtemp(join(tmpdir(), 'ledger-status-other-'));
+  t.after(() => rm(other, { recursive: true, force: true }));
+  await mkdir(join(other, '.hub'), { recursive: true });
+  await writeFile(join(other, '.hub', 'token'), await readFile(join(fx.dir, '.hub', 'token'), 'utf8'), {
+    mode: 0o600,
+  });
+  const wrongLedger = await ledger(['status'], { LEDGER_HUB_URL: fx.url, LEDGER_DIR: other });
+  assert.equal(wrongLedger.code, 3, wrongLedger.stdout);
+  assert.match(wrongLedger.stderr, /does not answer for ledger/);
+  assert.doesNotMatch(wrongLedger.stdout, /^hub ok/m);
+
+  // A stranger that answers `{ok:true}` to everything and never reveals a ledger.
+  const stranger = createServer((_req, res) => {
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end('{"ok":true}');
+  });
+  await new Promise<void>((r) => stranger.listen(0, '127.0.0.1', r));
+  t.after(
+    () =>
+      new Promise<void>((r) => {
+        stranger.closeAllConnections();
+        stranger.close(() => r());
+      }),
+  );
+  const addr = stranger.address();
+  const url = `http://127.0.0.1:${typeof addr === 'object' && addr !== null ? addr.port : 0}`;
+  const foreign = await ledger(['status'], { LEDGER_HUB_URL: url, LEDGER_DIR: other });
+  assert.equal(foreign.code, 3, foreign.stdout);
+  assert.match(foreign.stderr, /did not accept this ledger token/);
+  assert.equal(foreign.stdout, '');
 });

@@ -2,13 +2,13 @@
  *  when something is actually wrong. */
 
 import assert from 'node:assert/strict';
-import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { chmod, mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { createServer } from 'node:http';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
 import type { CliEnvConfig } from './client.ts';
-import { cmdDoctor, logErrors, pickEntryScript } from './doctor.ts';
+import { cmdDoctor, findInPath, logErrors, pickEntryScript } from './doctor.ts';
 import { parseArgs } from './args.ts';
 import { selfHealMarker } from './selfheal.ts';
 
@@ -220,4 +220,45 @@ test('doctor: claude-code adapter check is info only (skipped without settings, 
   assert.ok(present.some((l) => /1 ledger hook entries installed/.test(l)), present.join('\n'));
   // Informational only: the verdict is driven by the hub being dead, not by the adapter line.
   assert.match(present.at(-1) ?? '', /^DOWN: .*hub is not answering/);
+});
+
+test('doctor: graphify line is info only — found / not found, never a problem', async (t) => {
+  const dir = await ledger(t);
+  const bin = join(dir, 'bin');
+  await mkdir(bin, { recursive: true });
+  const probe = createServer();
+  await new Promise<void>((r) => probe.listen(0, '127.0.0.1', r));
+  const addr = probe.address();
+  const port = typeof addr === 'object' && addr !== null ? String(addr.port) : '0';
+  await new Promise<void>((r) => probe.close(() => r()));
+  const cfg: CliEnvConfig = {
+    baseUrl: `http://127.0.0.1:${port}`,
+    ledgerDir: dir,
+    session: null,
+    agent: 'test',
+  };
+  const run = async (searchPath: string): Promise<string[]> => {
+    const out: string[] = [];
+    await cmdDoctor(
+      parseArgs([]),
+      cfg,
+      {
+        out: (l) => out.push(l),
+        err: (l) => out.push(l),
+        env: { LEDGER_SPOOL_DIR: join(dir, 'spool') } as NodeJS.ProcessEnv,
+      },
+      { platform: 'linux', claudeSettingsPath: join(dir, 'nope.json'), searchPath },
+    );
+    return out;
+  };
+
+  const none = await run(bin);
+  assert.ok(none.includes('graphify: not found (optional)'), none.join('\n'));
+  assert.doesNotMatch(none.at(-1) ?? '', /graphify/, 'a missing graphify must not show up as a problem');
+
+  await writeFile(join(bin, 'graphify'), '#!/bin/sh\nexit 0\n');
+  await chmod(join(bin, 'graphify'), 0o755);
+  const found = await run(bin);
+  assert.ok(found.includes(`graphify: found (${join(bin, 'graphify')})`), found.join('\n'));
+  assert.equal(await findInPath('graphify', ''), null);
 });

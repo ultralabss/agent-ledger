@@ -5,6 +5,7 @@
   "description": "Shared memory for parallel AI coding agents: tasks, decisions, file claims and history as plain markdown in git, behind a local hub.",
   "license": "MIT",
   "author": "Ultra Labs",
+  "packageManager": "pnpm@11.1.2",
   "engines": {
     "node": ">=22.18"
   },

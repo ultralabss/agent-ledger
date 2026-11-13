@@ -3,7 +3,8 @@
 #
 #   git clone <repo> agent-ledger && cd agent-ledger && ./install.sh
 #
-# What it does (nothing outside $HOME, nothing Claude-specific by default):
+# What it does (nothing outside $HOME unless you pass --allow-brew; nothing
+# Claude-specific by default):
 #   1. pnpm install + build the web UI
 #   2. creates the ledger directory (default ~/.ledger, git-initialised,
 #      `.hub/` gitignored) and a verified copy of gitleaks inside it
@@ -15,6 +16,11 @@
 # Options:
 #   --no-service                 skip step 4 (start the hub yourself)
 #   --skip-gitleaks              do not fetch/copy gitleaks (commits go without the second secret check)
+#   --allow-brew                 if the verified gitleaks download fails and gitleaks is not in PATH,
+#                                run `brew install gitleaks` (writes outside $HOME). Without this flag
+#                                brew is only used after an interactive yes; non-interactive runs skip it.
+#   --port <n>                   hub port (same as LEDGER_HUB_PORT, default 4747). If the port is taken by
+#                                another process the installer asks (TTY) or fails with a clear message.
 #   --headless                   let the hub spawn an agent CLI headlessly (intake triage, grooming,
 #                                reply workers): sets LEDGER_HEADLESS=1 and LEDGER_CLAUDE_BIN
 #   --trust-claude-group         Claude Code adapter, optional: accept an agent binary that lives in a
@@ -26,7 +32,7 @@
 #
 # Environment:
 #   LEDGER_DIR            ledger directory (default ~/.ledger)
-#   LEDGER_HUB_PORT       hub port (default 4747)
+#   LEDGER_HUB_PORT       hub port (default 4747; `--port` wins)
 #   SHIM_DIR              where the `ledger` shim goes (default ~/.local/bin)
 #   AGENT_LEDGER_LABEL    service label (default io.agent-ledger.hub)
 #   LEDGER_PUSH, LEDGER_INTRUDE, LEDGER_RECAP_GUARD, LEDGER_RECAP_TAGS, LEDGER_WEB_REPLIES,
@@ -69,6 +75,7 @@ RENDER_UNIT_ONLY=0
 OUT_FILE=""
 NO_SERVICE=0
 SKIP_GITLEAKS=0
+ALLOW_BREW=0
 HEADLESS=0
 # Conscious opt-in to an agent binary in a group-writable directory. Without
 # this flag the hub keeps the headless features OFF instead of executing a
@@ -94,6 +101,14 @@ while (( $# > 0 )); do
     --skip-gitleaks)
       SKIP_GITLEAKS=1
       shift
+      ;;
+    --allow-brew)
+      ALLOW_BREW=1
+      shift
+      ;;
+    --port)
+      PORT="${2:?usage: install.sh --port <number>}"
+      shift 2
       ;;
     --headless)
       HEADLESS=1
@@ -135,6 +150,130 @@ NODE_MINOR="$("$NODE" -p 'process.versions.node.split(".")[1]')"
 if (( NODE_MAJOR < 22 || (NODE_MAJOR == 22 && NODE_MINOR < 18) )); then
   die "node $("$NODE" -v) is too old — type stripping needs >= 22.18"
 fi
+
+validate_port() {
+  [[ "$1" =~ ^[0-9]+$ ]] && (( 10#$1 >= 1 && 10#$1 <= 65535 )) \
+    || die "invalid port \"$1\" — use a number between 1 and 65535 (--port / LEDGER_HUB_PORT)"
+}
+validate_port "$PORT"
+PORT="$((10#$PORT))"
+
+# >>> hub-probe (test seam: install-hub-probe.test.ts extracts this block by marker)
+# Asks whatever answers on 127.0.0.1:$PORT who it is. `/v1/healthz` returns
+# `{ok}` only to an unauthenticated caller; with THIS ledger's token it also
+# returns `ledger` (the hub's ledger directory). A foreign process, or another
+# hub with a different ledger directory, therefore never matches.
+#   exit 0  = this ledger's hub        exit 10 = nothing listening (connection refused)
+#   exit 11 = something else answers (other hub, other ledger, not HTTP, no `ledger` field)
+probe_hub() {
+  LEDGER_PROBE_PORT="$PORT" LEDGER_PROBE_DIR="$LEDGER" "$NODE" -e '
+    const fs = require("node:fs");
+    const dir = process.env.LEDGER_PROBE_DIR;
+    const real = (p) => { try { return fs.realpathSync(p); } catch { return p; } };
+    let token = "";
+    try { token = fs.readFileSync(dir + "/.hub/token", "utf8").trim(); } catch {}
+    fetch("http://127.0.0.1:" + process.env.LEDGER_PROBE_PORT + "/v1/healthz", {
+      headers: token ? { "x-hub-token": token } : {},
+      redirect: "manual",
+      signal: AbortSignal.timeout(2000),
+    }).then(async (res) => {
+      let body = null;
+      try { body = await res.json(); } catch {}
+      const mine = body !== null && typeof body === "object" && typeof body.ledger === "string" &&
+        real(body.ledger) === real(dir);
+      process.exit(mine ? 0 : 11);
+    }, (err) => process.exit(err && err.cause && err.cause.code === "ECONNREFUSED" ? 10 : 11));
+  '
+}
+
+# Before installing a service: the port must be free, or already ours (re-install).
+# Never a silent skip — a hub that "starts" on a port someone else owns would be
+# reported as success while every `ledger` command talks to the stranger.
+ensure_port_available() {
+  local code answer
+  while true; do
+    code=0
+    probe_hub || code=$?
+    case "$code" in
+      10) return 0 ;;
+      0)
+        echo "==> port $PORT: served by this ledger's hub already (re-install)"
+        return 0
+        ;;
+    esac
+    echo "install: port $PORT is in use by another process (not this ledger's hub)." >&2
+    if [[ -t 0 && -t 1 ]]; then
+      answer=""
+      read -r -p "Another port for the hub (empty = abort): " answer || answer=""
+      [[ -n "$answer" ]] || die "aborted — free port $PORT or re-run with --port <n> / LEDGER_HUB_PORT=<n>"
+      validate_port "$answer"
+      PORT="$((10#$answer))"
+    else
+      die "port $PORT is taken — free it, or re-run with --port <n> (or LEDGER_HUB_PORT=<n>)"
+    fi
+  done
+}
+
+# Waits until THIS ledger's hub answers on $PORT, then prints `ledger status`.
+# A different process on the port is a failure, never a success.
+wait_for_hub() {
+  local code=0 foreign=0 _
+  # Migrations at boot can delay the hub for more than a second, and
+  # `ledger status` run before the hub opens its port reports "not running"
+  # even though the service started. Poll up to 30 s.
+  for _ in $(seq 1 60); do
+    code=0
+    probe_hub || code=$?
+    if [[ "$code" == "0" ]]; then
+      break
+    elif [[ "$code" == "11" ]]; then
+      # Our hub may still be starting with the old process answering; a stranger
+      # stays a stranger, so give up after a few consecutive foreign answers.
+      foreign=$((foreign + 1))
+      (( foreign >= 4 )) && break
+    else
+      foreign=0
+    fi
+    sleep 0.5
+  done
+  if [[ "$code" == "11" ]]; then
+    echo "install: something else answers on 127.0.0.1:$PORT — it is not the hub of $LEDGER. Free the port or use --port <n>." >&2
+    return 1
+  fi
+  if [[ "$code" != "0" ]]; then
+    echo "install: hub did not answer on 127.0.0.1:$PORT within 30 s — see $LEDGER/.hub/hub.log" >&2
+    return 1
+  fi
+  LEDGER_DIR="$LEDGER" LEDGER_HUB_PORT="$PORT" LEDGER_HUB_URL="" "$SHIM" status || {
+    echo "install: hub is not answering yet — see $LEDGER/.hub/hub.log" >&2
+    return 1
+  }
+}
+
+# gitleaks via Homebrew writes outside $HOME, so it needs consent: --allow-brew
+# or an interactive yes. Non-interactive without the flag: skipped, with a note.
+brew_gitleaks_if_allowed() {
+  command -v gitleaks >/dev/null 2>&1 && return 0
+  command -v brew >/dev/null 2>&1 || return 0
+  local a=""
+  if [[ "$ALLOW_BREW" == "1" ]]; then
+    echo "==> gitleaks missing — installing via brew (--allow-brew)"
+    brew install gitleaks || echo "    note: brew install gitleaks failed"
+  elif [[ -t 0 && -t 1 ]]; then
+    read -r -p "gitleaks is missing. Install it with Homebrew (writes outside \$HOME)? [y/N] " a || a=""
+    case "$a" in
+      y | Y | yes | YES)
+        brew install gitleaks || echo "    note: brew install gitleaks failed"
+        ;;
+      *) echo "    note: brew install skipped" ;;
+    esac
+  else
+    echo "    note: gitleaks is missing; brew is available but not used without consent."
+    echo "          Re-run with --allow-brew, or install gitleaks yourself."
+  fi
+  return 0
+}
+# <<< hub-probe
 
 # ---------------------------------------------------------------------------
 # Escaping. Values embedded in the service file (paths, port, the agent
@@ -448,6 +587,10 @@ fi
 command -v git >/dev/null 2>&1 || die "git not found in PATH — the ledger is a git repository"
 command -v pnpm >/dev/null 2>&1 || die "pnpm not found in PATH — install it (e.g. \`corepack enable\`)"
 
+if [[ "$NO_SERVICE" != "1" ]]; then
+  ensure_port_available
+fi
+
 echo "==> pnpm install"
 ( cd "$REPO" && pnpm install --frozen-lockfile )
 
@@ -602,10 +745,7 @@ else
   else
     GITLEAKS_REAL=""
     echo "    note: could not download/verify the official release (network, version, platform)."
-    if ! command -v gitleaks >/dev/null 2>&1 && command -v brew >/dev/null 2>&1; then
-      echo "==> gitleaks missing — installing via brew"
-      brew install gitleaks || echo "    note: brew install gitleaks failed"
-    fi
+    brew_gitleaks_if_allowed
     GITLEAKS_SRC="$(command -v gitleaks || true)"
     if [[ -n "$GITLEAKS_SRC" ]]; then
       # realpath: Homebrew's `bin/gitleaks` is a symlink into the Cellar, and the
@@ -725,30 +865,6 @@ esac
 # ---------------------------------------------------------------------------
 # Service
 # ---------------------------------------------------------------------------
-HEALTH_URL="http://127.0.0.1:$PORT/v1/healthz"
-
-wait_for_hub() {
-  local ready=0 _
-  # Migrations at boot can delay the hub for more than a second, and
-  # `ledger status` run before the hub opens its port reports "not running"
-  # even though the service started. Wait on /v1/healthz (up to 30 s).
-  for _ in $(seq 1 60); do
-    if curl -fsS -o /dev/null "$HEALTH_URL" 2>/dev/null; then
-      ready=1
-      break
-    fi
-    sleep 0.5
-  done
-  if [[ "$ready" != "1" ]]; then
-    echo "install: hub did not answer on $HEALTH_URL within 30 s — see $LEDGER/.hub/hub.log" >&2
-    return 1
-  fi
-  "$SHIM" status || {
-    echo "install: hub is not answering yet — see $LEDGER/.hub/hub.log" >&2
-    return 1
-  }
-}
-
 install_launchd() {
   echo "==> launchd agent $PLIST"
   render_plist "$REPO/ops/launchd/agent-ledger.plist.tmpl" "$PLIST"

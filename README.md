@@ -44,17 +44,33 @@ cd agent-ledger && ./install.sh
 `install.sh` installs dependencies, builds the web UI, creates the ledger directory
 (`~/.ledger`, a git repository), puts a `ledger` shim in `~/.local/bin`, and installs a
 background service (launchd on macOS, a systemd user unit on Linux). Useful flags:
-`--no-service`, `--help`. The service label is `AGENT_LEDGER_LABEL`
-(default `io.agent-ledger.hub`). `./uninstall.sh` removes the service and the shim;
-it never touches your ledger data.
+`--no-service`, `--port <n>` (if 4747 is taken; the installer fails with a clear message
+instead of skipping), `--allow-brew` (let it run `brew install gitleaks` as a fallback;
+writes outside `$HOME`), `--help`. The service label is `AGENT_LEDGER_LABEL`
+(default `io.agent-ledger.hub`). `./uninstall.sh` removes the service, the shim and the
+Claude Code hooks (if you installed them); it never touches your ledger data.
 
 Then:
 
 ```sh
-ledger status                         # is the hub up?
+ledger status                         # is this ledger's hub up?
 ledger repo add acme-shop --path ~/projects/acme-shop --prefix ACME
 ledger open                           # sign in to the web UI (one-time code)
 ```
+
+### Install with your AI agent
+
+Paste this into your coding agent (the repo is private for now, so replace `<repo-url>`):
+
+```text
+Install Agent Ledger from <repo-url>: follow INSTALL.md
+```
+
+The agent checks prerequisites, runs `./install.sh`, verifies that the hub on the
+port is this ledger's hub, and asks you before it registers a project, edits your
+`AGENTS.md`, installs Claude Code hooks, or touches graphify. The web UI is at
+`http://ledger.localhost:4747` (or your port): `*.localhost` resolves to loopback by
+itself, so it needs no `/etc/hosts` entry and no `sudo`.
 
 ### Connect an agent
 
