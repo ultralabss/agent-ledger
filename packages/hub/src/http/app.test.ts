@@ -196,6 +196,22 @@ test('hook secret scan sees MultiEdit edits[].file_path, not just file_path', as
   assert.equal(res.text.includes(GITHUB_TOKEN), false);
 });
 
+/* UL-650 (AL-2): a pre-tool-use whose persisted fields carry a secret must
+ * answer with an explicit DENY (200), never a 422 the CLI reads as "skip". */
+test('pre-tool-use with secret-like path fails closed (deny, not 422)', async (t) => {
+  const fx = await startTestHub();
+  t.after(fx.cleanup);
+  const res = await fx.api('POST', '/v1/hooks/pre-tool-use', {
+    session_id: 'gggg0006',
+    hook_event_name: 'PreToolUse',
+    tool_name: 'Edit',
+    tool_input: { file_path: `/tmp/${GITHUB_TOKEN}/file.ts`, old_string: 'a', new_string: 'b' },
+  });
+  assert.equal(res.status, 200, res.text);
+  assert.match(res.text, /"permissionDecision":"deny"/);
+  assert.equal(res.text.includes(GITHUB_TOKEN), false);
+});
+
 test('intake: a secret is redacted, not rejected', async (t) => {
   const fx = await startTestHub();
   t.after(fx.cleanup);

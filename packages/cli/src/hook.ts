@@ -342,7 +342,23 @@ export async function runHook(event: string, io: HookIo): Promise<number> {
         throw err;
       }
     }
-    if (!res.ok) return 0;
+    if (!res.ok) {
+      // UL-650: 422 on a PreToolUse = the hub refused to scan/process the
+      // payload (secret-like value). That is not "hub down": deny, don't skip the guard.
+      if (ev === 'pre-tool-use' && res.status === 422) {
+        io.out(
+          JSON.stringify({
+            hookSpecificOutput: {
+              hookEventName: 'PreToolUse',
+              permissionDecision: 'deny',
+              permissionDecisionReason:
+                'Hook payload was rejected by the hub (secret-like value in a path/cwd/session field); the edit guard cannot verify it.',
+            },
+          }),
+        );
+      }
+      return 0;
+    }
 
     const session = res.headers.get('x-ledger-session');
     if (session) await writeEnvFile(io.env, session, res.headers.get('x-ledger-repo'));

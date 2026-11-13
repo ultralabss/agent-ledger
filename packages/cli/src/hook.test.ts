@@ -467,7 +467,13 @@ test('CLI: guard, intrude, inbox, adopt, override, release-notes', async (t) => 
  * `LEDGER_SELFHEAL=0` in every env below — a unit test must never spawn
  * `launchctl` against the machine's own hub.
  */
-async function mockHub(opts: { body?: string; hang?: boolean; listen?: boolean; port?: number }) {
+async function mockHub(opts: {
+  body?: string;
+  hang?: boolean;
+  listen?: boolean;
+  port?: number;
+  status?: number;
+}) {
   const { createServer } = await import('node:http');
   let hits = 0;
   const server = createServer((req, res) => {
@@ -479,7 +485,7 @@ async function mockHub(opts: { body?: string; hang?: boolean; listen?: boolean; 
     hits += 1;
     req.resume();
     if (opts.hang === true) return; // never answers: the timeout path
-    res.writeHead(200, { 'content-type': 'text/plain' });
+    res.writeHead(opts.status ?? 200, { 'content-type': 'text/plain' });
     res.end(opts.body ?? '');
   });
   const start = (port: number): Promise<void> =>
@@ -585,4 +591,25 @@ test('tool hook keeps its 1 s and a single attempt (no retry)', async (t) => {
   assert.deepEqual(res.out, [], 'the tool hook stays silent even when the hub is not answering');
   assert.equal(mock.hits(), 1, 'a tool hook never retries');
   assert.ok(elapsed < 2_200, `a tool hook must not stretch (${elapsed} ms)`);
+});
+
+// UL-650 (AL-2): a 422 from the hub on a PreToolUse (secret-like value in a
+// persisted field) must DENY, not silently skip the guard.
+test('pre-tool-use + hub 422 → deny (fail-closed); other events stay silent', async (t) => {
+  const dir = await ledgerWithToken(t);
+  const mock = await mockHub({ status: 422, body: '{"error":"SECRET"}' });
+  t.after(() => mock.close());
+  const env = {
+    LEDGER_DIR: dir,
+    LEDGER_HUB_PORT: mock.port,
+    LEDGER_SELFHEAL: '0',
+  } as NodeJS.ProcessEnv;
+  const payload = JSON.stringify({ session_id: 's4', tool_name: 'Edit', cwd: '/tmp' });
+
+  const pre = await runCli(['hook', 'pre-tool-use'], env, payload);
+  assert.equal(pre.code, 0);
+  assert.match(pre.out.join('\n'), /"permissionDecision":"deny"/);
+
+  const post = await runCli(['hook', 'post-tool-use'], env, payload);
+  assert.deepEqual(post.out, []);
 });

@@ -8,6 +8,7 @@
 import { stat } from 'node:fs/promises';
 import { createHash } from 'node:crypto';
 import { Hono, type Context } from 'hono';
+import { preToolUseDeny } from '../guard/output.ts';
 import { bodyLimit } from 'hono/body-limit';
 import { streamSSE } from 'hono/streaming';
 import type { TypeOf, ZodTypeAny } from 'zod';
@@ -1328,6 +1329,7 @@ export function createApp(deps: AppDeps) {
     // path, edited paths. `prompt` and the tool payload are deliberately NOT
     // scanned: they are never written anywhere, and 422-ing them would silently
     // switch off file attribution for any session that edits a `.env`.
+    try {
     assertNoSecrets([
       input.session_id,
       input.agent_type,
@@ -1339,6 +1341,21 @@ export function createApp(deps: AppDeps) {
       // `notebook_path` and let a secret in an edit-array path through.
       ...editPaths(input.tool_input),
     ]);
+    } catch (err) {
+      // UL-650 (AL-2): fail CLOSED. A 422 here is read by the hook CLI as
+      // "hub unhappy → stay silent", i.e. the edit guard would be skipped.
+      // For PreToolUse answer with an explicit deny (never echoing the value).
+      if (err instanceof SecretError && parsedEvent.data === 'pre-tool-use') {
+        c.header('content-type', 'text/plain; charset=utf-8');
+        return c.body(
+          preToolUseDeny(
+            'Hook payload contains a secret-like value (path/cwd/session field); the edit guard cannot run on it. Remove the secret from the path and retry.',
+          ),
+          200,
+        );
+      }
+      throw err;
+    }
     const res = await hooks.handle(parsedEvent.data, input);
     if (res.env) {
       c.header('x-ledger-session', res.env.session);
