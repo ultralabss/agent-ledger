@@ -88,3 +88,18 @@ test("overrides, patches, pnpmfile and unlisted allowBuilds fail", () => {
   assert.match(runGate(repo({}, { ws: "packages:\n  - x\nallowBuilds:\n  evil-pkg: true\n" }), ALLOW).join("\n"), /allowBuilds "evil-pkg"/);
   assert.deepEqual(runGate(repo({}, { ws: "packages:\n  - x\nallowBuilds:\n  esbuild: true\n" }), ALLOW), []);
 });
+
+test("SC-4: quoted-key resolution fields fail (flow and block style)", () => {
+  const cases = [
+    "packages:\n  x@1.0.0:\n    resolution: {'tarball': 'https://evil.example.com/x.tgz'}\n",
+    "packages:\n  x@1.0.0:\n    resolution: {\"tarball\": file:../x.tgz}\n",
+    "packages:\n  x@1.0.0:\n    resolution:\n      \"tarball\": ../x.tgz\n",
+    "packages:\n  x@1.0.0:\n    resolution:\n      integrity: sha512-aaa\n      'repo': ./x\n",
+  ];
+  for (const lock of cases) assert.ok(runGate(repo({}, { lock }), ALLOW).length > 0, lock);
+});
+
+test("SC-4: plain integrity resolutions pass (flow and block)", () => {
+  const lock = "packages:\n  x@1.0.0:\n    resolution: {integrity: sha512-aaa}\n  y@1.0.0:\n    resolution:\n      integrity: sha512-bbb\n    engines: {node: '>=18'}\n";
+  assert.deepEqual(runGate(repo({}, { lock }), ALLOW), []);
+});

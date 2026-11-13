@@ -50,8 +50,13 @@ test("known bypass attempts are caught", () => {
   }
 });
 
-test("pure comments and emoji selectors do not trip code rules", () => {
-  assert.deepEqual(scanText("// mentions eval and fetch(x)\n * Function notes", "packages/hub/src/ok.ts"), []);
+test("SC-1: lines starting with * or inside comments are still scanned", () => {
+  for (const t of ["const r = 1\n  * eval(payload)", "const s = `x\n * require('child_process').exec(y)\n`", "/* hi */ eval(x)", "// eval(x)"]) {
+    assert.ok(scanText(t, "packages/hub/src/evil.ts", { useAllow: false }).length > 0, t);
+  }
+});
+
+test("emoji variation selector after a non-ASCII char is fine", () => {
   assert.deepEqual(scanText("const s = '\u26A0\uFE0F warn';", "packages/hub/src/ok.ts"), []);
 });
 

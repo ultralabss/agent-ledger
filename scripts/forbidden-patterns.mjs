@@ -52,10 +52,15 @@ export const ALLOW = {
   ],
   "http-request": ["packages/cli/src/hook-send.ts"],
   eval: ["packages/hub/src/guard/worker-guard.ts", "packages/hub/src/guard/worker-guard.test.ts", "packages/hub/src/headless.ts", "packages/hub/src/replies.ts"],
-  "dynamic-code": ["packages/cli/src/hook-bash.test.ts"],
+  "dynamic-code": ["packages/cli/src/hook-bash.test.ts", "packages/cli/src/doctor.ts"],
   net: ["packages/hub/src/server.ts"],
-  "curl-pipe-sh": ["packages/hub/src/guard/worker-guard.ts", "packages/hub/src/guard/worker-guard.test.ts"],
-  "bidi-invisible": ["packages/shared/src/md.ts"],
+  "curl-pipe-sh": [
+    "packages/hub/src/guard/worker-guard.ts",
+    "packages/hub/src/guard/worker-guard.test.ts",
+    "packages/cli/src/update-check.test.ts", // hostile tag fixture
+    "scripts/deps-gate.test.mjs", // hostile postinstall fixture
+  ],
+  "bidi-invisible": ["packages/shared/src/md.ts", "packages/cli/src/tidy.test.ts"],
 };
 // Network and process rules are relaxed in test files only (hostile fixtures, local servers).
 const TEST_FILE = /\.test\.(?:ts|mjs|js)$|(^|\/)test-helpers\.ts$/;
@@ -65,8 +70,8 @@ const SKIP_DIRS = new Set(["node_modules", ".git", "dist", ".next", "coverage"])
 const TEXT_EXT = new Set([".ts", ".tsx", ".mts", ".cts", ".js", ".jsx", ".mjs", ".cjs", ".sh", ".yml", ".yaml", ".json", ".toml", ".md", ".txt", ".css", ".html", ".tmpl", ".plist", ".service", ".snippet", ".cjs"]);
 // Rules that do not apply to docs/data (they legitimately discuss or contain such text).
 const DOC_ONLY_RULES = new Set(["bidi-invisible"]);
-// Rules that also apply inside comment-only lines (hidden text, blobs).
-const TEXT_RULES = new Set(["bidi-invisible", "base64", "long-line", "curl-pipe-sh"]);
+// No comment skipping: `*` lines can be code (`1\n * eval(x)`) or template-literal text,
+// so words like eval in a comment need an exact-file ALLOW entry or a rewording.
 const LOCKFILES = new Set(["pnpm-lock.yaml"]);
 
 function allowed(rule, rel) {
@@ -82,10 +87,7 @@ export function scanText(text, rel, opts = {}) {
   const out = [];
   const lines = text.split("\n");
   lines.forEach((line, i) => {
-    // `/* x */ eval(y)` is code, so a block-comment line must not continue after `*/`.
-    const commentOnly = /^\s*\/\//.test(line) || (/^\s*(?:\/\*|\*)/.test(line) && !/\*\/\s*\S/.test(line));
     for (const [rule, re] of Object.entries(RULES)) {
-      if (commentOnly && !TEXT_RULES.has(rule)) continue;
       if (isDoc && !DOC_ONLY_RULES.has(rule)) continue;
       if (rel.endsWith(".json") && (rule === "base64" || rule === "long-line")) continue;
       if (!re.test(line)) continue;

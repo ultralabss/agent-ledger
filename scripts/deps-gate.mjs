@@ -115,10 +115,26 @@ export function runGate(root, allowText) {
 
   const lock = join(root, "pnpm-lock.yaml");
   if (existsSync(lock)) {
+    let blockIndent = -1; // indent of a block-style `resolution:` line, -1 when outside one
     readFileSync(lock, "utf8").split("\n").forEach((line, i) => {
       const n = i + 1;
+      const indent = line.length - line.trimStart().length;
+      if (blockIndent >= 0) {
+        if (line.trim() && indent > blockIndent) {
+          const key = /^\s*['"]?([\w.-]+)['"]?\s*:/.exec(line)?.[1];
+          if (key !== "integrity") errors.push(`pnpm-lock.yaml:${n}: unexpected resolution field: ${line.trim().slice(0, 100)}`);
+        } else blockIndent = -1;
+      }
+      if (/^\s*resolution:\s*$/.test(line)) blockIndent = indent;
+      // Flow style: `resolution: {integrity: ...}` may contain only `integrity`.
+      const flow = /^\s*resolution:\s*\{(.*)\}\s*$/.exec(line);
+      if (flow) {
+        for (const m of flow[1].matchAll(/(?:^|,)\s*['"]?([\w.-]+)['"]?\s*:/g)) {
+          if (m[1] !== "integrity") errors.push(`pnpm-lock.yaml:${n}: unexpected resolution field "${m[1]}"`);
+        }
+      }
       // Any tarball/repo/commit/directory/type key, in flow or block style, anywhere in the lockfile.
-      if (/(?:^|[\s{,])(?:tarball|repo|commit|directory|type)\s*:/.test(line)) {
+      if (/(?:^|[\s{,])['"]?(?:tarball|repo|commit|directory|type)['"]?\s*:/.test(line)) {
         errors.push(`pnpm-lock.yaml:${n}: non-registry resolution: ${line.trim().slice(0, 100)}`);
       }
       // Package keys / versions that point outside the registry.
