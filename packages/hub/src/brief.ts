@@ -30,6 +30,9 @@ function kindLabel(cfg: { kind?: 'repo' | 'system' | 'vps'; host?: string; path:
 }
 import { sessionTag } from './sessions.ts';
 import type { Ledger } from './ledger/ledger.ts';
+import type { RuntimeStore } from './db/store.ts';
+import type { StaleEnv } from './stale.ts';
+import { analyzeRepo, type RepoAnalysis, type TidyCommit } from './tidy.ts';
 
 export interface BriefLive {
   sessions: SessionView[];
@@ -38,6 +41,18 @@ export interface BriefLive {
   git?: GitHeadView | null | undefined;
   release?: ReleaseView | null | undefined;
   orphans?: TouchedView[] | undefined;
+}
+
+/** What the brief needs to show how long items have been idle. Every part is
+ *  optional: without `store` the age comes from the md file alone, without
+ *  `commits` there is no `looks-done` figure. */
+export interface BriefStale {
+  /** Runtime DB: `item_files` and claims count as activity. */
+  store?: RuntimeStore | undefined;
+  /** Commits of the briefed repo's own checkout (`loadTidyCommits`). */
+  commits?: readonly TidyCommit[] | null | undefined;
+  now?: number | undefined;
+  env?: StaleEnv | undefined;
 }
 
 export interface BriefOptions {
@@ -50,6 +65,8 @@ export interface BriefOptions {
   /** `startup` shows 3 queue rows instead of 5. `resume` with nothing
    *  new never reaches here — `sessionStart` answers with one line. */
   lean?: boolean | undefined;
+  /** Item ages and the single `Stale:` line. */
+  stale?: BriefStale | undefined;
 }
 
 const MAX_LINES = 30;
@@ -80,6 +97,44 @@ function eventDigest(ev: JournalEvent): string {
 function shortTitle(item: Item, max = 52): string {
   const t = item.fm.title.replace(/\s+/g, ' ').trim();
   return t.length > max ? `${t.slice(0, max - 1)}…` : t;
+}
+
+/** Below this the age is noise — nobody needs `· 1d` on every row. */
+const AGE_SUFFIX_MIN_DAYS = 3;
+
+interface StaleView {
+  /** ` · 23d` once an item has been idle for 3+ days, else empty. */
+  suffix: (item: Item) => string;
+  /** At most ONE line: `Stale: 4 (oldest 41d) · looks-done 2 → ledger tidy`. */
+  line: string | null;
+}
+
+function staleView(analyses: readonly RepoAnalysis[], showLooksDone: boolean): StaleView {
+  const infos = new Map<string, number>();
+  let stale = 0;
+  let oldest = 0;
+  let looksDone = 0;
+  for (const a of analyses) {
+    for (const r of a.rows) {
+      infos.set(r.item.fm.id, r.info.ageDays);
+      if (!r.info.stale) continue;
+      stale += 1;
+      oldest = Math.max(oldest, r.info.ageDays);
+      if (r.bucket === 'looks-done') looksDone += 1;
+    }
+  }
+  return {
+    suffix: (item) => {
+      const d = infos.get(item.fm.id);
+      return d !== undefined && d >= AGE_SUFFIX_MIN_DAYS ? ` · ${d}d` : '';
+    },
+    line:
+      stale === 0
+        ? null
+        : `Stale: ${stale} (oldest ${oldest}d)${
+            showLooksDone && looksDone > 0 ? ` · looks-done ${looksDone}` : ''
+          } → ledger tidy`,
+  };
 }
 
 /** `↑2 ↓1` — ahead/behind, omitted when zero or unknown. */
@@ -122,11 +177,30 @@ function repoBrief(
   full: boolean,
   context: string | null,
   live?: BriefLive | undefined,
-  extra: { staleContext?: string | null | undefined; lean?: boolean | undefined } = {},
+  extra: {
+    staleContext?: string | null | undefined;
+    lean?: boolean | undefined;
+    stale?: BriefStale | undefined;
+  } = {},
 ): string[] {
   const cfg = ledger.repo(repo);
   const items = ledger.listItems({ repo });
   const open = items.filter((i) => isOpen(i.fm.status));
+  const sv = staleView(
+    [
+      analyzeRepo(
+        {
+          ledger,
+          store: extra.stale?.store,
+          commits: extra.stale?.commits,
+          now: extra.stale?.now,
+          env: extra.stale?.env,
+        },
+        repo,
+      ),
+    ],
+    extra.stale?.commits != null,
+  );
   const doing = open.filter((i) => i.fm.status === 'doing');
   const lines: string[] = [];
 
@@ -168,7 +242,7 @@ function repoBrief(
   if (mine.length > 0) {
     lines.push(`Needs you (${mine.length}):`);
     for (const i of mine.slice(0, full ? mine.length : 5)) {
-      lines.push(`  ${i.fm.id} [${i.fm.kind}] ${i.fm.priority} ${shortTitle(i)}`);
+      lines.push(`  ${i.fm.id} [${i.fm.kind}] ${i.fm.priority} ${shortTitle(i)}${sv.suffix(i)}`);
     }
   }
 
@@ -184,10 +258,12 @@ function repoBrief(
     const cap = full ? queue.length : extra.lean ? LEAN_QUEUE : 5;
     lines.push(`Up next (${queue.length}):`);
     for (const i of queue.slice(0, cap)) {
-      lines.push(`  ${i.fm.id} ${i.fm.priority} ${i.fm.status} ${shortTitle(i)}`);
+      lines.push(`  ${i.fm.id} ${i.fm.priority} ${i.fm.status} ${shortTitle(i)}${sv.suffix(i)}`);
     }
     if (queue.length > cap) lines.push(`  … +${queue.length - cap} — ledger ls --open`);
   }
+
+  if (sv.line) lines.push(sv.line);
 
   const unprocessed = ledger.listIntakeUnprocessed();
   if (unprocessed.length > 0) {
@@ -213,11 +289,24 @@ function repoBrief(
   return lines;
 }
 
-function globalBrief(ledger: Ledger, full: boolean, live?: BriefLive | undefined): string[] {
+function globalBrief(
+  ledger: Ledger,
+  full: boolean,
+  live?: BriefLive | undefined,
+  stale?: BriefStale | undefined,
+): string[] {
   const repos = ledger.repos();
   const all = ledger.listItems();
   const open = all.filter((i) => isOpen(i.fm.status));
   const lines: string[] = [];
+  // No git evidence across every repo here (that is one `git log` per repo),
+  // so no `looks-done` — `ledger tidy --repo <r>` has it.
+  const sv = staleView(
+    Object.keys(repos).map((slug) =>
+      analyzeRepo({ ledger, store: stale?.store, now: stale?.now, env: stale?.env }, slug),
+    ),
+    false,
+  );
   lines.push(
     `ledger · ${Object.keys(repos).length} repos · ${open.length} open · ${
       all.length
@@ -235,7 +324,7 @@ function globalBrief(ledger: Ledger, full: boolean, live?: BriefLive | undefined
   if (human.length > 0) {
     lines.push(`Needs you (${human.length}):`);
     for (const i of human.slice(0, full ? human.length : 5)) {
-      lines.push(`  ${i.fm.id} [${i.fm.kind}] ${i.fm.priority} ${shortTitle(i)}`);
+      lines.push(`  ${i.fm.id} [${i.fm.kind}] ${i.fm.priority} ${shortTitle(i)}${sv.suffix(i)}`);
     }
   }
   const queue = open.filter(
@@ -244,9 +333,10 @@ function globalBrief(ledger: Ledger, full: boolean, live?: BriefLive | undefined
   if (queue.length > 0) {
     lines.push(`Up next (${queue.length}):`);
     for (const i of queue.slice(0, full ? queue.length : 5)) {
-      lines.push(`  ${i.fm.id} ${i.fm.priority} ${i.fm.repo} ${shortTitle(i)}`);
+      lines.push(`  ${i.fm.id} ${i.fm.priority} ${i.fm.repo} ${shortTitle(i)}${sv.suffix(i)}`);
     }
   }
+  if (sv.line) lines.push(sv.line);
   const unprocessed = ledger.listIntakeUnprocessed();
   if (unprocessed.length > 0) {
     lines.push(
@@ -268,8 +358,9 @@ export async function buildBrief(ledger: Ledger, opts: BriefOptions = {}): Promi
     ? repoBrief(ledger, opts.repo, full, await ledger.contextFor(opts.repo), opts.live, {
         staleContext: opts.staleContext,
         lean: opts.lean,
+        stale: opts.stale,
       })
-    : globalBrief(ledger, full, opts.live);
+    : globalBrief(ledger, full, opts.live, opts.stale);
   const footer = 'More: ledger brief --full · ledger history --since 14d';
   const body = full ? lines : lines.slice(0, MAX_LINES - 1);
   if (!full && lines.length > MAX_LINES - 1) {

@@ -207,6 +207,8 @@ Mind the mobile app too.
 | * | dropped | `drop --why` (refuted; duplicates → `dup --into`) |
 | done | open | "needs rework" from the web or `reopen --why` |
 
+**Stale is computed, never stored.** An item in `open`/`doing`/`proposed`/`blocked` is *stale* when its age reaches a threshold. Age = now − `last_activity`, where `last_activity` = max(`updated`, the newest Log/Comments entry, `item_files.last_at`, the newest lease). Thresholds (`LEDGER_STALE_DAYS=N`, default 7): P0/P1 and `proposed` = N days, P2/P3 = 3×N days; an item is stale at exactly the threshold. A `blocked` item is stale only when every open blocker is stale. No file format or frontmatter field changes; the hub returns `age_days` and `stale` in API responses only. Keeping an item is recorded as a normal note `tidy: kept — <reason>` (it resets the age and is auditable in git); there is no snooze in the database. See §9.1.
+
 ### 4.5 Journal
 
 A monthly file, one event = one line, append-only:
@@ -367,7 +369,8 @@ A thin hub client. The session hook sets `LEDGER_SESSION` and `LEDGER_REPO` (in 
 | `ledger intake ls [--new]` · `show <id>` · `triage <id> --items A,B [--drop "text::reason"]` | list, full text with state and items, record the triage |
 | `ledger add --repo --kind --priority --owner [--area] [--intake] [--requested-by] [--blocked-by] [--proposed] "title" --why … --rec … [--step …]` | → `WEB-13` |
 | `ledger ls [--repo] [--owner human] [--status] [--kind] [--priority] [--open]` | list |
-| `ledger show <ID>` | detail |
+| `ledger show <ID> [--origin]` | detail; `--origin` adds where the item came from (§9.1) |
+| `ledger tidy [--repo] [--json] [--limit N] [--bucket b]` | stale items with evidence, read-only; interactive actions only on a TTY (§9.1) |
 | `ledger edit <ID> [--title] [--kind] [--priority] [--owner] [--area]` | edit metadata |
 | `ledger claim <ID> --paths "<glob,…>" --intent "<what I change, which contracts>"` | start of work |
 | `ledger step <ID> <n> done\|undo` · `ledger note <ID> "…"` | plan, note |
@@ -427,6 +430,7 @@ Context: CONTEXT.md · graphify: yes · docs: HANDOFF.md
 Live: 61e0 · ACME-142 doing "auth refactor" · 3 min · apps/server/src/auth/**
 Needs you: ACME-142 [BLOCKER] authorize deploy of v0.26.0
 Up next: ACME-150 P0 · ACME-151 P1 · ACME-143 P1
+Stale: 4 (oldest 41d) · looks-done 2 → ledger tidy
 Intake: 1 unprocessed (web, 09-28 13:10)
 7 days: 09-28 v0.26.0 OAuth + Keys tab · 09-27 ACME-131 done · 09-26 D12 allowlist without e-mails
 Inbox: 0
@@ -443,6 +447,22 @@ Sources of memory:
 | what runs now | sessions + claims from the hub |
 | what is next | the ledger by priority |
 | where something was mentioned | `ledger search` (FTS over items, journal, decisions, intake) |
+
+Items in `Needs you` / `Up next` carry an age suffix (` · 23d`) from 3 days. The briefing has at most one `Stale:` line; it is omitted when nothing is stale, and `looks-done` appears only when git evidence exists.
+
+### 9.1 Stale items and `ledger tidy`
+
+Problem: items created by one session are completed "by accident" in others, or never ticked off, and the session ends. A month later nobody remembers what they meant. Defence in layers, none of which changes the file format:
+
+1. **Age everywhere** — briefing suffix and `Stale:` line (§9), age badge and *Stale* label in the web UI (§13), `age_days` / `stale` in `GET /v1/items/:id`.
+2. **Origin** — `ledger show <ID> --origin` and the *Origin* panel in the web UI: the creating session and its `session.summary` (first 300 characters), the first 300 characters of the intake, the first commit after creation, the top 5 files.
+3. **`ledger tidy [--repo] [--json] [--limit 20] [--bucket b]`** — read-only evidence engine over the item's own repo only (commits from other repos are ignored). Score: a commit with `Refs: <ID>` after the last activity +3 · files recorded for the item changed by another session after creation +2 · title tokens matching commit subjects +1. Buckets: `looks-done` (score ≥ 4) · `abandoned` (stale, no evidence, creating session ended, never claimed) · `unknown` (stale, no intake and empty `## Why`) · `review` (other stale) · `fresh`. Evidence is computed from one cached `git log` per repo plus the `item_files` cache.
+4. **Closing is always a human decision.** `tidy` never closes anything. On a TTY it offers `[d]one --ref <sha>` · `[k]eep --why` · `[x]drop --why` · `[r]eassign` · `[n]ote`, each after an explicit y/N showing the exact command. Without a TTY, or with `--json`, it only prints; `--apply` does not exist. Items with `owner: human` report `agentMayClose=false`. `Closes:` trailers still close automatically as before.
+5. **Prompt-injection safety** — commit subjects, intake and summaries are data written by third parties. API responses carry `untrusted: true` and a `data_notice`; text output frames evidence as data and strips control characters and ANSI sequences.
+
+`GET /v1/items/:id/origin` and `GET /v1/repos/:slug/tidy?limit=&bucket=` back these (GET only, behind the usual `/v1` guard).
+
+**Planned (phase 2):** opt-in handoff guard `LEDGER_HANDOFF_GUARD=1` on the Stop hook (see §10.2) and a weekly digest line in the first briefing after ≥ 7 days (`ledger tidy --digest`, max 10 entries).
 
 ### Related: — a reminder during the session
 
@@ -543,6 +563,8 @@ Doctor is **read-only** — the only `launchctl` verb is `print`, it does not dr
 | PostToolUse | `Bash` | asynchronous `git status` of the checkout; new dirty files are attributed to the session (`via: bash`) | nothing |
 | Stop | — | **optional recap check (`LEDGER_RECAP_GUARD=1`)**: a recap line tagged with one of `LEDGER_RECAP_TAGS` (default `BLOCKER,DEPLOY,RISK,UNVERIFIED`) written as `[TAG]` without an ID `[A-Z]+-\d+` on the same line → block "record it with `ledger`". Respects `stop_hook_active`. Off by default: Stop only heartbeats. | block / nothing |
 | SessionEnd | — | ends the session, orphans, releases claims | nothing |
+
+**Planned:** `LEDGER_HANDOFF_GUARD=1` (off by default) makes the Stop hook block once per session when the session created or claimed items that are still `open`/`doing` without a note, listing "close / release with a note / hand over". It respects `stop_hook_active`, records a mark so it fires only once, and fails open when the hub is unreachable.
 
 The `PostToolUse` output shape is `additionalContext` (the documented envelope); `LEDGER_HUB_POST_TOOL_MODE=block` selects a fallback for agent builds that ignore it. `LEDGER_HUB_GUARD=off` pins every guard to allow until restart; `ledger guard off` does the same at runtime.
 

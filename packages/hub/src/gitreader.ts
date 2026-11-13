@@ -320,6 +320,7 @@ export async function readCommits(
 ): Promise<CommitInfo[]> {
   const res = await git(checkout, [
     'log',
+    '--no-show-signature',
     `--max-count=${limit}`,
     '--reverse',
     '--no-merges',
@@ -368,6 +369,7 @@ export async function readPathCommits(
     checkout,
     [
       'log',
+      '--no-show-signature',
       `--max-count=${limit}`,
       '--no-merges',
       `--since=${sinceDays}.days`,
@@ -376,6 +378,34 @@ export async function readPathCommits(
       relPath,
     ],
     5_000,
+  );
+  if (res.code !== 0) return [];
+  return parseLog(res.stdout);
+}
+
+/**
+ * `ledger tidy`: every commit of HEAD since a point in time, ONE `git log`
+ * for the whole repo (never one per item), newest first, without files. The
+ * `--since` value is built here from a number, never from caller text.
+ */
+export async function readCommitsSince(
+  checkout: string,
+  sinceMs: number,
+  limit = 500,
+  timeoutMs = 8_000,
+): Promise<Omit<CommitInfo, 'files'>[]> {
+  if (!Number.isFinite(sinceMs)) return [];
+  const res = await git(
+    checkout,
+    [
+      'log',
+      '--no-show-signature',
+      `--max-count=${Math.max(1, Math.min(Math.trunc(limit), 2_000))}`,
+      '--no-merges',
+      `--since=${new Date(Math.max(0, sinceMs)).toISOString()}`,
+      `--format=${FORMAT}`,
+    ],
+    timeoutMs,
   );
   if (res.code !== 0) return [];
   return parseLog(res.stdout);
@@ -422,6 +452,7 @@ export async function readPathHistory(
     checkout,
     [
       'log',
+      '--no-show-signature',
       `--max-count=${Math.max(1, Math.min(limit, 200))}`,
       '--no-merges',
       `--format=${FORMAT}`,

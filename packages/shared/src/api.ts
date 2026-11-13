@@ -105,6 +105,10 @@ export interface ItemDetail {
  */
 export interface ItemView extends ItemFrontmatter {
   last_reply: ReplyView | null;
+  /** Computed, only on `GET /v1/items/:id` (never in the item file): days
+   *  since the last activity, and whether that crosses the stale threshold. */
+  age_days?: number;
+  stale?: boolean;
 }
 
 export interface ItemsResponse {

@@ -70,6 +70,7 @@ import {
   normalizeTitle,
   replyCreateSchema,
   sanitizeLine,
+  tidyQuerySchema,
   titleSimilarity,
   untrustedSnippet,
   type DirtyFileView,
@@ -110,6 +111,16 @@ import { redactSecrets, scanSecrets, type LoginCodeStore } from '../security/ind
 import { RepliesError, type Replies } from '../replies.ts';
 import { realpathOrParent, sessionTag, type Sessions } from '../sessions.ts';
 import { staleContextLine } from '../stalecontext.ts';
+import { stalenessResolver } from '../stale.ts';
+import {
+  activityIndex,
+  buildTidy,
+  loadCommitsForBrief,
+  loadTidyCommits,
+  lookupItem,
+  oldestOpenCreated,
+  originOf,
+} from '../tidy.ts';
 import type { Summarizer } from '../summary.ts';
 import { whyOfPath } from '../why.ts';
 import { authPathOf, guard, isCookieCaller, type GuardConfig } from './guard.ts';
@@ -802,7 +813,27 @@ export function createApp(deps: AppDeps) {
   v1.get('/items/:id', (c) => {
     const rec = ledger.getItem(c.req.param('id'));
     if (wantsLine(c)) return c.text(`${itemLine(rec.item)}\n`);
-    return c.json({ item: oneWithLastReply(rec.item.fm), detail: detail(rec.item) });
+    // Computed per request, never written to the item file.
+    const act = activityIndex(deps.store);
+    const info = stalenessResolver(lookupItem(ledger), (i) => act.sources(i))(rec.item);
+    return c.json({
+      item: { ...oneWithLastReply(rec.item.fm), age_days: info.ageDays, stale: info.stale },
+      detail: detail(rec.item),
+    });
+  });
+
+  /** Where an item came from: creating session, its summary, the intake, the
+   *  first commit after creation, the files its commits touched. DATA only —
+   *  every string is cleaned and the answer says it is untrusted. */
+  v1.get('/items/:id/origin', async (c) => {
+    const item = ledger.getItem(c.req.param('id')).item;
+    const commits = await loadTidyCommits(
+      ledger,
+      item.fm.repo,
+      oldestOpenCreated(ledger, item.fm.repo),
+    );
+    c.header('cache-control', 'no-store');
+    return c.json(originOf({ ledger, store: deps.store, commits }, item));
   });
 
   v1.patch('/items/:id', async (c) => {
@@ -1297,6 +1328,7 @@ export function createApp(deps: AppDeps) {
       repo,
       full: boolish(c.req.query('full')),
       staleContext: stale,
+      stale: { store: deps.store, commits: repo ? await loadCommitsForBrief(ledger, repo) : null },
     });
     // SPEC §10 bod 4: an off guard is the first thing a session has to know —
     // `ledger brief` must say it too, not just the SessionStart hook.
@@ -1482,6 +1514,35 @@ export function createApp(deps: AppDeps) {
       { ledger, store: need(deps.store, 'why'), sessions: need(deps.sessions, 'why') },
       parsed.data,
       q.path,
+    );
+    c.header('cache-control', 'no-store');
+    return c.json(view);
+  });
+
+  /* ---------- `ledger tidy`: stale items with evidence (read-only, proposes only) ---------- */
+
+  v1.get('/repos/:slug/tidy', async (c) => {
+    const parsed = slugSchema.safeParse(c.req.param('slug'));
+    if (!parsed.success) throw new LedgerError(422, 'INVALID', 'slug must match [a-z0-9-]+');
+    ledger.repo(parsed.data);
+    const q = query(c, tidyQuerySchema, {
+      limit: c.req.query('limit'),
+      bucket: c.req.query('bucket'),
+    });
+    const store = need(deps.store, 'tidy');
+    const commits = await loadTidyCommits(ledger, parsed.data, oldestOpenCreated(ledger, parsed.data));
+    const view = buildTidy(
+      {
+        ledger,
+        store,
+        commits,
+        sessionEnded: (id) => {
+          const row = store.getSession(id);
+          return row === null || (deps.sessions ? deps.sessions.liveness(row) === 'ended' : row.ended_at !== null);
+        },
+      },
+      parsed.data,
+      { limit: q.limit, bucket: q.bucket },
     );
     c.header('cache-control', 'no-store');
     return c.json(view);

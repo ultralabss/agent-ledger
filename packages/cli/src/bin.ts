@@ -17,5 +17,6 @@ if (process.argv[2] === 'hook') {
     err: (line) => process.stderr.write(`${line}\n`),
     env: process.env,
     cwd: process.cwd(),
+    tty: { stdin: process.stdin.isTTY === true, stdout: process.stdout.isTTY === true },
   });
 }

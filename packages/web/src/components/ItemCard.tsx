@@ -2,6 +2,7 @@ import type { CSSProperties } from 'react';
 import { Link } from 'react-router';
 import type { ItemView } from '@agent-ledger/shared/api';
 import { KIND_COLOR, KIND_LABEL } from '../lib/format.tsx';
+import { AgeBadge } from './AgeBadge.tsx';
 import { repoColorVar } from '../lib/repoColor.ts';
 
 const PRIORITY_COLOR: Record<string, string> = {
@@ -53,6 +54,9 @@ export function ItemCard({ item }: { item: ItemView }) {
         </span>
         <span className="text-[11px]" style={{ color: 'var(--muted-foreground)' }}>
           {item.owner === 'human' ? 'you' : item.owner}
+        </span>
+        <span className="ml-auto">
+          <AgeBadge item={item} />
         </span>
       </div>
       {item.status === 'doing' && item.claimed_by && (

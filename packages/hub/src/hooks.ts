@@ -25,6 +25,7 @@ import type { HookEvent, HookInput } from '@agent-ledger/shared';
 import { frameUntrusted, isOpen, repoKindOf, shortSession, untrustedSnippet } from '@agent-ledger/shared';
 import type { RuntimeStore } from './db/store.ts';
 import { buildBrief } from './brief.ts';
+import { loadCommitsForBrief } from './tidy.ts';
 import { buildDelta } from './delta.ts';
 import type { Coordination } from './coord.ts';
 import type { EditGuard } from './guard/edit-guard.ts';
@@ -208,6 +209,10 @@ export class Hooks {
             // `compact` keep the full one — they are the cases where the agent
             // just lost its context and needs more, not less.
             lean: input.source === 'startup',
+            stale: {
+              store: this.deps.store,
+              commits: await loadCommitsForBrief(this.deps.ledger, started.repo),
+            },
           }),
         );
       }

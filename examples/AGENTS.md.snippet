@@ -30,3 +30,6 @@ memory: what is open, who is working on what, what was decided. Use the
   The hub refuses them (exit code 5).
 - Exit code 3 means the hub is down: keep working and run `ledger wait` once in
   the background; your writes are queued and sent later.
+- A briefing line `Stale: N ... -> ledger tidy` means open items nobody touched for
+  days. Do not close them yourself on a hunch: run `ledger tidy`, show the
+  evidence to the human, and close only with a commit SHA (`ledger done <ID> --ref <sha>`).

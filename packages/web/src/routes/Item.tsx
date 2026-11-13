@@ -7,6 +7,7 @@ import {
   useDoneItem,
   useDropItem,
   useItem,
+  useItemOrigin,
   usePatchItem,
   useReleaseItem,
   useReopenItem,
@@ -20,6 +21,55 @@ import { DepGraph } from '../components/DepGraph.tsx';
 import { findAuthorizedLine } from '../lib/format.tsx';
 import { ReplyStatusChip } from '../components/ReplyStatusChip.tsx';
 import { ReplyPopover } from '../components/ReplyPopover.tsx';
+
+/** Origin panel — every field is untrusted data: plain text only, never HTML/markdown. */
+function OriginPanel({ id }: { id: string }) {
+  const [open, setOpen] = useState(false);
+  const q = useItemOrigin(id, open);
+  const o = q.data;
+  return (
+    <section className="card">
+      <h2 style={{ cursor: 'pointer' }} onClick={() => setOpen((v) => !v)}>
+        Origin {open ? '▾' : '▸'}
+      </h2>
+      {open && q.isLoading && <Loading />}
+      {open && q.isError && <RequestError error={q.error} />}
+      {open && o && (
+        <div>
+          <div className="muted" style={{ fontSize: '0.75rem', marginBottom: '0.4rem' }}>
+            {o.data_notice}
+          </div>
+          <div>session: {o.session ? <code>{o.session}</code> : '—'}</div>
+          {o.sessionSummary && <div>summary: {o.sessionSummary}</div>}
+          {o.intake && <div>intake: {o.intake}</div>}
+          <div>
+            first commit after created:{' '}
+            {o.firstCommitAfterCreated ? (
+              <>
+                <code title={o.firstCommitAfterCreated.sha}>{o.firstCommitAfterCreated.sha.slice(0, 7)}</code>{' '}
+                {o.firstCommitAfterCreated.subject}
+              </>
+            ) : (
+              '—'
+            )}
+          </div>
+          {o.topFiles.length > 0 && (
+            <div>
+              top files:
+              <ul style={{ margin: '0.2rem 0 0' }}>
+                {o.topFiles.map((f) => (
+                  <li key={f}>
+                    <code>{f}</code>
+                  </li>
+                ))}
+              </ul>
+            </div>
+          )}
+        </div>
+      )}
+    </section>
+  );
+}
 
 export function ItemPage() {
   const { id = '' } = useParams();
@@ -67,6 +117,11 @@ export function ItemPage() {
           <KindBadge kind={item.kind} />
           <StatusBadge status={item.status} />
           <PriorityBadge priority={item.priority} />
+          {item.stale && (
+            <span className="badge" style={{ background: 'var(--k-blocking)' }}>
+              Stale · {item.age_days}d
+            </span>
+          )}
           {item.last_reply && <ReplyStatusChip reply={item.last_reply} />}
           <div style={{ marginLeft: 'auto' }}>
             <ReplyPopover item={item} recommended={detail.rec} />
@@ -117,6 +172,8 @@ export function ItemPage() {
         {item.intake && <div className="muted">intake origin: {item.intake}</div>}
         {item.done?.commit && <div className="muted">commit: <code title={item.done.commit}>{item.done.commit.slice(0, 7)}</code></div>}
       </section>
+
+      <OriginPanel id={item.id} />
 
       {(item.blocks.length > 0 || item.blocked_by.length > 0) && (
         <section className="card">

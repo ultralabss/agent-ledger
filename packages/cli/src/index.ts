@@ -29,6 +29,10 @@ export interface Io {
   env: NodeJS.ProcessEnv;
   cwd: string;
   stdin?: () => Promise<string>;
+  /** Whether stdin / stdout are terminals. Absent = not a TTY (tests, pipes). */
+  tty?: { stdin: boolean; stdout: boolean };
+  /** Interactive prompt (tests inject one; a real TTY gets readline). */
+  ask?: (prompt: string) => Promise<string | null>;
 }
 
 const USAGE = `ledger — shared ledger and intake for parallel AI agent sessions
@@ -47,7 +51,9 @@ const USAGE = `ledger — shared ledger and intake for parallel AI agent session
            [--why <t>|-] [--rec <t>|-] [--step "<step>"]… [--intake <id>]
            [--requested-by <ID>] [--blocked-by A,B] [--proposed]
   ledger ls [--repo] [--status] [--owner] [--kind] [--priority] [--open]
-  ledger show <ID>
+  ledger show <ID> [--origin]               item; --origin adds session, intake, first commit, top files
+  ledger tidy [--repo <slug>] [--json] [--limit N] [--bucket looks-done|abandoned|unknown|review|fresh]
+                                          stale items with evidence; read-only (on a TTY: confirm each action)
   ledger claim <ID> [--paths "a/**,b/**"] [--intent "<what I change>"]
   ledger step <ID> <n> done|undo
   ledger note <ID> "<text>"
@@ -196,6 +202,8 @@ async function dispatch(
       return cmdWhose(args, client, io);
     case 'why':
       return cmdWhy(args, client, cfg, io);
+    case 'tidy':
+      return cmdTidy(args, client, cfg, io);
     case 'search':
       return cmdSearch(args, client, cfg, io);
     case 'sessions':
@@ -1121,6 +1129,11 @@ async function cmdShow(args: Args, client: HubClient, io: Io): Promise<number> {
   for (const s of data.detail.steps) io.out(`  ${s.done ? '[x]' : '[ ]'} ${s.n}. ${s.text}`);
   for (const cm of data.detail.comments) io.out(`  ${cm.at} ${cm.author}: ${oneLine(cm.text)}`);
   for (const l of data.detail.log) io.out(`  log ${l.at} ${l.session} ${l.text}`);
+  if (bool(args, 'origin')) {
+    const o = await client.get(`/v1/items/${encodeURIComponent(id)}/origin`);
+    const { formatOrigin } = await import('./tidy.ts');
+    for (const line of formatOrigin(o.json as import('@agent-ledger/shared').ItemOrigin, fm)) io.out(line);
+  }
   return 0;
 }
 
@@ -1352,6 +1365,69 @@ async function cmdWhy(args: Args, client: HubClient, cfg: CliEnvConfig, io: Io):
   }
   const { formatWhy } = await import('./why.ts');
   for (const line of formatWhy(res.json as import('@agent-ledger/shared').WhyView)) io.out(line);
+  return 0;
+}
+
+/**
+ * `ledger tidy` — stale items with evidence. Read-only unless stdin AND stdout
+ * are terminals and `--json` is off; then each action is confirmed one by one.
+ * `--apply` does not exist on purpose: nothing is ever closed unattended.
+ */
+async function cmdTidy(args: Args, client: HubClient, cfg: CliEnvConfig, io: Io): Promise<number> {
+  if (bool(args, 'apply') || flag(args, 'apply') !== undefined) {
+    throw new CliError(4, '--apply is not supported (tidy never closes items non-interactively)');
+  }
+  const { TIDY_BUCKETS } = await import('@agent-ledger/shared');
+  const tidy = await import('./tidy.ts');
+  const repo = flag(args, 'repo') ?? (await resolveRepo(args, client, cfg, io));
+  const query = new URLSearchParams();
+  const limit = flag(args, 'limit');
+  if (limit !== undefined) {
+    if (!/^[1-9][0-9]{0,3}$/.test(limit)) throw new CliError(4, '--limit must be a positive integer');
+    query.set('limit', limit);
+  }
+  const bucket = flag(args, 'bucket');
+  if (bucket !== undefined) {
+    if (!(TIDY_BUCKETS as readonly string[]).includes(bucket)) {
+      throw new CliError(4, `--bucket must be one of ${TIDY_BUCKETS.join(', ')}`);
+    }
+    query.set('bucket', bucket);
+  }
+  const qs = query.toString();
+  const res = await client.get(
+    `/v1/repos/${encodeURIComponent(repo as string)}/tidy${qs ? `?${qs}` : ''}`,
+  );
+  if (bool(args, 'json')) {
+    io.out(JSON.stringify(res.json));
+    return 0;
+  }
+  const resp = res.json as import('@agent-ledger/shared').TidyResponse;
+  const interactive = io.tty?.stdin === true && io.tty?.stdout === true;
+  if (!interactive) {
+    for (const line of tidy.formatTidy(resp)) io.out(line);
+    return 0;
+  }
+  for (const line of tidy.formatTidyHeader(resp)) io.out(line);
+  const entries = Array.isArray(resp.entries) ? resp.entries : [];
+  if (entries.length === 0) {
+    io.out('nothing to tidy');
+    return 0;
+  }
+  const rl = io.ask ? null : await tidy.makeReadlineAsk();
+  const ask = io.ask ?? (rl as NonNullable<typeof rl>).ask;
+  try {
+    await tidy.runTidyInteractive(entries, {
+      ask,
+      out: io.out,
+      ctx: { interactive: true, session: session(cfg), agent: cfg.agent },
+      exec: async (call) => {
+        if (call.method === 'patch') await client.patch(call.path, call.body);
+        else await client.post(call.path, call.body);
+      },
+    });
+  } finally {
+    rl?.close();
+  }
   return 0;
 }
 

@@ -3,6 +3,7 @@ import { useParams } from 'react-router';
 import {
   useReleaseLock,
   useItems,
+  useRepoTidy,
   useLeasesForSessions,
   useOverride,
   useRepo,
@@ -12,6 +13,7 @@ import {
   useTimeline,
 } from '../api/queries.tsx';
 import { Loading, RequestError } from '../components/RequestState.tsx';
+import { itemAge } from '../lib/age.ts';
 import { ItemRow } from '../components/ItemRow.tsx';
 import { RelativeTime } from '../components/RelativeTime.tsx';
 import { Markdown } from '../components/Markdown.tsx';
@@ -129,6 +131,8 @@ export function RepoPage() {
   const { slug = '' } = useParams();
   const repo = useRepo(slug);
   const items = useItems({ repo: slug });
+  const tidy = useRepoTidy(slug);
+  const [staleOnly, setStaleOnly] = useState(false);
   const decisions = useRepoDecisions(slug);
   const timeline = useTimeline({ repo: slug });
   const context = useRepoContext(slug);
@@ -266,12 +270,30 @@ export function RepoPage() {
 
       <section className="card">
         <h2>Board</h2>
+        <div className="row" style={{ marginBottom: '0.5rem' }}>
+          <button
+            type="button"
+            className="badge"
+            aria-pressed={staleOnly}
+            onClick={() => setStaleOnly((v) => !v)}
+            style={{
+              cursor: 'pointer',
+              border: '1px solid var(--k-blocking)',
+              background: staleOnly ? 'var(--k-blocking)' : 'transparent',
+              color: staleOnly ? '#fff' : 'var(--k-blocking)',
+            }}
+          >
+            Stale{tidy.data ? ` · ${tidy.data.stale}` : ''}
+          </button>
+        </div>
         {items.isLoading && <Loading />}
         {items.isError && <RequestError error={items.error} />}
         {items.data && (
           <div className="board">
             {COLUMNS.map((col) => {
-              const list: ItemView[] = items.data.items.filter((i) => col.key.includes(i.status));
+              const list: ItemView[] = items.data.items.filter(
+                (i) => col.key.includes(i.status) && (!staleOnly || itemAge(i)?.stale),
+              );
               return (
                 <div key={col.label} className="board-col">
                   <h3>

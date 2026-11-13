@@ -442,6 +442,12 @@ export const whyQuerySchema = z.object({
   path: singleLine(z.string().min(1).max(400)),
 });
 
+/** `GET /v1/repos/:slug/tidy?limit=&bucket=` */
+export const tidyQuerySchema = z.object({
+  limit: z.coerce.number().int().min(1).max(100).default(20),
+  bucket: z.enum(['looks-done', 'abandoned', 'unknown', 'review', 'fresh']).optional(),
+});
+
 /* ---------- F2: guard, intrude, inbox, orphans (SPEC §10, §11) ---------- */
 
 /** An absolute path from a hook or the CLI. Never trusted before `realpath`. */

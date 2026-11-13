@@ -28,6 +28,7 @@ import type {
   SessionsResponse,
   TimelineResponse,
 } from '@agent-ledger/shared/api';
+import type { ItemOrigin, TidyResponse } from '@agent-ledger/shared';
 import { apiGet, apiPatch, apiPost, qs } from './client.tsx';
 
 export const qk = {
@@ -35,6 +36,8 @@ export const qk = {
   repo: (slug: string) => ['repo', slug] as const,
   items: (params: Record<string, string | undefined>) => ['items', params] as const,
   item: (id: string) => ['item', id] as const,
+  itemOrigin: (id: string) => ['item-origin', id] as const,
+  repoTidy: (slug: string) => ['repo-tidy', slug] as const,
   intake: (status?: string) => ['intake', status] as const,
   intakeOne: (id: string) => ['intake-one', id] as const,
   decisions: (repo?: string) => ['decisions', repo] as const,
@@ -96,6 +99,23 @@ export function useItem(id: string | undefined): UseQueryResult<ItemDetailRespon
     queryKey: qk.item(id ?? ''),
     queryFn: () => apiGet<ItemDetailResponse>(`/v1/items/${encodeURIComponent(id ?? '')}`),
     enabled: Boolean(id),
+  });
+}
+
+/** Lazy: only fetches while the Origin panel is visible (`enabled`). */
+export function useItemOrigin(id: string | undefined, enabled = true): UseQueryResult<ItemOrigin> {
+  return useQuery({
+    queryKey: qk.itemOrigin(id ?? ''),
+    queryFn: () => apiGet<ItemOrigin>(`/v1/items/${encodeURIComponent(id ?? '')}/origin`),
+    enabled: Boolean(id) && enabled,
+  });
+}
+
+export function useRepoTidy(slug: string | undefined): UseQueryResult<TidyResponse> {
+  return useQuery({
+    queryKey: qk.repoTidy(slug ?? ''),
+    queryFn: () => apiGet<TidyResponse>(`/v1/repos/${encodeURIComponent(slug ?? '')}/tidy`),
+    enabled: Boolean(slug),
   });
 }
 

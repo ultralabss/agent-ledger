@@ -207,6 +207,9 @@ function gitBinary(): Promise<string> {
  *    repo we did not create (it is a shell command git would run for us), and
  *    `status` is exactly the command that honours it.
  *  - `-c core.hooksPath=/dev/null`: same reasoning for repo-local hooks.
+ *  - `-c log.showSignature=false`: with it true (repo-local config) `git log`
+ *    runs `gpg.program` (also repo-local) for every signed commit in history —
+ *    arbitrary code execution from a checkout we did not create (UL-669 T1).
  */
 const GIT_GLOBAL_ARGS = [
   '--no-optional-locks',
@@ -214,6 +217,8 @@ const GIT_GLOBAL_ARGS = [
   'core.fsmonitor=false',
   '-c',
   'core.hooksPath=/dev/null',
+  '-c',
+  'log.showSignature=false',
 ];
 
 /** G1: a git child (e.g. `log` on a huge/adversarial repo) can produce
@@ -651,7 +656,12 @@ export class LedgerGit {
    * and no reflog, and that is the normal first-run state.
    */
   async loadState(): Promise<void> {
-    const head = await git(this.opts.root, ['log', '-1', '--format=%h%x00%cI']).catch(() => null);
+    const head = await git(this.opts.root, [
+      'log',
+      '--no-show-signature',
+      '-1',
+      '--format=%h%x00%cI',
+    ]).catch(() => null);
     if (head !== null && head.code === 0) {
       const [sha, when] = head.stdout.trim().split('\0');
       if (sha) this.state.lastCommit = sha;
@@ -872,7 +882,7 @@ export class LedgerGit {
    *  answer (fail closed — an inconclusive history check must not look like
    *  a clean one). */
   private async tokenHistoryClean(): Promise<boolean> {
-    const res = await git(this.opts.root, ['log', '--all', '--format=%H', '--', TOKEN_REL_PATH]).catch(
+    const res = await git(this.opts.root, ['log', '--no-show-signature', '--all', '--format=%H', '--', TOKEN_REL_PATH]).catch(
       (err: unknown) => ({ code: -2, stdout: '', stderr: String(err) }),
     );
     if (res.code !== 0) return false;

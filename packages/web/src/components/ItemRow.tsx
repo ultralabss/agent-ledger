@@ -2,6 +2,7 @@ import type { CSSProperties } from 'react';
 import { Link } from 'react-router';
 import type { ItemView } from '@agent-ledger/shared/api';
 import { KindBadge, PriorityBadge, StatusBadge } from './Badges.tsx';
+import { AgeBadge } from './AgeBadge.tsx';
 import { ReplyStatusChip } from './ReplyStatusChip.tsx';
 import { ReplyPopover } from './ReplyPopover.tsx';
 
@@ -19,6 +20,7 @@ export function ItemRow({ item }: { item: ItemView }) {
         {item.title}
       </Link>
       <span className="muted">{item.owner}</span>
+      <AgeBadge item={item} />
       {item.last_reply && <ReplyStatusChip reply={item.last_reply} />}
       {item.owner === 'human' && <ReplyPopover item={item} />}
     </li>

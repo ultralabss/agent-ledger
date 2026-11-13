@@ -1205,6 +1205,27 @@ export class RuntimeStore {
     );
   }
 
+  /** Every `item_files` row of a repo in ONE query (staleness, `ledger tidy`).
+   *  Bounded: the table keeps at most `ITEM_FILES_CAP` rows per item. */
+  itemFilesByRepo(repo: string): { item_id: string; path: string; n: number; last_at: number }[] {
+    return this.rows<{ item_id: string; path: string; n: number; last_at: number }>(
+      'SELECT item_id, path, n, last_at FROM item_files WHERE repo = ? ORDER BY last_at DESC, n DESC, path',
+      [repo],
+    );
+  }
+
+  /** Per item of a repo: when a claim/lease on it was first taken and last
+   *  touched (taken or released), and how many there were. One grouped query —
+   *  never one per item. */
+  leaseActivityByRepo(repo: string): { item_id: string; first_at: number; last_at: number; n: number }[] {
+    return this.rows<{ item_id: string; first_at: number; last_at: number; n: number }>(
+      `SELECT item_id, MIN(created_at) AS first_at,
+              MAX(MAX(created_at, COALESCE(released_at, 0))) AS last_at, COUNT(*) AS n
+         FROM leases WHERE repo = ? AND item_id IS NOT NULL GROUP BY item_id`,
+      [repo],
+    );
+  }
+
   /** `ledger why`: item files whose path starts with `prefix` (plain string, LIKE
    *  wildcards escaped; SQLite LIKE is ASCII case-insensitive, so the caller
    *  re-matches exactly). Newest first, capped. Scans one repo's rows — the table
