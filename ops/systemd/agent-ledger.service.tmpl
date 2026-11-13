@@ -1,12 +1,12 @@
 # Template. `install.sh` renders it to
 # ~/.config/systemd/user/<label>.service (default label io.agent-ledger.hub)
 # and substitutes:
-#   @NODE@       absolute path to node (quoted, `%` and `$` escaped)
-#   @HUB@        absolute path to packages/hub/src/bin.ts
-#   @LEDGER@     absolute path to the ledger dir
-#   @PORT@       LEDGER_HUB_PORT
-#   @LOG@        <ledger>/.hub/hub.log
-#   @EXTRA_ENV@  extra Environment= lines: optional-feature flags that were set
+#   <NODE>       absolute path to node (quoted, `%` and `$` escaped)
+#   <HUB>        absolute path to packages/hub/src/bin.ts
+#   <LEDGER>     absolute path to the ledger dir
+#   <PORT>       LEDGER_HUB_PORT
+#   <LOG>        <ledger>/.hub/hub.log
+#   <EXTRA_ENV>  extra Environment= lines: optional-feature flags that were set
 #                in the installer's environment and, with `--headless`,
 #                LEDGER_HEADLESS / LEDGER_CLAUDE_BIN (see the plist template).
 # No shell is involved: ExecStart runs node directly with an absolute path.
