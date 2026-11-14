@@ -3,7 +3,8 @@
 You are an AI coding agent asked to install Agent Ledger on the user's machine.
 Follow these steps in order. Do not skip the questions: they are marked **ASK**.
 Never edit files in the ledger directory by hand, never run `sudo`, never edit
-`/etc/hosts`.
+`/etc/hosts`. If you need the user to run a command in their own terminal,
+give exactly one at a time and wait for its output before the next one.
 
 `<repo-dir>` = the directory of this checkout (where `install.sh` lives).
 
@@ -91,7 +92,8 @@ Add only the projects the user names.
 **ASK:** "May I append the ledger section to this project's `AGENTS.md`
 (or `CLAUDE.md`)?" On yes, append the contents of `examples/AGENTS.md.snippet`
 to that file (create it if it does not exist). Show the user what you added.
-Do not change anything else in the file.
+Do not change anything else in the file. The snippet includes the rule "hand the human
+terminal commands one at a time, wait for the output"; do not drop that line.
 
 ## 6. Optional: Claude Code hooks
 

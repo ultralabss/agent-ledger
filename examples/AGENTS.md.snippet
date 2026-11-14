@@ -33,3 +33,10 @@ memory: what is open, who is working on what, what was decided. Use the
 - A briefing line `Stale: N ... -> ledger tidy` means open items nobody touched for
   days. Do not close them yourself on a hunch: run `ledger tidy`, show the
   evidence to the human, and close only with a commit SHA (`ledger done <ID> --ref <sha>`).
+- Commands you hand to the human to run in a terminal: give exactly one at a time.
+  Say where it runs and what it does in one line, then wait for the human to paste
+  the output (or read it yourself if you can see their terminal) before giving the
+  next. Never a list of commands to run at once. Before a command that changes state
+  (install, delete, migrate, push), say in one sentence what it changes and how to
+  undo it. Anything interactive (passwords, tokens, `read -s`) goes only to the
+  human's own terminal, never through the chat, and secret values in output are masked.
