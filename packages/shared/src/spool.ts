@@ -261,9 +261,20 @@ async function assertSafeParentDir(dir: string): Promise<void> {
   if (st.isSymbolicLink()) {
     throw new SpoolError(4, `spool: ${parent} is a symlink — refusing to write there`);
   }
-  if (st.uid !== process.getuid?.()) {
+  if (st.uid !== process.getuid?.() && !isTrustedRootParent(st)) {
     throw new SpoolError(4, `spool: ${parent} is not owned by you — refusing to write there`);
   }
+}
+
+/** A root-owned parent we may sit under: either not writable by group/other
+ *  (e.g. `0755`), or sticky (`/tmp` on Linux: root, `1777`). The sticky bit means nobody but the
+ *  entry's owner (or root) can rename or replace our directory inside it, so a
+ *  root-owned *sticky* parent cannot be used to redirect the spool. A root-owned
+ *  parent that others can write to WITHOUT the sticky bit is still refused. */
+export function isTrustedRootParent(st: { uid: number; mode: number }): boolean {
+  if (st.uid !== 0) return false;
+  const othersCanWrite = (st.mode & 0o022) !== 0;
+  return !othersCanWrite || (st.mode & 0o1000) !== 0;
 }
 
 async function assertSafeDir(dir: string): Promise<void> {

@@ -2,7 +2,7 @@
  *  and the fact collector behind `ledger onboard`. */
 
 import assert from 'node:assert/strict';
-import { mkdir, mkdtemp, rm, symlink, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, realpath, rm, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
@@ -186,7 +186,7 @@ test('ledger onboard: repo facts without an LLM and without running git in a for
   assert.equal(res.status, 200);
   const text = res.text;
   assert.ok(text.split('\n').length <= 31, `at most 30 lines, got ${text.split('\n').length}`);
-  assert.match(text, /^repo \/(private\/)?var\/folders/m);
+  assert.ok(text.split('\n').includes(`repo ${await realpath(repo)}`), 'the first line names the real repo path');
   assert.match(text, /ledger: unregistered · suggested slug agent-ledger-onb-/);
   assert.match(text, /remote: https:\/\/github\.com\/org\/thing\.git/, 'without credentials');
   assert.equal(text.includes('tok@'), false, 'the token from the remote URL is never printed');

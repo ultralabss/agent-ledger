@@ -283,6 +283,11 @@ brew_gitleaks_if_allowed() {
 # inject a second directive into a systemd unit.
 # ---------------------------------------------------------------------------
 xml_escape() {
+  # bash >= 5.2 (`patsub_replacement`, on by default) treats an unquoted `&` in a
+  # `${s//pat/repl}` replacement as "the matched text", so `&lt;` would render
+  # as `<lt;` and the escaping would silently stop working (plist injection).
+  # macOS ships bash 3.2, where the option does not exist.
+  shopt -u patsub_replacement 2>/dev/null || true
   local s="$1"
   s="${s//&/&amp;}"
   s="${s//</&lt;}"

@@ -3,7 +3,7 @@
 
 import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { loadConfig, type HubConfig } from './config.ts';
 import { git } from './git.ts';
 import { Ledger } from './ledger/ledger.ts';
@@ -124,7 +124,7 @@ export async function startTestHub(
     // whose ancestry (`/var` → `/private/var`) is a symlink and therefore
     // never "trusted" in production terms. Bound the chain walk to the temp
     // root so the gate can be exercised at all; production leaves it at `/`.
-    trustStopAt: tmpdir(),
+    trustStopAt: overrides.claudeBin ? dirname(overrides.claudeBin) : tmpdir(),
   });
   await configureGit(tmp.dir);
   const api = async (

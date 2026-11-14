@@ -69,7 +69,7 @@ async function fixture(t: { after: (fn: () => Promise<void> | void) => void }, b
     await rm(agents, { recursive: true, force: true });
   });
   const runner = new HeadlessRunner({
-    trustStopAt: tmpdir(),
+    trustStopAt: binDir,
     ledger: led.ledger,
     config: { ...led.config, claudeBin: bin, agentsDir: agents },
   });
@@ -239,7 +239,7 @@ printf '{"result":"ok","is_error":false}\\n'
     else process.env.SOME_SERVICE_TOKEN = prevToken;
   });
   const runner = new HeadlessRunner({
-    trustStopAt: tmpdir(),
+    trustStopAt: binDir,
     ledger: led.ledger,
     config: { ...led.config, claudeBin: bin, agentsDir: agents },
   });
@@ -291,7 +291,7 @@ printf '{"result":"ok","is_error":false}\\n'
     }
   });
   const runner = new HeadlessRunner({
-    trustStopAt: tmpdir(),
+    trustStopAt: binDir,
     ledger: led.ledger,
     config: { ...led.config, claudeBin: bin, agentsDir: agents },
   });
@@ -332,7 +332,7 @@ test('a missing ledger-keeper.md is a 503, not a hub crash', async (t) => {
     await rm(binDir, { recursive: true, force: true });
   });
   const runner = new HeadlessRunner({
-    trustStopAt: tmpdir(),
+    trustStopAt: binDir,
     ledger: led.ledger,
     config: { ...led.config, claudeBin: await fakeClaude(binDir), agentsDir: join(binDir, 'missing') },
   });
@@ -381,7 +381,7 @@ test('a timeout kills the child and the run fails', async (t) => {
   });
   const bin = await fakeClaude(binDir, '#!/bin/bash\nsleep 30\n');
   const runner = new HeadlessRunner({
-    trustStopAt: tmpdir(),
+    trustStopAt: binDir,
     ledger: led.ledger,
     config: { ...led.config, claudeBin: bin, agentsDir: agents, headlessTimeoutMs: 1_000 },
   });
@@ -398,7 +398,7 @@ test('agentsDir unset: 503 with a clear message and the same text in the status'
     await rm(binDir, { recursive: true, force: true });
   });
   const runner = new HeadlessRunner({
-    trustStopAt: tmpdir(),
+    trustStopAt: binDir,
     ledger: led.ledger,
     config: { ...led.config, claudeBin: await fakeClaude(binDir), agentsDir: null },
   });

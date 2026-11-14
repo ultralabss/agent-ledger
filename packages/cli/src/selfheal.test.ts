@@ -246,8 +246,10 @@ test('a marker that is a symlink is not followed — fail-open, nothing is writt
   await symlink(evilTarget, marker);
 
   // Real (unmocked) deps on purpose — this exercises the actual
-  // `open(..., O_NOFOLLOW)` production code path, not a test double.
-  const res = await triggerSelfHeal({ ledgerDir: dir, env: {} });
+  // `open(..., O_NOFOLLOW)` production code path, not a test double. Only the
+  // platform is pinned: self-heal is darwin-only and returns 'not-darwin'
+  // before it ever reaches the marker on a Linux runner.
+  const res = await triggerSelfHeal({ ledgerDir: dir, env: {}, deps: { platform: 'darwin' } });
   assert.deepEqual([res.attempted, res.reason], [false, 'error']);
   await assert.rejects(stat(evilTarget), 'the symlink target must not be created/written');
   const st = await lstat(marker);

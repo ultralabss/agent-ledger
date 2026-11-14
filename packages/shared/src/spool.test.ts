@@ -8,6 +8,7 @@ import { join } from 'node:path';
 import {
   enqueue,
   ensureSpoolDir,
+  isTrustedRootParent,
   isSpoolableRequest,
   lightSpoolStats,
   readFailedSpool,
@@ -62,6 +63,14 @@ test('ensureSpoolDir refuses a spool dir whose PARENT is a symlink', async () =>
   await symlink(real, parentLink);
   const dir = join(parentLink, 'ledger-spool');
   await assert.rejects(() => ensureSpoolDir(dir), /symlink/);
+});
+
+test('isTrustedRootParent: /tmp-style (root, 1777) passes; root-owned world-writable without sticky and foreign owners do not', () => {
+  assert.equal(isTrustedRootParent({ uid: 0, mode: 0o41777 }), true, 'Linux /tmp');
+  assert.equal(isTrustedRootParent({ uid: 0, mode: 0o40755 }), true, 'root-owned, not writable by others');
+  assert.equal(isTrustedRootParent({ uid: 0, mode: 0o40777 }), false, 'world-writable without the sticky bit');
+  assert.equal(isTrustedRootParent({ uid: 0, mode: 0o40775 }), false, 'group-writable without the sticky bit');
+  assert.equal(isTrustedRootParent({ uid: 1234, mode: 0o41777 }), false, 'sticky but owned by someone else');
 });
 
 /* ---------------- Allowlist ---------------- */
