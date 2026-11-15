@@ -39,7 +39,14 @@ jobs:
       # No lifecycle scripts of any dependency run in CI.
       - run: pnpm install --frozen-lockfile --ignore-scripts
       - run: pnpm typecheck
+      # Hosted Windows runners are elevated; the product refuses to run elevated
+      # (T14, not relaxed), so tests run as a non-elevated local user there.
       - run: pnpm test
+        if: runner.os != 'Windows'
+      - name: pnpm test (non-elevated user)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: ./scripts/ci-win-nonelevated.ps1
       - name: Supply-chain script tests
         run: node --test scripts/*.test.mjs
       # Weak-filesystem tests: a loop-mounted vfat image (no POSIX modes, no
