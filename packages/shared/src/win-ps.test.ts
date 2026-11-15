@@ -131,6 +131,33 @@ test('defaultSpawnFile: output cap and timeout are enforced and reported', async
   assert.notEqual(slow.code, 0);
 });
 
+test('defaultSpawnFile: stdin is closed (EOF), so a child that reads it to the end exits instead of hanging (powershell.exe)', async () => {
+  const r = await defaultSpawnFile(
+    process.execPath,
+    ['-e', 'process.stdin.resume(); process.stdin.on("end", () => process.stdout.write("eof"))'],
+    opts({ timeoutMs: 5_000 }),
+  );
+  assert.equal(r.timedOut, false);
+  assert.equal(r.code, 0);
+  assert.equal(r.stdout, 'eof');
+});
+
+test('inspectWindowsPaths: timeout / non-zero exit say why (bounded, printable stderr), still WinPsError', async () => {
+  const noisy = 'x'.repeat(2000);
+  const spawnT: SpawnFile = async () => ({ ...okRes(), code: null, timedOut: true, stderr: `\u001bboom\u0000\n${noisy}` });
+  await assert.rejects(inspectWindowsPaths(['C:\\Users\\me'], ctx(spawnT)), (e: unknown) => {
+    assert.ok(e instanceof WinPsError);
+    assert.match(e.message, /^powershell timed out after 15000 ms \[stderr: boom x+\]$/);
+    assert.ok(e.message.length < 400);
+    assert.doesNotMatch(e.message, /[\u0000-\u001f]/);
+    return true;
+  });
+  const spawnE: SpawnFile = async () => ({ ...okRes(), code: 1, stderr: 'Get-Acl : Attempted to perform an unauthorized operation.' });
+  await assert.rejects(inspectWindowsPaths(['C:\\Users\\me'], ctx(spawnE)), /powershell exited with 1 \[stderr: Get-Acl : Attempted to perform an unauthorized operation\.\]/);
+  const spawnQ: SpawnFile = async () => ({ ...okRes(), code: 2 });
+  await assert.rejects(inspectWindowsPaths(['C:\\Users\\me'], ctx(spawnQ)), /^WinPsError: powershell exited with 2$/);
+});
+
 test('defaultSpawnFile: a missing binary is an error result, never a throw or a success', async () => {
   const r = await defaultSpawnFile('/definitely/not/here/binary', [], opts());
   assert.equal(r.code, null);

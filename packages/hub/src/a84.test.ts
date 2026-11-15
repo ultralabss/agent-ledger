@@ -16,6 +16,7 @@ import { createHash } from 'node:crypto';
 import { chmod, mkdir, mkdtemp, readFile, readdir, rm, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import test from 'node:test';
 import { GROUP_WRITABLE_MESSAGE, resolveClaudeBin } from './claudebin.ts';
 import { HeadlessRunner } from './headless.ts';

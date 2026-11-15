@@ -979,6 +979,17 @@ test('win32: powershell failure, timeout, oversize output and garbage output are
   }
 });
 
+test('win32: a git.exe probe that times out is REJECTED with the real reason in the message (CI 43713437446: "trust probe failed" hid it)', async () => {
+  const w = winWorld();
+  w.entries.set(GIT, { type: 'file', ino: 12n });
+  w.sddl.set(GIT, GIT_EXE);
+  const spawnFile: SpawnFile = async () => ({ code: null, stdout: '', stderr: 'Windows PowerShell\r\n\u0000boom', timedOut: true, truncated: false });
+  const info = await resolveTrustedExecutable([GIT], {}, { ...winDeps(w), spawnFile });
+  assert.equal(info.path, null, 'fail-closed: no binary is trusted when the probe does not finish');
+  assert.equal(info.rejected.length, 1);
+  assert.match(info.rejected[0] ?? '', /windows trust probe failed: powershell timed out after 15000 ms \[stderr: Windows PowerShell boom\]/);
+});
+
 test('win32: UNC / device / relative paths are refused before any process runs', async () => {
   const w = winWorld();
   for (const p of ['\\\\server\\share\\x', '\\\\?\\C:\\x', '\\\\.\\C:\\x', 'relative\\x', 'C:x', 'C:\\bad*name']) {

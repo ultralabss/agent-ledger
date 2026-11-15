@@ -11,7 +11,8 @@
 import assert from 'node:assert/strict';
 import { chmod, mkdtemp, readdir, readFile, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import test from 'node:test';
 import { buildWorkerArgs, buildWorkerSystemPrompt, workerCommitCommand } from './replies.ts';
 import { makeCodeRepo, startTestHub } from './test-helpers.ts';
@@ -561,7 +562,7 @@ test('I4: worker commit command embeds only a safely-quotable hub hooks path, el
 });
 
 test('I4: no /dev/null core.hooksPath anywhere in non-test src', async () => {
-  const root = new URL('.', import.meta.url).pathname;
+  const root = dirname(fileURLToPath(import.meta.url));
   const files: string[] = [];
   async function walk(dir: string): Promise<void> {
     for (const e of await readdir(dir, { withFileTypes: true })) {

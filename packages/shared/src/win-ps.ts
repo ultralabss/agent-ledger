@@ -20,6 +20,7 @@ export const PS_TIMEOUT_MS = 15_000;
 export const PS_MAX_STDOUT = 1024 * 1024;
 export const TRUST_PATHS_ENV = 'LEDGER_TRUST_PATHS';
 const MAX_PATHS = 64;
+const DIAG_MAX = 300;
 const MAX_PATH_LEN = 4096;
 
 export interface SpawnOpts {
@@ -44,7 +45,7 @@ export type SpawnFile = (file: string, args: readonly string[], opts: SpawnOpts)
 /** Default runner: `execFile` (never a shell), hidden window, bounded time and output. */
 export const defaultSpawnFile: SpawnFile = (file, args, opts) =>
   new Promise((resolve) => {
-    execFile(
+    const child = execFile(
       file,
       [...args],
       {
@@ -76,6 +77,10 @@ export const defaultSpawnFile: SpawnFile = (file, args, opts) =>
         });
       },
     );
+    // powershell.exe keeps reading an open stdin pipe and never exits (execFile leaves one open);
+    // an immediate EOF makes the fixed script the only input. Never carries data.
+    child.stdin?.on('error', () => undefined);
+    child.stdin?.end();
   });
 
 // ---- inputs ---------------------------------------------------------------------------
@@ -254,6 +259,22 @@ export function parseInspectOutput(stdout: string, expected: number): WinInspect
   return { sid: o.sid.toUpperCase(), elevated: o.elevated, paths };
 }
 
+/**
+ * Short, printable tail of what the child said, for the TrustError message (so a CI log shows
+ * WHY a probe failed). The fixed script never prints secrets: only a SID, flags, SDDL and
+ * exception type names; stderr is PowerShell's own text. Control chars stripped, length capped.
+ */
+function diag(res: SpawnResult): string {
+  // eslint-disable-next-line no-control-regex
+  const clean = (t: string): string => t.replace(/[\u0000-\u001f\u007f]+/g, ' ').trim().slice(0, DIAG_MAX);
+  const err = clean(res.stderr);
+  const out = clean(res.stdout);
+  const parts: string[] = [];
+  if (err !== '') parts.push(`stderr: ${err}`);
+  if (out !== '') parts.push(`stdout: ${out}`);
+  return parts.length > 0 ? ` [${parts.join('; ')}]` : '';
+}
+
 /** Run the fixed script over `paths` (one process for the whole batch). */
 export async function inspectWindowsPaths(paths: readonly string[], ctx: WinPsContext): Promise<WinInspect> {
   if (paths.length === 0 || paths.length > MAX_PATHS) throw new WinPsError('bad batch size');
@@ -272,9 +293,9 @@ export async function inspectWindowsPaths(paths: readonly string[], ctx: WinPsCo
     },
   );
   if (res.error !== undefined) throw new WinPsError(`powershell could not start (${res.error})`);
-  if (res.timedOut) throw new WinPsError('powershell timed out');
+  if (res.timedOut) throw new WinPsError(`powershell timed out after ${PS_TIMEOUT_MS} ms${diag(res)}`);
   if (res.truncated) throw new WinPsError('powershell output too large');
-  if (res.code !== 0) throw new WinPsError(`powershell exited with ${String(res.code)}`);
+  if (res.code !== 0) throw new WinPsError(`powershell exited with ${String(res.code)}${diag(res)}`);
   return parseInspectOutput(res.stdout.trim(), paths.length);
 }
 

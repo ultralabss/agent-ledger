@@ -1154,7 +1154,9 @@ async function checkCandidateWin(candidate: string, deps: TrustDeps): Promise<Ca
     insp = await winInspect(chain, deps);
   } catch (err) {
     if (isElevatedError(err)) throw err;
-    return { kind: 'rejected', reason: 'trust probe failed' };
+    // Keep the probe's own reason (timeout / exit code / parse): a bare "probe failed" hid the
+    // real cause in CI. Still a rejection (fail-closed); the text is path-free by construction.
+    return { kind: 'rejected', reason: err instanceof TrustError ? err.message : 'trust probe failed' };
   }
   const f = insp.paths[0];
   if (f === undefined || !f.exists) return { kind: 'absent' };
