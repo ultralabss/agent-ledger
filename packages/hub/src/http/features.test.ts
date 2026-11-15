@@ -6,6 +6,7 @@
 
 import assert from 'node:assert/strict';
 import test from 'node:test';
+import { skipOnWin32 } from '@agent-ledger/shared/testing';
 import { startTestHub } from '../test-helpers.ts';
 
 type Feature = 'intrude' | 'web_replies' | 'headless';
@@ -148,7 +149,7 @@ test('headless on: the routes reach the runner (503 without a binary, empty inta
   assert.equal(groom.json.error, 'UNAVAILABLE');
 });
 
-test('headless off: the runner exists but reports itself as not configured', async (t) => {
+test('headless off: the runner exists but reports itself as not configured', { skip: skipOnWin32('POSIX-only: symlink/chmod/mode bits/uid/shell stubs') }, async (t) => {
   const off = await startTestHub({ headless: false, claudeBin: '/usr/bin/true' });
   t.after(off.cleanup);
   const offHealth = await off.api('GET', '/v1/healthz');

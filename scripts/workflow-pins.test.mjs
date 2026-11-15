@@ -29,3 +29,14 @@ test("all workflows pin actions to full SHA, read-only token, no pull_request_ta
   const all = files.flatMap((f) => violations(f, readFileSync(join(dir, f), "utf8")));
   assert.deepEqual(all, []);
 });
+
+test("ci.yml runs on a windows-latest matrix, fail-fast off, bash shell, no continue-on-error", () => {
+  const ci = readFileSync(join(dir, "ci.yml"), "utf8").replace(/^\s*#.*$/gm, "");
+  const m = /matrix:\s*\n\s*os:\s*\[([^\]]*)\]/.exec(ci);
+  assert.ok(m, "ci.yml has a strategy.matrix.os list");
+  const oses = m[1].split(",").map((x) => x.trim());
+  for (const os of ["ubuntu-latest", "windows-latest", "macos-latest"]) assert.ok(oses.includes(os), `matrix includes ${os}`);
+  assert.match(ci, /fail-fast:\s*false/);
+  assert.match(ci, /^defaults:\s*\n\s+run:\s*\n\s+shell:\s*bash/m);
+  assert.doesNotMatch(ci, /continue-on-error/);
+});

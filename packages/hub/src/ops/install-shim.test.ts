@@ -21,6 +21,7 @@ import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import test from 'node:test';
+import { skipOnWin32 } from '@agent-ledger/shared/testing';
 
 const INSTALL_SH = join(
   dirname(fileURLToPath(import.meta.url)),
@@ -72,7 +73,7 @@ function shQuote(value: string): string {
   return `'${value.replace(/'/g, `'\\''`)}'`;
 }
 
-test('a REPO path with `"` and `$(…)` round-trips through the shim without breaking syntax or injecting', async (t) => {
+test('a REPO path with `"` and `$(…)` round-trips through the shim without breaking syntax or injecting', { skip: skipOnWin32('POSIX-only: sh/awk installer, launchd/systemd units') }, async (t) => {
   const block = await extractShimBlock();
   const base = await mkdtemp(join(tmpdir(), 'agent-ledger-shim-'));
   t.after(() => rm(base, { recursive: true, force: true }));
@@ -120,7 +121,7 @@ test('a REPO path with `"` and `$(…)` round-trips through the shim without bre
   );
 });
 
-test('an empty source glob falls back to .ts, never trusts a stale dist/hook/bin.js', async (t) => {
+test('an empty source glob falls back to .ts, never trusts a stale dist/hook/bin.js', { skip: skipOnWin32('POSIX-only: sh/awk installer, launchd/systemd units') }, async (t) => {
   const block = await extractShimBlock();
   const base = await mkdtemp(join(tmpdir(), 'agent-ledger-shim-empty-'));
   t.after(() => rm(base, { recursive: true, force: true }));

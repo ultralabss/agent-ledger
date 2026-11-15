@@ -17,6 +17,7 @@ import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
+import { skipOnWin32 } from '@agent-ledger/shared/testing';
 
 import { resolveClaudeBin } from './claudebin.ts';
 import { git, LedgerGit } from './git.ts';
@@ -38,7 +39,7 @@ async function recordSha(bin: string): Promise<void> {
 
 /* ---------------- the scanner fails closed ---------------- */
 
-test('gitleaks timeout (code -2) BLOCKS the commit and is marked retryable', async (t) => {
+test('gitleaks timeout (code -2) BLOCKS the commit and is marked retryable', { skip: skipOnWin32('POSIX-only: symlink/chmod/mode bits/uid/shell stubs') }, async (t) => {
   const dir = await temp(t, 'r71-timeout');
   resetGitleaksCache();
   t.after(() => resetGitleaksCache());
@@ -57,7 +58,7 @@ test('gitleaks timeout (code -2) BLOCKS the commit and is marked retryable', asy
   assert.doesNotMatch(res.note ?? '', /ran without a second check/);
 });
 
-test('a failed spawn (code -1) BLOCKS the commit', async (t) => {
+test('a failed spawn (code -1) BLOCKS the commit', { skip: skipOnWin32('POSIX-only: symlink/chmod/mode bits/uid/shell stubs') }, async (t) => {
   const dir = await temp(t, 'r71-spawn');
   resetGitleaksCache();
   t.after(() => resetGitleaksCache());
@@ -151,7 +152,7 @@ test('health line names a missing, unverified and stale scanner differently', ()
   assert.deepEqual(ok, [], 'a healthy scanner reports nothing');
 });
 
-test('sha256 mismatch → state `mismatch`, not the catch-all `untrusted`', async (t) => {
+test('sha256 mismatch → state `mismatch`, not the catch-all `untrusted`', { skip: skipOnWin32('POSIX-only: symlink/chmod/mode bits/uid/shell stubs') }, async (t) => {
   const dir = await temp(t, 'r74-mismatch');
   resetGitleaksCache();
   t.after(() => resetGitleaksCache());
@@ -255,7 +256,7 @@ test('rotation repeats even after the token was untracked and the hold is releas
   );
 });
 
-test('retrySecurityHold is a no-op without a hold and does not do a second lockdown', async (t) => {
+test('retrySecurityHold is a no-op without a hold and does not do a second lockdown', { skip: skipOnWin32('POSIX-only: symlink/chmod/mode bits/uid/shell stubs') }, async (t) => {
   const dir = await temp(t, 'a92-noop');
   await git(dir, ['init', '-q', '-b', 'main']);
   const logs: string[] = [];
@@ -337,7 +338,7 @@ test('a path other than the pinned one → headless disabled with a message', as
   assert.match(status.detail ?? '', /the allowed path was/);
 });
 
-test('a binary that is trusted even without the opt-in stays enabled', async (t) => {
+test('a binary that is trusted even without the opt-in stays enabled', { skip: skipOnWin32('POSIX-only: symlink/chmod/mode bits/uid/shell stubs') }, async (t) => {
   const root = await temp(t, 'a91-clean');
   const dir = join(root, 'bin');
   await mkdir(dir, { recursive: true, mode: 0o755 });

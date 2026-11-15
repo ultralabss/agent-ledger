@@ -63,3 +63,23 @@ test('time: parseSince understands 7d/36h/90m', () => {
   assert.equal(parseSince('90m'), 90 * 60_000);
   assert.throws(() => parseSince('tomorrow'), /cannot parse/);
 });
+
+test('B3: CRLF journal text parses every event (no `\\r` drops the line)', () => {
+  const text =
+    '# acme — journal 2026-09\r\n' +
+    '- 2026-09-28 13:12 · 61e0 · session.summary · did a thing\r\n' +
+    '- 2026-09-28 13:15 · a9f2 (acme · ACME-13) · item.status · ACME-13 · open → done\r\n';
+  const evs = parseJournal(text, 'acme');
+  assert.equal(evs.length, 2);
+  assert.equal(evs[0]?.type, 'session.summary');
+  assert.deepEqual(evs[0]?.fields, ['did a thing']);
+  assert.equal(evs[1]?.session, 'a9f2 (acme · ACME-13)');
+  assert.deepEqual(evs[1]?.fields, ['ACME-13', 'open → done']);
+  // single CRLF line too, and CRLF parse equals LF parse
+  assert.equal(parseJournalLine('- 2026-09-28 13:12 · 61e0 · commit · x\r', 'acme')?.fields[0], 'x');
+  assert.deepEqual(parseJournal(text, 'acme'), parseJournal(text.replace(/\r\n/g, '\n'), 'acme'));
+});
+
+test('B3: writers emit LF only', () => {
+  assert.equal(journalLine({ session: '61e0', type: 'commit', fields: ['a'] }).includes('\r'), false);
+});

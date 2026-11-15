@@ -53,6 +53,7 @@ import { day, isoLocal, month, shortSession, stamp } from '@agent-ledger/shared'
 import { expandHome, type HubConfig } from '../config.ts';
 import { conflict, invalid, notFound, LedgerError } from '../errors.ts';
 import { gitToplevel, LedgerGit } from '../git.ts';
+import { normalizeGitPath, samePathGit } from '../gitpath.ts';
 import { MemoryIndex, type ItemFilter, type LedgerIndex, type StoredItem } from '../index-store.ts';
 import { appendLine, ensureDir, ensureFile, readText, tighten, writeAtomic } from './fsops.ts';
 import { LedgerPaths } from './paths.ts';
@@ -110,6 +111,10 @@ export interface CreateItemInput {
  *  gain these lines, and `git add -A` would pick up `.hub/token`. */
 const GITIGNORE_LINES = ['.hub/', '*.tmp'];
 const GITIGNORE = `${GITIGNORE_LINES.join('\n')}\n`;
+
+/** Ledger files are LF on every platform (parsers tolerate CRLF, writers emit LF).
+ *  Stops Windows `core.autocrlf` from rewriting them and making every file dirty. */
+const GITATTRIBUTES_LINE = '* text eol=lf';
 
 export class Ledger {
   readonly paths: LedgerPaths;
@@ -169,6 +174,7 @@ export class Ledger {
     await ensureDir(this.paths.hubDir, 0o700);
     await this.git.init();
     await this.ensureGitignore();
+    await this.ensureGitattributes();
     const created = await ensureFile(
       this.paths.reposYml,
       stringifyYaml({ ops: { kind: 'system', prefix: 'OPS', path: null, next: 1 } }, { lineWidth: 0 }),
@@ -193,6 +199,23 @@ export class Ledger {
     if (missing.length === 0) return;
     const next = `${existing.replace(/\n*$/, '\n')}${missing.join('\n')}\n`;
     await writeAtomic(this.paths.gitignore, next, 0o600);
+  }
+
+  /** Create `.gitattributes` with `* text eol=lf`, or PREPEND the line to a
+   *  user-written file that lacks it (idempotent). Prepended, not appended:
+   *  gitattributes is last-match-wins, so the user's later, more specific rules
+   *  (`*.png binary`) keep precedence and nothing of theirs is rewritten. */
+  private async ensureGitattributes(): Promise<void> {
+    const existing = await readText(this.paths.gitattributes);
+    if (existing === null) {
+      await writeAtomic(this.paths.gitattributes, `${GITATTRIBUTES_LINE}\n`, 0o600);
+      return;
+    }
+    const has = existing
+      .split(/\r?\n/)
+      .some((l) => l.trim().replace(/\s+/g, ' ') === GITATTRIBUTES_LINE);
+    if (has) return;
+    await writeAtomic(this.paths.gitattributes, `${GITATTRIBUTES_LINE}\n${existing}`, 0o600);
   }
 
   /* ---------------- repos.yml ---------------- */
@@ -397,7 +420,7 @@ export class Ledger {
           `"${input.path}" is not a git repository (git rev-parse --show-toplevel failed)`,
         );
       }
-      path = top;
+      path = normalizeGitPath(top);
     }
     return this.queue.run(async () => {
       await this.loadRepos();
@@ -409,7 +432,7 @@ export class Ledger {
       }
       if (path) {
         const dup = Object.entries(this.reposRaw).find(
-          ([, cfg]) => cfg.path && expandHome(cfg.path) === path,
+          ([, cfg]) => cfg.path && samePathGit(expandHome(cfg.path), path as string),
         );
         if (dup) throw conflict(`path "${path}" is already held by repo "${dup[0]}"`);
       }
@@ -435,7 +458,7 @@ export class Ledger {
     const top = await gitToplevel(dir);
     if (!top) return null;
     for (const [slug, cfg] of Object.entries(this.reposRaw)) {
-      if (cfg.path && expandHome(cfg.path) === top) return slug;
+      if (cfg.path && samePathGit(expandHome(cfg.path), top)) return slug;
     }
     return null;
   }
@@ -1408,7 +1431,7 @@ export class Ledger {
       if (existing === null) {
         await writeAtomic(file, `# ${repo} — journal ${month(at)}\n${line}\n`, 0o600);
       } else {
-        const lines = existing.split('\n');
+        const lines = existing.split(/\r?\n/);
         // Match on the session and type columns of the rendered line, which is
         // the same shape `journalLine` just produced — no re-parsing needed.
         const marker = `${SEP}${short}${SEP}${type}${SEP}`;

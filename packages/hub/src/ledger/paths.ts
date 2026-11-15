@@ -27,6 +27,10 @@ export class LedgerPaths {
     return join(this.root, '.gitignore');
   }
 
+  get gitattributes(): string {
+    return join(this.root, '.gitattributes');
+  }
+
   get intakeRoot(): string {
     return join(this.root, 'intake');
   }

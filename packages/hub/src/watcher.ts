@@ -3,6 +3,7 @@
  *  write queue so it never interleaves with a write in flight. */
 
 import { watch, type FSWatcher } from 'node:fs';
+import { toPosix } from './gitpath.ts';
 import type { Ledger } from './ledger/ledger.ts';
 
 export interface Watcher {
@@ -11,7 +12,7 @@ export interface Watcher {
   settled(): Promise<void>;
 }
 
-const IGNORE = /(^|\/)(\.hub|\.git)(\/|$)|\.tmp$/;
+export const IGNORE = /(^|\/)(\.hub|\.git)(\/|$)|\.tmp$/;
 
 export function startWatcher(ledger: Ledger, debounceMs = 150): Watcher {
   let timer: NodeJS.Timeout | null = null;
@@ -33,7 +34,7 @@ export function startWatcher(ledger: Ledger, debounceMs = 150): Watcher {
 
   try {
     fsw = watch(ledger.paths.root, { recursive: true }, (_event, filename) => {
-      if (filename && IGNORE.test(filename.toString())) return;
+      if (filename && IGNORE.test(toPosix(filename.toString()))) return;
       schedule();
     });
     fsw.on('error', (err) => ledger.log(`watcher error: ${String(err)}`));

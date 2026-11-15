@@ -6,6 +6,7 @@ import { chmod, mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
+import { skipOnWin32 } from '@agent-ledger/shared/testing';
 import { isDoneRef, parseItem, type ItemRepair } from '@agent-ledger/shared';
 import { redactUrlCredentials } from './git.ts';
 import { gitleaksAvailability, resetGitleaksCache, scanStaged } from './gitleaks.ts';
@@ -149,7 +150,7 @@ test('rotateLog copy-truncates at the cap and keeps N files', async (t) => {
  *  (which `rotateLog` used to call) follows symlinks, so a planted
  *  `hub.log → /some/other/file` would get ITS content truncated and copied
  *  into `hub.log.1` instead of being left alone. */
-test('hub.log as a symlink is not followed — rotation is skipped', async (t) => {
+test('hub.log as a symlink is not followed — rotation is skipped', { skip: skipOnWin32('POSIX-only: symlink/chmod/mode bits/uid/shell stubs') }, async (t) => {
   const dir = await mkdtemp(join(tmpdir(), 'agent-ledger-log-symlink-'));
   t.after(() => rm(dir, { recursive: true, force: true }));
   const { symlink } = await import('node:fs/promises');
@@ -166,7 +167,7 @@ test('hub.log as a symlink is not followed — rotation is skipped', async (t) =
   assert.equal(await stat(`${log}.1`).catch(() => null), null, 'hub.log.1 must not be created from the symlink target');
 });
 
-test('store.checkpoint truncates the WAL and is safe to repeat', async (t) => {
+test('store.checkpoint truncates the WAL and is safe to repeat', { skip: skipOnWin32('POSIX-only: symlink/chmod/mode bits/uid/shell stubs') }, async (t) => {
   const fx = await startTestHub();
   t.after(fx.cleanup);
   fx.hub.store.checkpoint();
@@ -189,7 +190,7 @@ async function fakeBin(dir: string, name: string): Promise<string> {
   return bin;
 }
 
-test('A8-4: a gitleaks copy in a group-writable dir is untrusted, not "not installed"', async (t) => {
+test('A8-4: a gitleaks copy in a group-writable dir is untrusted, not "not installed"', { skip: skipOnWin32('POSIX-only: symlink/chmod/mode bits/uid/shell stubs') }, async (t) => {
   const dir = await mkdtemp(join(tmpdir(), 'agent-ledger-n1-'));
   t.after(() => rm(dir, { recursive: true, force: true }));
   const binDir = join(dir, 'bin');

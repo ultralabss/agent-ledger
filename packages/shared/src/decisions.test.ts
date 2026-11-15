@@ -21,3 +21,14 @@ test('S4: forged "### D99" inside a decision body stays part of the original D1'
   assert.equal(all.length, 2);
   assert.equal(all[1]?.n, 2);
 });
+
+test('B3: CRLF DECISIONS.md parses like LF', () => {
+  const lf = '### D1 · 2026-01-02 · first\nbody a\nbody b\n\n### D2 · 2026-01-03 · second\nbody c\n';
+  const crlf = lf.replace(/\n/g, '\r\n');
+  const out = parseDecisions(crlf, 'acme');
+  assert.deepEqual(out, parseDecisions(lf, 'acme'));
+  assert.equal(out.length, 2);
+  assert.equal(out[0]?.title, 'first');
+  assert.equal(out[0]?.body.includes('\r'), false);
+  assert.equal(nextDecisionNumber(out), 3);
+});

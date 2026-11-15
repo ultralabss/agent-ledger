@@ -484,3 +484,22 @@ manual
 - 2026-09-28 14:02 · — · manual edit
 `;
 }
+
+test('B3: init writes .gitattributes `* text eol=lf`; existing file is kept, line prepended once', async (t) => {
+  const fresh = await openTestLedger();
+  t.after(fresh.cleanup);
+  assert.equal(await readFile(fresh.ledger.paths.gitattributes, 'utf8'), '* text eol=lf\n');
+
+  const tmp = await tempConfig();
+  t.after(tmp.cleanup);
+  await mkdir(tmp.dir, { recursive: true });
+  await writeFile(`${tmp.dir}/.gitattributes`, '*.png binary\r\n', 'utf8');
+  const ledger = new Ledger({ config: tmp.config, log: () => {} });
+  await ledger.init();
+  t.after(() => ledger.close());
+  const text = await readFile(ledger.paths.gitattributes, 'utf8');
+  assert.equal(text, '* text eol=lf\n*.png binary\r\n', 'user content untouched, our line first so theirs win');
+
+  await ledger.init(); // idempotent
+  assert.equal(await readFile(ledger.paths.gitattributes, 'utf8'), text);
+});

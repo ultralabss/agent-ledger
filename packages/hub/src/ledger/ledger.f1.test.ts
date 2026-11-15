@@ -4,6 +4,7 @@
 import assert from 'node:assert/strict';
 import { chmod, readFile, rm, writeFile } from 'node:fs/promises';
 import test from 'node:test';
+import { skipOnWin32 } from '@agent-ledger/shared/testing';
 import { git } from '../git.ts';
 import { openTestLedger, startTestHub, tempConfig } from '../test-helpers.ts';
 import { Ledger } from './ledger.ts';
@@ -214,7 +215,7 @@ test('H5: done.commit stored as a 7-char abbreviated sha is still recognised as 
 
 /* ---------------- backlog: `next` comes back on a failed write ---------------- */
 
-test('backlog: when an item write fails, `next` is returned (no gap in ids)', async (t) => {
+test('backlog: when an item write fails, `next` is returned (no gap in ids)', { skip: skipOnWin32('POSIX-only: symlink/chmod/mode bits/uid/shell stubs') }, async (t) => {
   const fx = await openTestLedger();
   t.after(async () => {
     await chmod(fx.ledger.paths.itemsDir('acme'), 0o700).catch(() => undefined);

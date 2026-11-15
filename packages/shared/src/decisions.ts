@@ -14,7 +14,7 @@ export function parseDecisions(text: string, repo: string): Decision[] {
       out.push(current);
     }
   };
-  for (const raw of text.split('\n')) {
+  for (const raw of text.split(/\r?\n/)) {
     const line = raw.replace(/\r$/, '');
     const m = HEAD.exec(line);
     if (m) {

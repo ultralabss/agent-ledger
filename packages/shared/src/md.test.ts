@@ -174,3 +174,13 @@ test('S4: round-trip with structural input is stable (idempotent escaping)', () 
   const twice = serializeItem(itemFromDoc(parseMd(once)), parseMd(once));
   assert.equal(once, twice);
 });
+
+test('B3: CRLF markdown parses like LF (frontmatter, sections, no stray \\r)', () => {
+  const lf = '---\nid: ACME-1\ntitle: hello\n---\nintro\n\n## Notes\nline one\nline two\n\n## Log\n- x\n';
+  const crlf = lf.replace(/\n/g, '\r\n');
+  const a = parseMd(lf);
+  const b = parseMd(crlf);
+  assert.deepEqual(b, a);
+  assert.equal(JSON.stringify(b).includes('\\r'), false);
+  assert.equal(serializeMd(b).includes('\r'), false, 'writers emit LF');
+});

@@ -12,6 +12,7 @@ import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import test from 'node:test';
+import { skipOnWin32 } from '@agent-ledger/shared/testing';
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..', '..', '..', '..');
 const INSTALL_SH = join(ROOT, 'install.sh');
@@ -117,7 +118,7 @@ async function fakeShim(t: test.TestContext): Promise<{ shim: string; marker: st
   return { shim, marker };
 }
 
-test('probe_hub: free port → 10, this ledger → 0, stranger/other ledger → 11', async (t) => {
+test('probe_hub: free port → 10, this ledger → 0, stranger/other ledger → 11', { skip: skipOnWin32('POSIX-only: sh/awk installer, launchd/systemd units') }, async (t) => {
   const mine = await ledgerWithHub(t);
   const stranger = await listen(t, (_req, res) => {
     res.writeHead(200, { 'content-type': 'application/json' });
@@ -141,7 +142,7 @@ test('probe_hub: free port → 10, this ledger → 0, stranger/other ledger → 
   assert.equal(await code(mine.port, other), 11);
 });
 
-test('ensure_port_available: free ok · own hub ok (re-install) · stranger → fail, never a silent skip', async (t) => {
+test('ensure_port_available: free ok · own hub ok (re-install) · stranger → fail, never a silent skip', { skip: skipOnWin32('POSIX-only: sh/awk installer, launchd/systemd units') }, async (t) => {
   const mine = await ledgerWithHub(t);
   const stranger = await listen(t, (_req, res) => {
     res.writeHead(200, { 'content-type': 'application/json' });
@@ -161,7 +162,7 @@ test('ensure_port_available: free ok · own hub ok (re-install) · stranger → 
   assert.match(busy.err, /--port <n>/);
 });
 
-test('wait_for_hub: a stranger on the port is a failure; our hub is a success and gets the right env', async (t) => {
+test('wait_for_hub: a stranger on the port is a failure; our hub is a success and gets the right env', { skip: skipOnWin32('POSIX-only: sh/awk installer, launchd/systemd units') }, async (t) => {
   const mine = await ledgerWithHub(t);
   const stranger = await listen(t, (_req, res) => {
     res.writeHead(200, { 'content-type': 'application/json' });
@@ -181,7 +182,7 @@ test('wait_for_hub: a stranger on the port is a failure; our hub is a success an
   assert.equal((await readFile(good.marker, 'utf8')).trim(), `${mine.port}:${mine.dir}`);
 });
 
-test('brew gitleaks: never without consent; --allow-brew runs it; an existing gitleaks wins', async (t) => {
+test('brew gitleaks: never without consent; --allow-brew runs it; an existing gitleaks wins', { skip: skipOnWin32('POSIX-only: sh/awk installer, launchd/systemd units') }, async (t) => {
   const dir = await tmp(t);
   const bin = join(dir, 'bin');
   await mkdir(bin);
@@ -207,7 +208,7 @@ test('brew gitleaks: never without consent; --allow-brew runs it; an existing gi
   await assert.rejects(stat(marker), 'brew must not run when gitleaks is already in PATH');
 });
 
-test('install.sh: --port validation, busy port fails before any work, --no-service skips the check', async (t) => {
+test('install.sh: --port validation, busy port fails before any work, --no-service skips the check', { skip: skipOnWin32('POSIX-only: sh/awk installer, launchd/systemd units') }, async (t) => {
   const home = await tmp(t);
   const fakeBin = join(home, 'fakebin');
   await mkdir(fakeBin);
@@ -239,7 +240,7 @@ test('install.sh: --port validation, busy port fails before any work, --no-servi
   await stat(marker); // got as far as pnpm: the port check does not apply without a service
 });
 
-test('uninstall.sh removes the Claude Code hooks (non-interactive) and leaves the ledger alone', async (t) => {
+test('uninstall.sh removes the Claude Code hooks (non-interactive) and leaves the ledger alone', { skip: skipOnWin32('POSIX-only: sh/awk installer, launchd/systemd units') }, async (t) => {
   const home = await tmp(t);
   const settings = join(home, '.claude', 'settings.json');
   const env = {

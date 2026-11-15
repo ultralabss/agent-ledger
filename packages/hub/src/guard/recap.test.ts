@@ -5,6 +5,7 @@ import { mkdtemp, rm, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
+import { skipOnWin32 } from '@agent-ledger/shared/testing';
 import { startTestHub } from '../test-helpers.ts';
 import {
   buildTagRe,
@@ -61,7 +62,7 @@ test('lastAssistantText: takes the last assistant block, both transcript shapes'
   assert.equal(lastAssistantText('skip\nnot json\n'), null);
 });
 
-test('checkRecap: blocks only under allowed roots, otherwise silent', async (t) => {
+test('checkRecap: blocks only under allowed roots, otherwise silent', { skip: skipOnWin32('POSIX-only: symlink/chmod/mode bits/uid/shell stubs') }, async (t) => {
   const root = await mkdtemp(join(tmpdir(), 'agent-ledger-transcripts-'));
   const outside = await mkdtemp(join(tmpdir(), 'agent-ledger-outside-'));
   t.after(async () => {
@@ -112,7 +113,7 @@ test('checkRecap: a clean recap with IDs does not block and only the tail of the
 
 /* ---------------- realpath→open TOCTOU ---------------- */
 
-test('a transcript swapped for a symlink after the check is not read', async (t) => {
+test('a transcript swapped for a symlink after the check is not read', { skip: skipOnWin32('POSIX-only: symlink/chmod/mode bits/uid/shell stubs') }, async (t) => {
   const { mkdtemp, rm, writeFile, unlink, symlink, realpath } = await import('node:fs/promises');
   const { tmpdir } = await import('node:os');
   const { join } = await import('node:path');
@@ -203,7 +204,7 @@ test('H3-1: parentChain walks root → file, excluding the file\'s own basename'
   assert.deepEqual(chain, [dir, join(dir, 'a'), join(dir, 'a', 'b')]);
 });
 
-test('H3-1: chainStable(false) when a directory in the chain is swapped for a symlink', async (t) => {
+test('H3-1: chainStable(false) when a directory in the chain is swapped for a symlink', { skip: skipOnWin32('POSIX-only: symlink/chmod/mode bits/uid/shell stubs') }, async (t) => {
   const { mkdtemp, rm, mkdir, writeFile: write, realpath, symlink } = await import(
     'node:fs/promises'
   );

@@ -19,6 +19,7 @@ import type {
 } from '@agent-ledger/shared';
 import { sanitizeField } from '@agent-ledger/shared';
 import { git } from './git.ts';
+import { normalizeGitPath } from './gitpath.ts';
 
 export interface CheckoutStatus {
   head: string | null;
@@ -162,7 +163,7 @@ export async function readWorktrees(checkout: string): Promise<GitWorktreeView[]
     if (line.startsWith('worktree ')) {
       flush();
       current = {
-        path: line.slice('worktree '.length),
+        path: normalizeGitPath(line.slice('worktree '.length)),
         head: null,
         branch: null,
         detached: false,

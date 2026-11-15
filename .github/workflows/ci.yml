@@ -13,11 +13,20 @@ concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
 
+defaults:
+  run:
+    # Same shell everywhere (Git Bash on Windows) so the step scripts stay identical.
+    shell: bash
+
 jobs:
   test:
-    name: test
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
+    name: test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -33,3 +42,19 @@ jobs:
       - run: pnpm test
       - name: Supply-chain script tests
         run: node --test scripts/*.test.mjs
+      # Weak-filesystem tests: a loop-mounted vfat image (no POSIX modes, no
+      # owner, no hardlinks). The vfat-gated tests are added later; until then
+      # LEDGER_TEST_VFAT is ignored and this re-runs the suite unchanged.
+      - name: Weak-FS tests (vfat loop mount)
+        if: runner.os == 'Linux'
+        run: |
+          set -euo pipefail
+          img="$RUNNER_TEMP/ledger-vfat.img"
+          mnt="$RUNNER_TEMP/ledger-vfat"
+          command -v mkfs.vfat >/dev/null || sudo apt-get install -y --no-install-recommends dosfstools
+          truncate -s 64M "$img"
+          mkfs.vfat "$img" >/dev/null
+          mkdir -p "$mnt"
+          sudo mount -o "loop,uid=$(id -u),gid=$(id -g)" "$img" "$mnt"
+          trap 'sudo umount "$mnt" || true' EXIT
+          LEDGER_TEST_VFAT=1 LEDGER_TEST_VFAT_DIR="$mnt" pnpm test

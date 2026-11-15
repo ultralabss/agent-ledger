@@ -38,10 +38,10 @@ function splitFrontmatter(text: string): { yaml: string; rest: string } {
   if (!FM_OPEN.test(normalized)) {
     return { yaml: '', rest: normalized };
   }
-  const lines = normalized.split('\n');
+  const lines = normalized.split(/\r?\n/);
   let end = -1;
   for (let i = 1; i < lines.length; i += 1) {
-    const line = (lines[i] ?? '').replace(/\r$/, '');
+    const line = lines[i] ?? '';
     if (line === '---') {
       end = i;
       break;
@@ -82,7 +82,7 @@ export function parseMd(text: string, file?: string): MdDoc {
     frontmatter = parsed as Record<string, unknown>;
   }
 
-  const lines = rest.split('\n');
+  const lines = rest.split(/\r?\n/);
   const sections: MdSection[] = [];
   const preambleLines: string[] = [];
   let current: { heading: string; body: string[] } | null = null;
@@ -138,7 +138,7 @@ const STEP_LINE = /^\s*- \[[ xX]\] /;
 export function escapeStructuralLines(text: string): string {
   if (text === '') return text;
   return text
-    .split('\n')
+    .split(/\r?\n/)
     .map((line) =>
       HEADING_LINE.test(line) || LOG_LINE.test(line) || STEP_LINE.test(line) ? `\`${line}` : line,
     )

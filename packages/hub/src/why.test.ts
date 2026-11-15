@@ -6,6 +6,7 @@ import { mkdir, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
+import { skipOnWin32 } from '@agent-ledger/shared/testing';
 import { WHY_DATA_NOTICE, type WhyView } from '@agent-ledger/shared';
 import { makeCommittedRepo, startTestHub, type HubFixture } from './test-helpers.ts';
 import { cleanText, mentionsPath, WHY_MAX_PATHS } from './why.ts';
@@ -124,7 +125,7 @@ test('why: directory and glob; a claim not tied to a listed item is listed on it
   assert.equal(deep.items[0]?.id, id, '** crosses directories');
 });
 
-test('why: path validation — traversal, outside, NUL, symlink out, root, .git, bad globs, length', async (t) => {
+test('why: path validation — traversal, outside, NUL, symlink out, root, .git, bad globs, length', { skip: skipOnWin32('POSIX-only: symlink/chmod/mode bits/uid/shell stubs') }, async (t) => {
   const { repo, why } = await setup(t);
   const outside = join(tmpdir(), `why-outside-${process.pid}`);
   await mkdir(outside, { recursive: true });

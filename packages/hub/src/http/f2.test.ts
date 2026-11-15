@@ -12,6 +12,7 @@ import { mkdir, mkdtemp, rm, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
+import { skipOnWin32 } from '@agent-ledger/shared/testing';
 import { git } from '../git.ts';
 import { makeCommittedRepo, startTestHub, type HubFixture } from '../test-helpers.ts';
 
@@ -487,7 +488,7 @@ test('rule 1: the ledger is not edited, `CONTEXT.md` is an exception', async (t)
   assertAllowed(await tryEdit(fx, 'aaaa1111', '/etc/hosts'), 'outside a git repo (rule 2)');
 });
 
-test('symlink to the ledger does not bypass rule 1, a symlink to CONTEXT.md may pass', async (t) => {
+test('symlink to the ledger does not bypass rule 1, a symlink to CONTEXT.md may pass', { skip: skipOnWin32('POSIX-only: symlink/chmod/mode bits/uid/shell stubs') }, async (t) => {
   const fx = await startTestHub();
   const x = await makeCommittedRepo('sl');
   t.after(async () => {

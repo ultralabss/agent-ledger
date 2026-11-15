@@ -6,6 +6,7 @@ import { chmod, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
+import { skipOnWin32 } from '@agent-ledger/shared/testing';
 import { git, LedgerGit } from './git.ts';
 import { createHash } from 'node:crypto';
 import { gitleaksInfoFor, resetGitleaksCache, scanStaged, summariseFindings } from './gitleaks.ts';
@@ -51,7 +52,7 @@ test('summariseFindings never echoes the matched secret', () => {
   assert.doesNotMatch(note, /ghp_REALSECRETVALUE/, 'the secret itself must never be surfaced');
 });
 
-test('scanStaged: exit 0 → clean, commit may proceed', async (t) => {
+test('scanStaged: exit 0 → clean, commit may proceed', { skip: skipOnWin32('POSIX-only: symlink/chmod/mode bits/uid/shell stubs') }, async (t) => {
   const dir = await temp(t);
   resetGitleaksCache();
   t.after(() => resetGitleaksCache());
@@ -60,7 +61,7 @@ test('scanStaged: exit 0 → clean, commit may proceed', async (t) => {
   assert.deepEqual(res, { scanner: 'gitleaks', blocked: false, note: null });
 });
 
-test('scanStaged: exit 1 → blocked, with a secret-free note', async (t) => {
+test('scanStaged: exit 1 → blocked, with a secret-free note', { skip: skipOnWin32('POSIX-only: symlink/chmod/mode bits/uid/shell stubs') }, async (t) => {
   const dir = await temp(t);
   resetGitleaksCache();
   t.after(() => resetGitleaksCache());
@@ -82,7 +83,7 @@ test('scanStaged: missing binary → warning, NOT a block', async (t) => {
   assert.match(res.note ?? '', /install\.sh/);
 });
 
-test('H6-1: gitleaks failing for its own reasons (exit > 1) is now fail-closed', async (t) => {
+test('H6-1: gitleaks failing for its own reasons (exit > 1) is now fail-closed', { skip: skipOnWin32('POSIX-only: symlink/chmod/mode bits/uid/shell stubs') }, async (t) => {
   const dir = await temp(t);
   resetGitleaksCache();
   t.after(() => resetGitleaksCache());
@@ -98,7 +99,7 @@ test('H6-1: gitleaks failing for its own reasons (exit > 1) is now fail-closed',
   assert.match(res.note ?? '', /failed/);
 });
 
-test('H55-A6: output-cap kill settles immediately, not only when the pipe happens to close', async (t) => {
+test('H55-A6: output-cap kill settles immediately, not only when the pipe happens to close', { skip: skipOnWin32('POSIX-only: symlink/chmod/mode bits/uid/shell stubs') }, async (t) => {
   const dir = await temp(t);
   resetGitleaksCache();
   t.after(() => resetGitleaksCache());
@@ -139,7 +140,7 @@ test('H55-A6: output-cap kill settles immediately, not only when the pipe happen
   );
 });
 
-test('H6-1: --config always points outside the scanned ledger, never trusts a repo-local .gitleaks.toml', async (t) => {
+test('H6-1: --config always points outside the scanned ledger, never trusts a repo-local .gitleaks.toml', { skip: skipOnWin32('POSIX-only: symlink/chmod/mode bits/uid/shell stubs') }, async (t) => {
   const dir = await temp(t);
   resetGitleaksCache();
   t.after(() => resetGitleaksCache());
@@ -158,7 +159,7 @@ test('H6-1: --config always points outside the scanned ledger, never trusts a re
   assert.ok(configPath.length > 0 && !configPath.startsWith(dir), `--config must not point inside the scanned ledger (${dir}): ${configPath}`);
 });
 
-test('H6-2: the gitleaks child does not get the real user HOME', async (t) => {
+test('H6-2: the gitleaks child does not get the real user HOME', { skip: skipOnWin32('POSIX-only: symlink/chmod/mode bits/uid/shell stubs') }, async (t) => {
   const dir = await temp(t);
   resetGitleaksCache();
   t.after(() => resetGitleaksCache());
@@ -173,7 +174,7 @@ test('H6-2: the gitleaks child does not get the real user HOME', async (t) => {
   assert.notEqual(home, process.env.HOME, 'gitleaks child must not see the real user HOME');
 });
 
-test('H6-3: the binary-resolution cache is keyed by (binPath, stopAt), not shared globally', async (t) => {
+test('H6-3: the binary-resolution cache is keyed by (binPath, stopAt), not shared globally', { skip: skipOnWin32('POSIX-only: symlink/chmod/mode bits/uid/shell stubs') }, async (t) => {
   const dirA = await temp(t);
   const dirB = await temp(t);
   resetGitleaksCache();

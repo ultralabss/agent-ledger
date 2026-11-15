@@ -629,6 +629,18 @@ for line in '.hub/' '*.tmp'; do
 done
 chmod 600 "$GITIGNORE_FILE"
 
+# Ledger files are LF on every platform (Windows autocrlf would dirty them).
+# Same rule as the hub's boot repair; prepended so the user's own later rules win.
+GITATTR_FILE="$LEDGER/.gitattributes"
+if [ ! -f "$GITATTR_FILE" ]; then
+  printf '%s\n' '* text eol=lf' > "$GITATTR_FILE"
+elif ! tr -d '\r' < "$GITATTR_FILE" | grep -qxF '* text eol=lf'; then
+  GITATTR_TMP="$(mktemp "$LEDGER/.gitattributes.XXXXXX")"
+  { printf '%s\n' '* text eol=lf'; cat "$GITATTR_FILE"; } > "$GITATTR_TMP"
+  mv -f "$GITATTR_TMP" "$GITATTR_FILE"
+fi
+chmod 600 "$GITATTR_FILE"
+
 # gitleaks is the second line of defence in front of every ledger commit (the
 # hub's own secret scanner is the first). Best-effort: a machine without
 # network just gets a warning — a failed fetch must not stop the hub from being

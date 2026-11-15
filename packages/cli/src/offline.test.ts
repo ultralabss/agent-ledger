@@ -5,6 +5,7 @@ import { mkdir, mkdtemp, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
+import { skipOnWin32 } from '@agent-ledger/shared/testing';
 import { readItems } from './offline.ts';
 
 const ITEM_MD = `---
@@ -76,7 +77,7 @@ test('readItems rejects --repo with traversal characters and does not read outsi
   }
 });
 
-test('readItems rejects a slug whose items/ is a symlink outside the ledger', async () => {
+test('readItems rejects a slug whose items/ is a symlink outside the ledger', { skip: skipOnWin32('POSIX-only: symlink/chmod/mode bits/uid/shell stubs') }, async () => {
   const ledger = await tmp();
   const outside = await tmp();
   await mkdir(join(outside, 'items'), { recursive: true });

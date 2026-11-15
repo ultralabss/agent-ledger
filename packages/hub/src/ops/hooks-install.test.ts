@@ -8,6 +8,7 @@ import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import test from 'node:test';
+import { skipOnWin32 } from '@agent-ledger/shared/testing';
 import {
   HOOK_SPECS,
   HOOK_TIMEOUT_S,
@@ -220,7 +221,7 @@ test('install-hooks.mjs: broken JSON is neither written nor overwritten', async 
   assert.equal(await readFile(file, 'utf8'), '{ this is not json', 'file untouched');
 });
 
-test('H8: a settings.json symlink survives, the write goes through to its target', async (t) => {
+test('H8: a settings.json symlink survives, the write goes through to its target', { skip: skipOnWin32('POSIX-only: symlink/chmod/mode bits/uid/shell stubs') }, async (t) => {
   const dir = await mkdtemp(join(tmpdir(), 'agent-ledger-settings-symlink-'));
   t.after(() => rm(dir, { recursive: true, force: true }));
   const real = join(dir, 'dotfiles-settings.json');
@@ -276,7 +277,7 @@ test('J3: settings.json in a nonexistent directory (first install, `~/.claude` d
   assert.equal(installedCount(JSON.parse(await readFile(file, 'utf8')) as Settings, ledgerBin), HOOK_SPECS.length);
 });
 
-test('J4: the lock is keyed by the real path — two symlinks to the same target do not race', async (t) => {
+test('J4: the lock is keyed by the real path — two symlinks to the same target do not race', { skip: skipOnWin32('POSIX-only: symlink/chmod/mode bits/uid/shell stubs') }, async (t) => {
   const dir = await mkdtemp(join(tmpdir(), 'agent-ledger-settings-two-symlinks-'));
   t.after(() => rm(dir, { recursive: true, force: true }));
   const real = join(dir, 'dotfiles-settings.json');
@@ -327,7 +328,7 @@ test('K5: --uninstall on a nonexistent path is "nothing to remove", exit 0', asy
   assert.doesNotMatch(res.err, /ENOENT|at Object\.|at async/, 'no raw stack trace');
 });
 
-test('a dangling symlink — the write goes to the target, the symlink stays a symlink', async (t) => {
+test('a dangling symlink — the write goes to the target, the symlink stays a symlink', { skip: skipOnWin32('POSIX-only: symlink/chmod/mode bits/uid/shell stubs') }, async (t) => {
   const dir = await mkdtemp(join(tmpdir(), 'agent-ledger-settings-dangling-'));
   t.after(() => rm(dir, { recursive: true, force: true }));
   // `settings.json` → `dotfiles/claude/settings.json`, which does not exist yet
@@ -351,7 +352,7 @@ test('a dangling symlink — the write goes to the target, the symlink stays a s
   assert.deepEqual(JSON.parse(await readFile(link, 'utf8')), written);
 });
 
-test('a chain of dangling symlinks is followed to the end', async (t) => {
+test('a chain of dangling symlinks is followed to the end', { skip: skipOnWin32('POSIX-only: symlink/chmod/mode bits/uid/shell stubs') }, async (t) => {
   const dir = await mkdtemp(join(tmpdir(), 'agent-ledger-settings-chain-'));
   t.after(() => rm(dir, { recursive: true, force: true }));
   const final = join(dir, 'real', 'settings.json');
@@ -368,7 +369,7 @@ test('a chain of dangling symlinks is followed to the end', async (t) => {
   assert.equal(installedCount(JSON.parse(await readFile(final, 'utf8')) as Settings, ledgerBin), HOOK_SPECS.length);
 });
 
-test('a relative dangling symlink is resolved against its own directory', async (t) => {
+test('a relative dangling symlink is resolved against its own directory', { skip: skipOnWin32('POSIX-only: symlink/chmod/mode bits/uid/shell stubs') }, async (t) => {
   const dir = await mkdtemp(join(tmpdir(), 'agent-ledger-settings-rel-'));
   t.after(() => rm(dir, { recursive: true, force: true }));
   const link = join(dir, 'settings.json');

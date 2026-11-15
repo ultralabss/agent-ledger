@@ -64,7 +64,9 @@ export function journalLine(ev: { at?: string; session: string; type: string; fi
   return sanitizeLine(`- ${parts.join(SEP)}`);
 }
 
-export function parseJournalLine(line: string, repo: string): JournalEvent | null {
+export function parseJournalLine(rawLine: string, repo: string): JournalEvent | null {
+  // CRLF checkouts (Windows, autocrlf): a trailing `\r` would make `(.*)$` fail and drop the event.
+  const line = rawLine.replace(/\r$/, '');
   const m = /^\s*-\s+(\d{4}-\d{2}-\d{2} \d{2}:\d{2})\s*·\s*(.*)$/.exec(line);
   if (!m) return null;
   const rest = (m[2] ?? '').split('·').map((p) => p.trim());
@@ -83,7 +85,7 @@ export function parseJournalLine(line: string, repo: string): JournalEvent | nul
 
 export function parseJournal(text: string, repo: string): JournalEvent[] {
   const out: JournalEvent[] = [];
-  for (const line of text.split('\n')) {
+  for (const line of text.split(/\r?\n/)) {
     const ev = parseJournalLine(line, repo);
     if (ev) out.push(ev);
   }

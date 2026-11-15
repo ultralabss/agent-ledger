@@ -6,6 +6,7 @@ import { mkdir, mkdtemp, realpath, rm, symlink, writeFile } from 'node:fs/promis
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
+import { skipOnWin32 } from '@agent-ledger/shared/testing';
 import { git } from './git.ts';
 import { parseRemoteUrl, stripCredentials } from './onboard.ts';
 import { makeCodeRepo, startTestHub } from './test-helpers.ts';
@@ -213,7 +214,7 @@ test('ledger onboard: repo facts without an LLM and without running git in a for
 
 /* findFiles used stat() (follows symlinks), so a symlinked `docs/` dir
  * or a symlinked doc file could walk/read outside the checkout. */
-test('onboard neither walks a symlinked directory nor reads a symlinked file', async (t) => {
+test('onboard neither walks a symlinked directory nor reads a symlinked file', { skip: skipOnWin32('POSIX-only: symlink/chmod/mode bits/uid/shell stubs') }, async (t) => {
   const fx = await startTestHub();
   const repo = await mkdtemp(join(tmpdir(), 'agent-ledger-sym-'));
   const outside = await mkdtemp(join(tmpdir(), 'agent-ledger-sym-outside-'));

@@ -7,6 +7,7 @@ import { chmod, lstat, mkdir, mkdtemp, readFile, rm, stat, symlink, writeFile } 
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
+import { skipOnWin32 } from '@agent-ledger/shared/testing';
 import {
   SELFHEAL_MIN_INTERVAL_MS,
   lastSelfHealAt,
@@ -60,7 +61,7 @@ async function tmp(t: { after: (fn: () => unknown) => void }): Promise<string> {
   return dir;
 }
 
-test('rate limit: two attempts within 30 s → one spawn, a second after 30 s', async (t) => {
+test('rate limit: two attempts within 30 s → one spawn, a second after 30 s', { skip: skipOnWin32('POSIX-only: symlink/chmod/mode bits/uid/shell stubs') }, async (t) => {
   const dir = await tmp(t);
   const h = harness(dir);
   const first = await triggerSelfHeal({ ledgerDir: dir, env: {}, deps: h.deps });
@@ -129,7 +130,7 @@ test('a marker dated in the future must not bypass the rate limit', async (t) =>
   assert.equal(h.calls.length, 0, 'a future marker must not trigger launchctl');
 });
 
-test('a writable ancestor between $HOME and the plist (not just the direct parent) is detected', async (t) => {
+test('a writable ancestor between $HOME and the plist (not just the direct parent) is detected', { skip: skipOnWin32('POSIX-only: symlink/chmod/mode bits/uid/shell stubs') }, async (t) => {
   const dir = await tmp(t);
   const home = join(dir, 'home');
   const library = join(home, 'Library');
@@ -170,7 +171,7 @@ test('plist: a symlink or group-writable file is not bootstrapped', async (t) =>
   }
 });
 
-test('validatePlist: a real file on disk', async (t) => {
+test('validatePlist: a real file on disk', { skip: skipOnWin32('POSIX-only: symlink/chmod/mode bits/uid/shell stubs') }, async (t) => {
   const dir = await tmp(t);
   const uid = process.getuid?.() ?? 0;
   const file = join(dir, 'ok.plist');
@@ -237,7 +238,7 @@ test('the marker is written before the spawn (a failed spawn does not open a loo
   assert.equal((await readFile(selfHealMarker(dir), 'utf8')).trim(), '1000000');
 });
 
-test('a marker that is a symlink is not followed — fail-open, nothing is written through it', async (t) => {
+test('a marker that is a symlink is not followed — fail-open, nothing is written through it', { skip: skipOnWin32('POSIX-only: symlink/chmod/mode bits/uid/shell stubs') }, async (t) => {
   const dir = await tmp(t);
   const hubDir = join(dir, '.hub');
   await mkdir(hubDir, { recursive: true, mode: 0o700 });

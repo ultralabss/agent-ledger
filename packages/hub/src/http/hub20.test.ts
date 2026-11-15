@@ -12,6 +12,7 @@ import { chmod, mkdir, mkdtemp, readFile, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
+import { skipOnWin32 } from '@agent-ledger/shared/testing';
 import { makeCodeRepo, startTestHub } from '../test-helpers.ts';
 
 /**
@@ -137,7 +138,7 @@ test('a secret in the text is redacted, not rejected (as before)', async (t) => 
   assert.ok(!res.json.intake.text.includes('A1bCdEfGhIjKlMnOpQrStUvWxYz01'), res.json.intake.text);
 });
 
-test('triage_and_run starts a worker only for agent P0/P1 items', async (t) => {
+test('triage_and_run starts a worker only for agent P0/P1 items', { skip: skipOnWin32('POSIX-only: symlink/chmod/mode bits/uid/shell stubs') }, async (t) => {
   const dir = await mkdtemp(join(tmpdir(), 'ledger-fake-claude-'));
   const bin = await fakeClaude(dir);
   const repo = await makeCodeRepo();
@@ -206,7 +207,7 @@ test('triage_and_run starts a worker only for agent P0/P1 items', async (t) => {
   assert.match(stdin, /end of reply/, stdin.slice(0, 400));
 });
 
-test('triage_and_run does not start a worker for DEPLOY/BLOCKER, even for owner agent P0', async (t) => {
+test('triage_and_run does not start a worker for DEPLOY/BLOCKER, even for owner agent P0', { skip: skipOnWin32('POSIX-only: symlink/chmod/mode bits/uid/shell stubs') }, async (t) => {
   const dir = await mkdtemp(join(tmpdir(), 'ledger-fake-claude-'));
   const bin = await fakeClaude(dir);
   const repo = await makeCodeRepo();

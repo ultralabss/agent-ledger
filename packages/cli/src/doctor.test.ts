@@ -7,6 +7,7 @@ import { createServer } from 'node:http';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
+import { skipOnWin32 } from '@agent-ledger/shared/testing';
 import type { CliEnvConfig } from './client.ts';
 import { cmdDoctor, findInPath, logErrors, pickEntryScript, type DoctorDeps } from './doctor.ts';
 import { linuxChecks } from './doctor-linux.ts';
@@ -237,7 +238,7 @@ test('doctor: claude-code adapter check is info only (skipped without settings, 
   assert.match(present.at(-1) ?? '', /^DOWN: .*hub is not answering/);
 });
 
-test('doctor: graphify line is info only — found / not found, never a problem', async (t) => {
+test('doctor: graphify line is info only — found / not found, never a problem', { skip: skipOnWin32('POSIX-only: symlink/chmod/mode bits/uid/shell stubs') }, async (t) => {
   const dir = await ledger(t);
   const bin = join(dir, 'bin');
   await mkdir(bin, { recursive: true });
@@ -423,7 +424,7 @@ test('linux: missing systemctl or unreachable user bus → info, never a failure
   assert.deepEqual(nobus.problems, []);
 });
 
-test('path: shim on PATH ok; shim dir not on PATH warns; neither warns', async (t) => {
+test('path: shim on PATH ok; shim dir not on PATH warns; neither warns', { skip: skipOnWin32('POSIX-only: symlink/chmod/mode bits/uid/shell stubs') }, async (t) => {
   const dir = await ledger(t);
   const bin = join(dir, 'bin');
   await mkdir(bin, { recursive: true });

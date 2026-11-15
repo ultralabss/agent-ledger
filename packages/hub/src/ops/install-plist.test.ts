@@ -13,6 +13,7 @@ import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import test from 'node:test';
+import { skipOnWin32 } from '@agent-ledger/shared/testing';
 
 const SCRIPT = join(dirname(fileURLToPath(import.meta.url)), '..', '..', '..', '..', 'install.sh');
 
@@ -55,7 +56,7 @@ async function fakeHome(t: test.TestContext): Promise<string> {
 
 /* ------------------------------ launchd plist ------------------------------ */
 
-test('plist: values are XML-escaped, the result is a valid plist', async (t) => {
+test('plist: values are XML-escaped, the result is a valid plist', { skip: skipOnWin32('POSIX-only: sh/awk installer, launchd/systemd units') }, async (t) => {
   const home = await fakeHome(t);
   const out = join(home, 'sub', 'dir', 'io.agent-ledger.hub.plist');
 
@@ -73,7 +74,7 @@ test('plist: values are XML-escaped, the result is a valid plist', async (t) => 
   assert.equal(linted.code, 0, `plutil -lint failed: ${linted.err}`);
 });
 
-test('plist: an XML injection attempt via LEDGER_DIR creates no new <key>, the plist stays valid', async (t) => {
+test('plist: an XML injection attempt via LEDGER_DIR creates no new <key>, the plist stays valid', { skip: skipOnWin32('POSIX-only: sh/awk installer, launchd/systemd units') }, async (t) => {
   const home = await fakeHome(t);
   const out = join(home, 'io.agent-ledger.hub.plist');
 
@@ -89,7 +90,7 @@ test('plist: an XML injection attempt via LEDGER_DIR creates no new <key>, the p
   assert.equal(linted.code, 0, `plutil -lint failed: ${linted.err}`);
 });
 
-test('plist: the plist directory goes through ensure_chain (created 0755, never through a symlink)', async (t) => {
+test('plist: the plist directory goes through ensure_chain (created 0755, never through a symlink)', { skip: skipOnWin32('POSIX-only: sh/awk installer, launchd/systemd units') }, async (t) => {
   const home = await fakeHome(t);
   const out = join(home, 'newly', 'created', 'chain', 'io.agent-ledger.hub.plist');
 
@@ -101,7 +102,7 @@ test('plist: the plist directory goes through ensure_chain (created 0755, never 
   assert.equal((st.mode & 0o777).toString(8), '755');
 });
 
-test('plist: a symlinked path component is refused', async (t) => {
+test('plist: a symlinked path component is refused', { skip: skipOnWin32('POSIX-only: sh/awk installer, launchd/systemd units') }, async (t) => {
   const home = await fakeHome(t);
   const elsewhere = join(home, 'elsewhere');
   await mkdir(elsewhere);
@@ -114,7 +115,7 @@ test('plist: a symlinked path component is refused', async (t) => {
   assert.match(res.err, /symlink/);
 });
 
-test('plist: `&` in a value does not collapse into the placeholder (awk gsub `&` gotcha)', async (t) => {
+test('plist: `&` in a value does not collapse into the placeholder (awk gsub `&` gotcha)', { skip: skipOnWin32('POSIX-only: sh/awk installer, launchd/systemd units') }, async (t) => {
   // Regression: `gsub(pattern, repl)` treats a bare `&` in `repl` as "insert
   // the match" — an already-XML-escaped value is full of literal `&`
   // (`&amp;`), so without `awk_repl_escape` every `&` re-expanded into the
@@ -132,7 +133,7 @@ test('plist: `&` in a value does not collapse into the placeholder (awk gsub `&`
   assert.match(plist, /<string>\/tmp\/a&amp;b&amp;c<\/string>/);
 });
 
-test('plist: LEDGER_CLAUDE_BIN with XML-special characters in the path is escaped too (--headless)', async (t) => {
+test('plist: LEDGER_CLAUDE_BIN with XML-special characters in the path is escaped too (--headless)', { skip: skipOnWin32('POSIX-only: sh/awk installer, launchd/systemd units') }, async (t) => {
   const home = await fakeHome(t);
   const binDir = join(home, 'bin');
   await mkdir(binDir, { recursive: true });
@@ -154,7 +155,7 @@ test('plist: LEDGER_CLAUDE_BIN with XML-special characters in the path is escape
   assert.equal(linted.code, 0, `plutil -lint failed: ${linted.err}`);
 });
 
-test('plist: no agent-specific keys by default (headless is opt-in)', async (t) => {
+test('plist: no agent-specific keys by default (headless is opt-in)', { skip: skipOnWin32('POSIX-only: sh/awk installer, launchd/systemd units') }, async (t) => {
   const home = await fakeHome(t);
   const out = join(home, 'io.agent-ledger.hub.plist');
 
@@ -167,7 +168,7 @@ test('plist: no agent-specific keys by default (headless is opt-in)', async (t) 
   assert.match(plist, /<key>Label<\/key>\s*<string>io\.agent-ledger\.hub<\/string>/);
 });
 
-test('plist: feature flags set in the installer environment are passed into the service', async (t) => {
+test('plist: feature flags set in the installer environment are passed into the service', { skip: skipOnWin32('POSIX-only: sh/awk installer, launchd/systemd units') }, async (t) => {
   const home = await fakeHome(t);
   const out = join(home, 'io.agent-ledger.hub.plist');
 
@@ -184,7 +185,7 @@ test('plist: feature flags set in the installer environment are passed into the 
   assert.equal(linted.code, 0, `plutil -lint failed: ${linted.err}`);
 });
 
-test('plist: AGENT_LEDGER_LABEL overrides the label; an unsafe label is refused', async (t) => {
+test('plist: AGENT_LEDGER_LABEL overrides the label; an unsafe label is refused', { skip: skipOnWin32('POSIX-only: sh/awk installer, launchd/systemd units') }, async (t) => {
   const home = await fakeHome(t);
   const out = join(home, 'custom.plist');
 
@@ -199,7 +200,7 @@ test('plist: AGENT_LEDGER_LABEL overrides the label; an unsafe label is refused'
   assert.match(bad.err, /AGENT_LEDGER_LABEL/);
 });
 
-test('plist: ProcessType Standard, ExitTimeOut 30 and the node flag before the script', async (t) => {
+test('plist: ProcessType Standard, ExitTimeOut 30 and the node flag before the script', { skip: skipOnWin32('POSIX-only: sh/awk installer, launchd/systemd units') }, async (t) => {
   const home = await fakeHome(t);
   const out = join(home, 'io.agent-ledger.hub.plist');
 
@@ -239,7 +240,7 @@ function unitEnv(unit: string): Map<string, string> {
   return env;
 }
 
-test('systemd: renders a user unit with Restart=on-failure and an absolute, shell-free ExecStart', async (t) => {
+test('systemd: renders a user unit with Restart=on-failure and an absolute, shell-free ExecStart', { skip: skipOnWin32('POSIX-only: sh/awk installer, launchd/systemd units') }, async (t) => {
   const home = await fakeHome(t);
   const out = join(home, '.config', 'systemd', 'user', 'io.agent-ledger.hub.service');
 
@@ -273,7 +274,7 @@ test('systemd: renders a user unit with Restart=on-failure and an absolute, shel
   assert.equal((st.mode & 0o777).toString(8), '755', 'unit directory created 0755 via ensure_chain');
 });
 
-test('systemd: quotes, backslashes, `%` and `$` in values are escaped; a line break is refused', async (t) => {
+test('systemd: quotes, backslashes, `%` and `$` in values are escaped; a line break is refused', { skip: skipOnWin32('POSIX-only: sh/awk installer, launchd/systemd units') }, async (t) => {
   const home = await fakeHome(t);
   const out = join(home, 'a.service');
 
@@ -299,7 +300,7 @@ test('systemd: quotes, backslashes, `%` and `$` in values are escaped; a line br
   await assert.rejects(() => readFile(join(home, 'b.service'), 'utf8'), /ENOENT/, 'nothing rendered');
 });
 
-test('systemd: feature flags and --headless land as Environment= lines; AGENT_LEDGER_LABEL does not change the unit body', async (t) => {
+test('systemd: feature flags and --headless land as Environment= lines; AGENT_LEDGER_LABEL does not change the unit body', { skip: skipOnWin32('POSIX-only: sh/awk installer, launchd/systemd units') }, async (t) => {
   const home = await fakeHome(t);
   const binDir = join(home, 'bin');
   await mkdir(binDir, { recursive: true });
@@ -322,7 +323,7 @@ test('systemd: feature flags and --headless land as Environment= lines; AGENT_LE
   assert.equal(env.get('LEDGER_WEB_REPLIES'), '1');
 });
 
-test('systemd: a `$` in the hub path is doubled in ExecStart (no env expansion)', async (t) => {
+test('systemd: a `$` in the hub path is doubled in ExecStart (no env expansion)', { skip: skipOnWin32('POSIX-only: sh/awk installer, launchd/systemd units') }, async (t) => {
   // ExecStart= expands `$VAR`, Environment= does not. The node path comes from
   // PATH lookup, so put a fake node with a `$` in its directory name first.
   const home = await fakeHome(t);
@@ -343,7 +344,7 @@ test('systemd: a `$` in the hub path is doubled in ExecStart (no env expansion)'
   assert.ok(exec.startsWith(`"${join(home, 'b$$in')}/node"`), `ExecStart was: ${exec}`);
 });
 
-test('a value that looks like a placeholder is inserted literally, never substituted again', async (t) => {
+test('a value that looks like a placeholder is inserted literally, never substituted again', { skip: skipOnWin32('POSIX-only: sh/awk installer, launchd/systemd units') }, async (t) => {
   const home = await fakeHome(t);
   const plist = join(home, 'p.plist');
   const unit = join(home, 'u.service');
@@ -356,7 +357,7 @@ test('a value that looks like a placeholder is inserted literally, never substit
   assert.equal(unitEnv(await readFile(unit, 'utf8')).get('LEDGER_DIR'), '/tmp/@PORT@/@LABEL@');
 });
 
-test('--trust-claude-group pins the opt-in to the realpath and gid it saw; a plain directory pins nothing', async (t) => {
+test('--trust-claude-group pins the opt-in to the realpath and gid it saw; a plain directory pins nothing', { skip: skipOnWin32('POSIX-only: sh/awk installer, launchd/systemd units') }, async (t) => {
   const { realpath } = await import('node:fs/promises');
   const home = await fakeHome(t);
 

@@ -5,6 +5,7 @@ import { mkdir, mkdtemp, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
+import { skipOnWin32 } from '@agent-ledger/shared/testing';
 import { UI_COOKIE_NAME, uiCookieValue } from '../security/index.ts';
 import { makeCodeRepo, startTestHub, type HubFixture } from '../test-helpers.ts';
 import { UI_CSP } from './ui.ts';
@@ -383,7 +384,7 @@ test('UI: placeholder when dist is missing, cookie and CSP only on HTML', async 
   }
 });
 
-test('UI: static files from dist, SPA fallback, no traversal', async (t) => {
+test('UI: static files from dist, SPA fallback, no traversal', { skip: skipOnWin32('POSIX-only: symlink/chmod/mode bits/uid/shell stubs') }, async (t) => {
   const dist = await mkdtemp(join(tmpdir(), 'agent-ledger-dist-'));
   const outside = await mkdtemp(join(tmpdir(), 'agent-ledger-outside-'));
   await writeFile(join(outside, 'secret.txt'), 'TOP SECRET\n', 'utf8');

@@ -6,6 +6,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import test from 'node:test';
+import { skipOnWin32 } from '@agent-ledger/shared/testing';
 import { openDb } from './schema.ts';
 import { ftsQuery, RuntimeStore } from './store.ts';
 
@@ -102,7 +103,7 @@ test('search survives FTS metacharacters in the query', async (t) => {
   assert.deepEqual(store.search('-', 10), []);
 });
 
-test('the DB file is 0600 (it holds a mirror of the ledger)', async (t) => {
+test('the DB file is 0600 (it holds a mirror of the ledger)', { skip: skipOnWin32('POSIX-only: symlink/chmod/mode bits/uid/shell stubs') }, async (t) => {
   const tmp = await tempDb();
   const store = new RuntimeStore(tmp.file);
   t.after(async () => {

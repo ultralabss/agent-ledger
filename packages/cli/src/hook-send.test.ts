@@ -12,6 +12,7 @@ import { mkdir, mkdtemp, rm, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test, { type TestContext } from 'node:test';
+import { skipOnWin32 } from '@agent-ledger/shared/testing';
 import { runHook } from './hook.ts';
 import { inboxState } from './hook-inbox.ts';
 
@@ -99,7 +100,7 @@ async function waitForSeen(stub: Stub, n: number): Promise<void> {
   }
 }
 
-test('inboxState: three states and refusal of a symlink (marker contract)', async (t) => {
+test('inboxState: three states and refusal of a symlink (marker contract)', { skip: skipOnWin32('POSIX-only: symlink/chmod/mode bits/uid/shell stubs') }, async (t) => {
   const withDir = await ledger(t, [SESSION]);
   assert.equal(await inboxState(withDir, SESSION), 'pending');
   assert.equal(await inboxState(withDir, 'ses-other'), 'empty');
