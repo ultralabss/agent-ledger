@@ -6,7 +6,11 @@ param(
   # Diagnostics: override the test glob / node:test flags / wall-clock cap (defaults = the full suite).
   [string]$Files = 'packages/*/src/**/*.test.ts',
   [string]$ExtraArgs = '',
-  [int]$MaxMinutes = 17
+  [int]$MaxMinutes = 17,
+  # Diagnostics: run `node <script>` instead of the suite, and never fail the step.
+  [string]$DiagScript = '',
+  # Diagnostics: report but never fail the step.
+  [switch]$NoFail
 )
 $ErrorActionPreference = 'Stop'
 $user = 'ledgertest'
@@ -29,7 +33,8 @@ try {
   # user's TEMP is a directory inside ITS profile (ACL: user, SYSTEM, Administrators only).
   # Start-Process -Credential inherits the runner's USERPROFILE, so name the test user's profile explicitly.
   $lt = "$env:SystemDrive\Users\$user\lt"
-  $cmd = "set PATH=$nodeDir;%PATH%&& mkdir `"$lt`"& set `"TEMP=$lt`"& set `"TMP=$lt`"& set `"TMPDIR=$lt`"& cd /d `"$ws`" && node --test --test-timeout=120000 $ExtraArgs `"$Files`" > `"$log`" 2>&1"
+  $nodeCmd = if ($DiagScript) { "node `"$DiagScript`"" } else { "node --test --test-timeout=120000 $ExtraArgs `"$Files`"" }
+  $cmd = "set PATH=$nodeDir;%PATH%&& mkdir `"$lt`"& set `"TEMP=$lt`"& set `"TMP=$lt`"& set `"TMPDIR=$lt`"& cd /d `"$ws`" && $nodeCmd > `"$log`" 2>&1"
   $proc = Start-Process -FilePath cmd.exe -ArgumentList '/d','/s','/c',"`"$cmd`"" -Credential $cred -LoadUserProfile -WorkingDirectory $env:RUNNER_TEMP -PassThru -WindowStyle Hidden
   # Stream the log while the suite runs (a hang must be visible, not silent) and stop before the job limit.
   $deadline = (Get-Date).AddMinutes($MaxMinutes)
@@ -43,12 +48,13 @@ try {
     if ((Get-Date) -gt $deadline) {
       Write-Host '##[error]non-elevated test run exceeded $MaxMinutes min; killing it'
       & taskkill /F /T /PID $proc.Id | Out-Null
+      if ($NoFail) { Write-Host 'diagnostics timed out'; return }
       throw 'tests hung (see log above: last output shows the file/test that never finished)'
     }
   }
   $lines = @(Get-Content $log -ErrorAction SilentlyContinue)
   if ($lines.Count -gt $shown) { $lines[$shown..($lines.Count - 1)] }
-  if ($proc.ExitCode -ne 0) { throw "tests failed as non-elevated user (exit $($proc.ExitCode))" }
+  if ($proc.ExitCode -ne 0 -and -not $NoFail) { throw "tests failed as non-elevated user (exit $($proc.ExitCode))" }
 } finally {
   Remove-LocalUser -Name $user -ErrorAction SilentlyContinue
 }
