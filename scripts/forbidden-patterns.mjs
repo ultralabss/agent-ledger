@@ -38,6 +38,7 @@ export const ALLOW = {
     "packages/hub/src/gitleaks.ts",
     "packages/hub/src/headless.ts",
     "packages/hub/src/replies.ts",
+    "packages/shared/src/win-ps.ts", // platformTrust: fixed PowerShell/icacls runner (absolute System32 paths, shell:false)
   ],
   fetch: [
     "install.sh",

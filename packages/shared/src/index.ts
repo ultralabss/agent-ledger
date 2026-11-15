@@ -10,6 +10,8 @@ export * from './decisions.ts';
 export * from './dedupe.ts';
 export * from './secrets.ts';
 export * from './spool.ts';
+export * from './sddl.ts';
+export * from './platformTrust.ts';
 export * from './snowflake.ts';
 export * from './context-template.ts';
 export * from './api.ts';
