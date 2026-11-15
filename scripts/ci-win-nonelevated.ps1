@@ -20,9 +20,25 @@ try {
   # pnpm's shim lives in the runner profile (unreadable for this user); the root `test` script is plain node.
   $tmp = $env:RUNNER_TEMP
   # Start-Process -Credential inherits the runner's TEMP/HOME, which this user cannot write: point them at the granted temp dir.
-  $cmd = "set PATH=$nodeDir;%PATH%&& set TEMP=$tmp&& set TMP=$tmp&& set TMPDIR=$tmp&& cd /d `"$ws`" && node --test `"packages/*/src/**/*.test.ts`" > `"$log`" 2>&1"
-  $proc = Start-Process -FilePath cmd.exe -ArgumentList '/d','/s','/c',"`"$cmd`"" -Credential $cred -LoadUserProfile -WorkingDirectory $env:RUNNER_TEMP -Wait -PassThru -WindowStyle Hidden
-  Get-Content $log
+  $cmd = "set PATH=$nodeDir;%PATH%&& set TEMP=$tmp&& set TMP=$tmp&& set TMPDIR=$tmp&& cd /d `"$ws`" && node --test --test-timeout=120000 `"packages/*/src/**/*.test.ts`" > `"$log`" 2>&1"
+  $proc = Start-Process -FilePath cmd.exe -ArgumentList '/d','/s','/c',"`"$cmd`"" -Credential $cred -LoadUserProfile -WorkingDirectory $env:RUNNER_TEMP -PassThru -WindowStyle Hidden
+  # Stream the log while the suite runs (a hang must be visible, not silent) and stop before the job limit.
+  $deadline = (Get-Date).AddMinutes(17)
+  $shown = 0
+  while (-not $proc.HasExited) {
+    Start-Sleep -Seconds 5
+    if (Test-Path $log) {
+      $lines = @(Get-Content $log -ErrorAction SilentlyContinue)
+      if ($lines.Count -gt $shown) { $lines[$shown..($lines.Count - 1)]; $shown = $lines.Count }
+    }
+    if ((Get-Date) -gt $deadline) {
+      Write-Host '##[error]non-elevated test run exceeded 17 min; killing it'
+      & taskkill /F /T /PID $proc.Id | Out-Null
+      throw 'tests hung (see log above: last output shows the file/test that never finished)'
+    }
+  }
+  $lines = @(Get-Content $log -ErrorAction SilentlyContinue)
+  if ($lines.Count -gt $shown) { $lines[$shown..($lines.Count - 1)] }
   if ($proc.ExitCode -ne 0) { throw "tests failed as non-elevated user (exit $($proc.ExitCode))" }
 } finally {
   Remove-LocalUser -Name $user -ErrorAction SilentlyContinue
