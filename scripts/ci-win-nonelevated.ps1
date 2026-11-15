@@ -18,9 +18,10 @@ try {
   $cred = New-Object System.Management.Automation.PSCredential(".\$user", $sec)
   $log = Join-Path $env:RUNNER_TEMP 'nonelevated-test.log'
   # pnpm's shim lives in the runner profile (unreadable for this user); the root `test` script is plain node.
-  $tmp = $env:RUNNER_TEMP
-  # Start-Process -Credential inherits the runner's TEMP/HOME, which this user cannot write: point them at the granted temp dir.
-  $cmd = "set PATH=$nodeDir;%PATH%&& set TEMP=$tmp&& set TMP=$tmp&& set TMPDIR=$tmp&& cd /d `"$ws`" && node --test --test-timeout=120000 `"packages/*/src/**/*.test.ts`" > `"$log`" 2>&1"
+  # The runner's temp root grants BUILTIN\Users inheritable write, which the product's ancestor trust
+  # check (correctly) refuses. A real install keeps its data under the user's own profile, so the test
+  # user's TEMP is a directory inside ITS profile (ACL: user, SYSTEM, Administrators only).
+  $cmd = "set PATH=$nodeDir;%PATH%&& mkdir `"%USERPROFILE%\lt`" 2>nul & set `"TEMP=%USERPROFILE%\lt`"& set `"TMP=%USERPROFILE%\lt`"& set `"TMPDIR=%USERPROFILE%\lt`"& cd /d `"$ws`" && node --test --test-timeout=120000 `"packages/*/src/**/*.test.ts`" > `"$log`" 2>&1"
   $proc = Start-Process -FilePath cmd.exe -ArgumentList '/d','/s','/c',"`"$cmd`"" -Credential $cred -LoadUserProfile -WorkingDirectory $env:RUNNER_TEMP -PassThru -WindowStyle Hidden
   # Stream the log while the suite runs (a hang must be visible, not silent) and stop before the job limit.
   $deadline = (Get-Date).AddMinutes(17)

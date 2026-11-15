@@ -925,7 +925,7 @@ test('win32: assertPrivateDir passes on the DACL ensurePrivateDir produces; one 
   const call = w.spawns[0]!;
   assert.equal(call.file, PS_EXE);
   assert.deepEqual(call.args, [
-    '-NoProfile', '-NonInteractive', '-NoLogo', '-ExecutionPolicy', 'Bypass', '-EncodedCommand',
+    '-NoProfile', '-NonInteractive', '-NoLogo', '-InputFormat', 'None', '-ExecutionPolicy', 'Bypass', '-EncodedCommand',
     Buffer.from(WIN_PS_SCRIPT, 'utf16le').toString('base64'),
   ]);
   assert.deepEqual(JSON.parse(call.env.LEDGER_TRUST_PATHS ?? ''), [LEDGER, LA, 'C:\\Users\\me\\AppData', 'C:\\Users\\me', 'C:\\Users', 'C:\\']);

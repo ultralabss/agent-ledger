@@ -153,6 +153,8 @@ export function icaclsPath(systemRoot: string): string {
  */
 export const WIN_PS_SCRIPT = [
   "$ErrorActionPreference = 'Stop'",
+  // No progress records: with redirected stderr they are serialized as '#< CLIXML' noise (CI 43765681408).
+  "$ProgressPreference = 'SilentlyContinue'",
   '[Console]::OutputEncoding = [System.Text.Encoding]::UTF8',
   // Windows PowerShell 5.1 emits a parsed JSON array as ONE object; piping to ForEach-Object unrolls it,
   // so N paths give N entries (CI 43750942946: 'probe returned the wrong number of paths').
@@ -316,7 +318,7 @@ export async function inspectWindowsPaths(paths: readonly string[], ctx: WinPsCo
   const res = await psSlot(() =>
     ctx.spawnFile(
       exe,
-      ['-NoProfile', '-NonInteractive', '-NoLogo', '-ExecutionPolicy', 'Bypass', '-EncodedCommand', encodePsCommand(WIN_PS_SCRIPT)],
+      ['-NoProfile', '-NonInteractive', '-NoLogo', '-InputFormat', 'None', '-ExecutionPolicy', 'Bypass', '-EncodedCommand', encodePsCommand(WIN_PS_SCRIPT)],
       {
         env: minimalEnv(root, { [TRUST_PATHS_ENV]: JSON.stringify(paths) }, ctx.env),
         cwd: root,
