@@ -49,7 +49,7 @@ import {
   type ReposFile,
   type Transition,
 } from '@agent-ledger/shared';
-import { day, isoLocal, month, renameRetry, shortSession, stamp } from '@agent-ledger/shared';
+import { day, ensurePrivateDir, isoLocal, month, renameRetry, shortSession, stamp } from '@agent-ledger/shared';
 import { expandHome, type HubConfig } from '../config.ts';
 import { conflict, invalid, notFound, LedgerError } from '../errors.ts';
 import { gitToplevel, LedgerGit } from '../git.ts';
@@ -171,7 +171,11 @@ export class Ledger {
   async init(): Promise<void> {
     await ensureDir(this.paths.root, 0o700);
     await tighten(this.paths.root, 0o700);
-    await ensureDir(this.paths.hubDir, 0o700);
+    // win32: a plain mkdir inherits the parent's ACL (e.g. BUILTIN\\Users write under a shared
+    // temp/data root), which the token/hooks trust checks rightly refuse. Create `.hub` private
+    // (DACL {me, SYSTEM}, inheritance removed). POSIX keeps the mode-based path unchanged.
+    if (process.platform === 'win32') await ensurePrivateDir(this.paths.hubDir);
+    else await ensureDir(this.paths.hubDir, 0o700);
     await this.git.init();
     await this.ensureGitignore();
     await this.ensureGitattributes();

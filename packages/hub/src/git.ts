@@ -2,10 +2,10 @@
  *  never a PATH-resolved `git` (SPEC §6.1, S6). */
 
 import { spawn } from 'node:child_process';
-import { createHash } from 'node:crypto';
+import { createHash, randomBytes } from 'node:crypto';
 import type { Stats } from 'node:fs';
 import { rmdirSync } from 'node:fs';
-import { lstat, mkdtemp, readFile, readdir, realpath, stat } from 'node:fs/promises';
+import { lstat, readFile, readdir, realpath, stat } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, isAbsolute, join, resolve as resolvePath, win32 as winPath } from 'node:path';
 import {
@@ -238,7 +238,11 @@ export function configureGitHooksDir(dir: string | null): void {
 
 /** No ledger configured (CLI helpers, tests): a random private per-process temp dir. */
 function processHooksDir(): Promise<string> {
-  fallbackHooksDir ??= mkdtemp(join(tmpdir(), 'agent-ledger-hooks-')).then((dir) => {
+  // Created through ensurePrivateDir (not mkdtemp): on win32 mkdtemp inherits the temp dir's ACL,
+  // which the private-dir verification refuses ("DACL is not protected").
+  fallbackHooksDir ??= (async () => {
+    const dir = join(tmpdir(), `agent-ledger-hooks-${randomBytes(6).toString('hex')}`);
+    await ensurePrivateDir(dir);
     process.once('exit', () => {
       // best effort; a leftover empty private dir is harmless
       try {
@@ -248,7 +252,7 @@ function processHooksDir(): Promise<string> {
       }
     });
     return dir;
-  });
+  })();
   return fallbackHooksDir;
 }
 
