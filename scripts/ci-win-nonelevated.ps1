@@ -21,7 +21,9 @@ try {
   # The runner's temp root grants BUILTIN\Users inheritable write, which the product's ancestor trust
   # check (correctly) refuses. A real install keeps its data under the user's own profile, so the test
   # user's TEMP is a directory inside ITS profile (ACL: user, SYSTEM, Administrators only).
-  $cmd = "set PATH=$nodeDir;%PATH%&& mkdir `"%USERPROFILE%\lt`" 2>nul & set `"TEMP=%USERPROFILE%\lt`"& set `"TMP=%USERPROFILE%\lt`"& set `"TMPDIR=%USERPROFILE%\lt`"& cd /d `"$ws`" && node --test --test-timeout=120000 `"packages/*/src/**/*.test.ts`" > `"$log`" 2>&1"
+  # Start-Process -Credential inherits the runner's USERPROFILE, so name the test user's profile explicitly.
+  $lt = "$env:SystemDrive\Users\$user\lt"
+  $cmd = "set PATH=$nodeDir;%PATH%&& mkdir `"$lt`"& set `"TEMP=$lt`"& set `"TMP=$lt`"& set `"TMPDIR=$lt`"& cd /d `"$ws`" && node --test --test-timeout=120000 `"packages/*/src/**/*.test.ts`" > `"$log`" 2>&1"
   $proc = Start-Process -FilePath cmd.exe -ArgumentList '/d','/s','/c',"`"$cmd`"" -Credential $cred -LoadUserProfile -WorkingDirectory $env:RUNNER_TEMP -PassThru -WindowStyle Hidden
   # Stream the log while the suite runs (a hang must be visible, not silent) and stop before the job limit.
   $deadline = (Get-Date).AddMinutes(17)
