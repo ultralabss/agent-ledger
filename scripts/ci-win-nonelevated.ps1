@@ -2,6 +2,12 @@
 # The hosted runner is an elevated Administrator and the product (T14) refuses
 # to run elevated; that rule is NOT relaxed for CI. No password leaves this
 # script: it is random, per run, and the account is deleted at the end.
+param(
+  # Diagnostics: override the test glob / node:test flags / wall-clock cap (defaults = the full suite).
+  [string]$Files = 'packages/*/src/**/*.test.ts',
+  [string]$ExtraArgs = '',
+  [int]$MaxMinutes = 17
+)
 $ErrorActionPreference = 'Stop'
 $user = 'ledgertest'
 $bytes = New-Object byte[] 24
@@ -23,10 +29,10 @@ try {
   # user's TEMP is a directory inside ITS profile (ACL: user, SYSTEM, Administrators only).
   # Start-Process -Credential inherits the runner's USERPROFILE, so name the test user's profile explicitly.
   $lt = "$env:SystemDrive\Users\$user\lt"
-  $cmd = "set PATH=$nodeDir;%PATH%&& mkdir `"$lt`"& set `"TEMP=$lt`"& set `"TMP=$lt`"& set `"TMPDIR=$lt`"& cd /d `"$ws`" && node --test --test-timeout=120000 `"packages/*/src/**/*.test.ts`" > `"$log`" 2>&1"
+  $cmd = "set PATH=$nodeDir;%PATH%&& mkdir `"$lt`"& set `"TEMP=$lt`"& set `"TMP=$lt`"& set `"TMPDIR=$lt`"& cd /d `"$ws`" && node --test --test-timeout=120000 $ExtraArgs `"$Files`" > `"$log`" 2>&1"
   $proc = Start-Process -FilePath cmd.exe -ArgumentList '/d','/s','/c',"`"$cmd`"" -Credential $cred -LoadUserProfile -WorkingDirectory $env:RUNNER_TEMP -PassThru -WindowStyle Hidden
   # Stream the log while the suite runs (a hang must be visible, not silent) and stop before the job limit.
-  $deadline = (Get-Date).AddMinutes(17)
+  $deadline = (Get-Date).AddMinutes($MaxMinutes)
   $shown = 0
   while (-not $proc.HasExited) {
     Start-Sleep -Seconds 5
@@ -35,7 +41,7 @@ try {
       if ($lines.Count -gt $shown) { $lines[$shown..($lines.Count - 1)]; $shown = $lines.Count }
     }
     if ((Get-Date) -gt $deadline) {
-      Write-Host '##[error]non-elevated test run exceeded 17 min; killing it'
+      Write-Host '##[error]non-elevated test run exceeded $MaxMinutes min; killing it'
       & taskkill /F /T /PID $proc.Id | Out-Null
       throw 'tests hung (see log above: last output shows the file/test that never finished)'
     }
