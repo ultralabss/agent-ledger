@@ -18,7 +18,9 @@ try {
   $cred = New-Object System.Management.Automation.PSCredential(".\$user", $sec)
   $log = Join-Path $env:RUNNER_TEMP 'nonelevated-test.log'
   # pnpm's shim lives in the runner profile (unreadable for this user); the root `test` script is plain node.
-  $cmd = "set PATH=$nodeDir;%PATH%&& cd /d `"$ws`" && node --test `"packages/*/src/**/*.test.ts`" > `"$log`" 2>&1"
+  $tmp = $env:RUNNER_TEMP
+  # Start-Process -Credential inherits the runner's TEMP/HOME, which this user cannot write: point them at the granted temp dir.
+  $cmd = "set PATH=$nodeDir;%PATH%&& set TEMP=$tmp&& set TMP=$tmp&& set TMPDIR=$tmp&& cd /d `"$ws`" && node --test `"packages/*/src/**/*.test.ts`" > `"$log`" 2>&1"
   $proc = Start-Process -FilePath cmd.exe -ArgumentList '/d','/s','/c',"`"$cmd`"" -Credential $cred -LoadUserProfile -WorkingDirectory $env:RUNNER_TEMP -Wait -PassThru -WindowStyle Hidden
   Get-Content $log
   if ($proc.ExitCode -ne 0) { throw "tests failed as non-elevated user (exit $($proc.ExitCode))" }
