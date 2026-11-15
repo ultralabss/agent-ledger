@@ -7,7 +7,7 @@
 
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { chmod, link, mkdir, mkdtemp, readFile, rm, stat, symlink, writeFile } from 'node:fs/promises';
+import { chmod, link, mkdir, mkdtemp, readFile, realpath, rm, stat, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir, userInfo } from 'node:os';
 import { join } from 'node:path';
 import {
@@ -28,12 +28,14 @@ import {
   posixWriteBitsTrusted,
   probeCaseInsensitive,
   probeFs,
+  probeFsStatOnly,
   resolveTrustedExecutable,
   TrustError,
   type StatLike,
   type TrustCode,
   type TrustDeps,
   type TrustFs,
+  type TrustHandle,
 } from './platformTrust.ts';
 import { WIN_PS_SCRIPT, type SpawnFile, type SpawnResult, type WinPathInfo } from './win-ps.ts';
 
@@ -75,6 +77,15 @@ const isProbe = (p: string): boolean => p.includes('.ledger-fsprobe-');
 function wrapFs(over: Partial<TrustFs>): TrustFs {
   return { ...nodeTrustFs, ...over };
 }
+/** Fake the probe file's handle (the probe works ONLY through its descriptor, W1). */
+function probeHandleFs(over: Partial<TrustHandle> | ((h: TrustHandle) => Partial<TrustHandle>)): TrustFs {
+  return wrapFs({
+    open: async (p, f, m) => {
+      const h = await nodeTrustFs.open(p, f, m);
+      return isProbe(p) ? { ...h, ...(typeof over === 'function' ? over(h) : over) } : h;
+    },
+  });
+}
 function errno(code: string): NodeJS.ErrnoException {
   return Object.assign(new Error(code), { code });
 }
@@ -84,23 +95,13 @@ function errno(code: string): NodeJS.ErrnoException {
 const WEAK_FAKES: Record<string, { fs: TrustFs; cap: 'posixModes' | 'ownerMatches' | 'hardlinks' }> = {
   'mode bits read back as 0777': {
     cap: 'posixModes',
-    fs: wrapFs({
-      lstat: async (p) => {
-        const s = await nodeTrustFs.lstat(p);
-        return isProbe(p) ? { ...s, mode: 0o100777 } : s;
-      },
-    }),
+    fs: probeHandleFs((h) => ({ stat: async () => ({ ...(await h.stat()), mode: 0o100777 }) })),
   },
   'files owned by uid 65534': {
     cap: 'ownerMatches',
-    fs: wrapFs({
-      lstat: async (p) => {
-        const s = await nodeTrustFs.lstat(p);
-        return isProbe(p) ? { ...s, uid: 65534 } : s;
-      },
-    }),
+    fs: probeHandleFs((h) => ({ stat: async () => ({ ...(await h.stat()), uid: 65534 }) })),
   },
-  'chmod is a silent no-op': { cap: 'posixModes', fs: wrapFs({ chmod: async () => undefined }) },
+  'chmod is a silent no-op': { cap: 'posixModes', fs: probeHandleFs({ chmod: async () => undefined }) },
   'link() fails with ENOTSUP': {
     cap: 'hardlinks',
     fs: wrapFs({
@@ -128,6 +129,82 @@ test('posix: ensurePrivateDir creates a real 0700 dir on a strong filesystem', {
 test('posix: the capability probe cleans up after itself', { skip: NOT_POSIX }, async () => {
   const base = await sandbox();
   await probeFs(base, posixDeps());
+  const { readdir } = await import('node:fs/promises');
+  assert.deepEqual(await readdir(base), []);
+  await rm(base, { recursive: true, force: true });
+});
+
+// ---- W1: the probe only acts through the descriptor of the file it created ----------------
+
+test('W1: a probe name swapped for a symlink mid-probe is never chmod-ed or followed', { skip: NOT_POSIX }, async () => {
+  const base = await sandbox();
+  const victim = join(base, 'victim-secret');
+  await writeFile(victim, 'keep', { mode: 0o600 });
+  await chmod(victim, 0o600);
+  const dir = join(base, 'probed');
+  await mkdir(dir, { mode: 0o700 });
+  const planting = wrapFs({
+    open: async (p, f, m) => {
+      const h = await nodeTrustFs.open(p, f, m);
+      if (isProbe(p) && !p.endsWith('.l')) {
+        // the attacker wins the race right after our O_EXCL create: name -> symlink to the victim
+        await rm(p);
+        await symlink(victim, p);
+      }
+      return h;
+    },
+  });
+  const caps = await probeFs(dir, posixDeps({ fs: planting }));
+  assert.equal(caps.posixModes, true, 'modes are judged on our own descriptor');
+  assert.equal((await stat(victim)).mode & 0o777, 0o600, 'the symlink target mode must be untouched');
+  assert.equal(await readFile(victim, 'utf8'), 'keep');
+  const { readdir } = await import('node:fs/promises');
+  assert.deepEqual(await readdir(dir), [], 'probe leftovers (incl. the planted link) are removed');
+  await rm(base, { recursive: true, force: true });
+});
+
+test('W1: a dir not owned by us is never probed (OWNER at once), even under the weak-FS bypass', { skip: NOT_POSIX }, async () => {
+  const base = await sandbox();
+  const dir = await realpath(base);
+  await chmod(dir, 0o777);
+  let created = 0;
+  const foreign = (uid: number, mode?: number): TrustFs =>
+    wrapFs({
+      lstat: async (p) => {
+        const st = await nodeTrustFs.lstat(p);
+        return p === dir ? { ...st, uid, ...(mode === undefined ? {} : { mode }) } : st;
+      },
+      open: async (p, f, m) => {
+        if (isProbe(p)) created += 1;
+        return nodeTrustFs.open(p, f, m);
+      },
+    });
+  const env = { LEDGER_ALLOW_WEAK_FS: '1' };
+  await rejectsWith(probeFs(dir, posixDeps({ fs: foreign(UID + 1) })), 'OWNER');
+  await rejectsWith(probeFs(dir, posixDeps({ fs: foreign(UID + 1), env })), 'OWNER');
+  await rejectsWith(probeFs(dir, posixDeps({ fs: foreign(0, 0o40777), env })), 'OWNER', undefined); // root-owned but world-writable, not sticky
+  await rejectsWith(assertPrivateDir(dir, {}, posixDeps({ fs: foreign(UID + 1), env })), 'OWNER');
+  await rejectsWith(ensurePrivateDir(dir, posixDeps({ fs: foreign(UID + 1) })), 'OWNER');
+  assert.equal(created, 0, 'no probe file may be created in a directory that is not ours');
+  // root-owned sticky parent (/tmp-like) under the bypass: probing is allowed (nobody can plant there)
+  const c = await probeFs(dir, posixDeps({ fs: foreign(0, 0o41777), env, cache: new Map() }));
+  assert.equal(created, 1);
+  assert.equal(c.weak, false);
+  await rm(base, { recursive: true, force: true });
+});
+
+test('W1: probeFsStatOnly creates, chmods and links nothing', { skip: NOT_POSIX }, async () => {
+  const base = await sandbox();
+  const writes: string[] = [];
+  const spy = wrapFs({
+    open: async (p) => { writes.push(`open ${p}`); throw errno('EACCES'); },
+    mkdir: async (p) => { writes.push(`mkdir ${p}`); },
+    link: async (a) => { writes.push(`link ${a}`); },
+    rm: async (p) => { writes.push(`rm ${p}`); },
+  });
+  const caps = await probeFsStatOnly(base, posixDeps({ fs: spy }));
+  assert.deepEqual(writes, []);
+  assert.equal(typeof caps.caseInsensitive, 'boolean');
   const { readdir } = await import('node:fs/promises');
   assert.deepEqual(await readdir(base), []);
   await rm(base, { recursive: true, force: true });
@@ -407,7 +484,7 @@ test('I5: under bypass only the missing capability is relaxed; symlink / not-a-d
       const s = await modeFake.lstat(p);
       return p === dir ? { ...s, uid: UID + 1 } : s;
     },
-    chmod: modeFake.chmod,
+    open: modeFake.open,
   });
   await rejectsWith(assertPrivateDir(dir, {}, posixDeps({ fs: foreignOnModeWeak, env })), 'OWNER');
   // a symlink is never relaxed
@@ -425,7 +502,8 @@ test('I5: owner mismatch is tolerated only when ownership is the missing capabil
   const f = join(base, 'x');
   await writeFile(f, 'x', { mode: 0o600 });
   const uidFake = wrapFs({
-    lstat: async (p) => ({ ...(await nodeTrustFs.lstat(p)), uid: 65534 }),
+    // the FILE reads as foreign-owned; the directory stays ours (a foreign dir is never probed, W1)
+    lstat: async (p) => ({ ...(await nodeTrustFs.lstat(p)), ...(p === f ? { uid: 65534 } : {}) }),
     open: async (p, fl, m) => {
       const h = await nodeTrustFs.open(p, fl, m);
       return { ...h, stat: async () => ({ ...(await h.stat()), uid: 65534 }) };
@@ -483,7 +561,6 @@ function mappedFs(from: string, to: string, mountinfo: string): TrustFs {
     rmdir: (p) => nodeTrustFs.rmdir(m(p)),
     rm: (p) => nodeTrustFs.rm(m(p)),
     open: (p, f, mo) => nodeTrustFs.open(m(p), f, mo),
-    chmod: (p, mo) => nodeTrustFs.chmod(m(p), mo),
     link: (a, b) => nodeTrustFs.link(m(a), m(b)),
     readdir: (p) => nodeTrustFs.readdir(m(p)),
     realpath: async (p) => (p.startsWith(from) ? p : nodeTrustFs.realpath(p)),
@@ -788,13 +865,13 @@ function winWorld(): WinWorld {
         writeFile: async () => undefined,
         readText: async () => '',
         truncate: async () => undefined,
+        chmod: async () => undefined,
         sync: async () => undefined,
         close: async () => {
           w.log.push(`close ${p}`);
         },
       };
     },
-    chmod: async () => undefined,
     link: async () => {
       throw errno('ENOTSUP');
     },

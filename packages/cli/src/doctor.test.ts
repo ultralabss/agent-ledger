@@ -2,7 +2,7 @@
  *  when something is actually wrong. */
 
 import assert from 'node:assert/strict';
-import { chmod, mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { chmod, mkdir, mkdtemp, readdir, rm, writeFile } from 'node:fs/promises';
 import { createServer } from 'node:http';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -562,7 +562,7 @@ test('doctor FS: EACCES says what to fix; a missing directory is just "absent"; 
     if (d.endsWith('spool')) throw errno('ENOENT');
     return caps({ fsType: 'apfs' });
   };
-  const res = await run({ baseUrl, ledgerDir: dir, session: null, agent: 'test' }, [], hermetic(dir, { probe }));
+  const res = await run({ baseUrl, ledgerDir: dir, session: null, agent: 'test' }, [], hermetic(dir, { probe, probeStat: async () => caps({ fsType: 'apfs' }) }));
   assert.match(res.out.find((l) => l.startsWith('fs ledger:')) ?? '', /permission denied probing .* chown -R "\$USER" .* chmod 700 .*icacls|fix the folder ACL/s);
   assert.ok(res.out.includes('fs: spool absent · checkout apfs'), res.out.join('\n'));
   assert.equal(res.code, 0, 'a permission problem on a probe is a warning, never DOWN');
@@ -706,4 +706,20 @@ test('doctor T12: a hub of another platform gets NO token; identity fails', asyn
   assert.equal(res.code, 1);
   assert.ok(res.out.some((l) => /^identity: .*another ledger or platform .*token not sent/.test(l)), res.out.join('\n'));
   assert.ok(seenTokens.length > 0 && seenTokens.every((x) => x === undefined), 'no x-hub-token was sent');
+});
+
+test('doctor W1/W4: the checkout (cwd) is described stat-only — no probe file is created there', async (t) => {
+  const dir = await ledger(t);
+  const cwd = await mkdtemp(join(tmpdir(), 'ledger-doctor-cwd-'));
+  t.after(() => rm(cwd, { recursive: true, force: true }));
+  const baseUrl = await serve(t, { ok: true, ...hubIdentity(dir), ledger: dir });
+  const probed: string[] = [];
+  const probe = async (d: string): Promise<FsCaps> => {
+    probed.push(d);
+    return caps();
+  };
+  const res = await run({ baseUrl, ledgerDir: dir, session: null, agent: 'test' }, [], hermetic(dir, { cwd, probe }));
+  assert.ok(!probed.includes(cwd), `the creating probe must not run in the checkout: ${probed.join(',')}`);
+  assert.deepEqual(await readdir(cwd), [], res.out.join('\n'));
+  assert.match(res.out.find((l) => l.startsWith('fs:')) ?? '', /checkout /);
 });

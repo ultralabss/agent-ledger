@@ -105,6 +105,8 @@ export interface TrustHandle {
   writeFile(data: string | Uint8Array): Promise<void>;
   readText(): Promise<string>;
   truncate(len: number): Promise<void>;
+  /** fchmod: acts on the open descriptor, never re-resolves a path (W1). */
+  chmod(mode: number): Promise<void>;
   sync(): Promise<void>;
   close(): Promise<void>;
 }
@@ -116,7 +118,6 @@ export interface TrustFs {
   rmdir(p: string): Promise<void>;
   rm(p: string): Promise<void>;
   open(p: string, flags: number, mode: number): Promise<TrustHandle>;
-  chmod(p: string, mode: number): Promise<void>;
   link(existing: string, created: string): Promise<void>;
   readdir(p: string): Promise<string[]>;
   realpath(p: string): Promise<string>;
@@ -200,6 +201,7 @@ function wrapHandle(fh: fsp.FileHandle): TrustHandle {
     writeFile: (d) => fh.writeFile(d),
     readText: () => fh.readFile('utf8'),
     truncate: (n) => fh.truncate(n),
+    chmod: (m) => fh.chmod(m),
     sync: () => fh.sync(),
     close: () => fh.close(),
   };
@@ -214,7 +216,6 @@ export const nodeTrustFs: TrustFs = {
   rmdir: (p) => fsp.rmdir(p),
   rm: (p) => fsp.rm(p, { force: true }),
   open: async (p, flags, mode) => wrapHandle(await fsp.open(p, flags, mode)),
-  chmod: (p, mode) => fsp.chmod(p, mode),
   link: (a, b) => fsp.link(a, b),
   readdir: (p) => fsp.readdir(p),
   realpath: (p) => fsp.realpath(p),
@@ -422,6 +423,13 @@ async function probePosix(dir: string, deps: TrustDeps): Promise<Omit<FsCaps, 'b
   const real = await deps.fs.realpath(dir).catch(() => {
     throw new TrustError('PROBE_FAILED', `cannot resolve ${dir}`, dir);
   });
+  // W1: never create files in a directory that is not ours. Only a weak-FS bypass may probe a
+  // foreign-owned dir, and then only a root-owned one another account cannot write into (or a
+  // sticky one such as /tmp) — there nobody can plant anything under our probe name.
+  const dst = await deps.fs.lstat(real);
+  if (dst.uid !== uid && !(deps.env.LEDGER_ALLOW_WEAK_FS === '1' && isRootOwnedTrustedParent(dst))) {
+    throw new TrustError('OWNER', `${dir} is not owned by you — refusing to use it`, dir);
+  }
   const api = nodePath.posix;
   const file = api.join(real, `.ledger-fsprobe-${randomBytes(8).toString('hex')}`);
   const linked = `${file}.l`;
@@ -430,34 +438,41 @@ async function probePosix(dir: string, deps: TrustDeps): Promise<Omit<FsCaps, 'b
   let ownerMatches = true;
   let hardlinks = true;
   try {
+    let h: TrustHandle;
     try {
-      const h = await deps.fs.open(file, flag(deps, 'O_WRONLY') | flag(deps, 'O_CREAT') | flag(deps, 'O_EXCL') | noFollow, 0o600);
-      await h.close().catch(() => undefined);
+      h = await deps.fs.open(file, flag(deps, 'O_WRONLY') | flag(deps, 'O_CREAT') | flag(deps, 'O_EXCL') | noFollow, 0o600);
     } catch (err) {
       // Not a weak-FS symptom: a directory we cannot even write to is a fixable misconfiguration.
       throw new TrustError('PROBE_FAILED', `cannot create a probe file in ${dir} (${errCode(err) ?? 'error'})`, dir);
     }
+    // Everything below goes through the descriptor of the file WE just created (O_EXCL|O_NOFOLLOW):
+    // another account swapping the name for a symlink can never make us chmod/stat its target.
     try {
-      const st = await deps.fs.lstat(file);
-      ownerMatches = st.isFile() && st.uid === uid;
-    } catch {
-      ownerMatches = false;
-    }
-    try {
-      // Set explicitly (umask-independent), then flip to 0640: a silent chmod no-op shows up as a mismatch.
-      await deps.fs.chmod(file, 0o600);
-      const a = await deps.fs.lstat(file);
-      await deps.fs.chmod(file, 0o640);
-      const b = await deps.fs.lstat(file);
-      posixModes = (a.mode & 0o777) === 0o600 && (b.mode & 0o777) === 0o640;
-    } catch {
-      posixModes = false;
-    }
-    try {
-      await deps.fs.link(file, linked);
-      hardlinks = (await deps.fs.lstat(file)).nlink === 2;
-    } catch {
-      hardlinks = false;
+      try {
+        const st = await h.stat();
+        ownerMatches = st.isFile() && st.uid === uid;
+      } catch {
+        ownerMatches = false;
+      }
+      try {
+        // Set explicitly (umask-independent), then flip to 0640: a silent chmod no-op shows up as a mismatch.
+        await h.chmod(0o600);
+        const a = await h.stat();
+        await h.chmod(0o640);
+        const b = await h.stat();
+        posixModes = (a.mode & 0o777) === 0o600 && (b.mode & 0o777) === 0o640;
+      } catch {
+        posixModes = false;
+      }
+      try {
+        await deps.fs.link(file, linked);
+        // nlink from OUR descriptor: a swapped-in name cannot fake (or hide) the link count.
+        hardlinks = (await h.stat()).nlink === 2;
+      } catch {
+        hardlinks = false;
+      }
+    } finally {
+      await h.close().catch(() => undefined);
     }
   } finally {
     await deps.fs.rm(linked).catch(() => undefined);
@@ -570,6 +585,41 @@ function checkWinChain(insp: WinInspect, chain: string[], startIndex: number, ki
     const v = evaluateSddl(info.sddl ?? '', kind, { mySid: insp.sid });
     if (!v.ok) throw verdictToError({ ...v, code: 'CHAIN' }, at);
   }
+}
+
+/**
+ * Stat-only filesystem description of a directory we do NOT own (a user's checkout): creates,
+ * chmods and links nothing (W1/W4). Linux fs type from mountinfo, case sensitivity by stat;
+ * the capability flags are not measured (assumed present) — use for display only, never for a
+ * trust decision.
+ */
+export async function probeFsStatOnly(dir: string, depsIn: Partial<TrustDeps> = {}): Promise<FsCaps> {
+  const deps = createTrustDeps(depsIn);
+  const real = await deps.fs.realpath(dir);
+  let fsType = 'unknown';
+  const reasons: string[] = [];
+  let weak = false;
+  if (deps.platform === 'linux') {
+    const mounts = parseMountInfo(await deps.fs.readText('/proc/self/mountinfo').catch(() => ''));
+    fsType = fsTypeFor(real, mounts);
+    if ((await isWsl(deps)) && (WSL_WEAK_TYPES.has(fsType) || WSL_DRIVE_RE.test(real))) {
+      weak = true;
+      reasons.push('WSL DrvFs/9p mount (Windows-side access control)');
+    }
+  }
+  return withBypass(
+    {
+      posixModes: !weak,
+      ownerMatches: !weak,
+      hardlinks: !weak,
+      acl: false,
+      fsType,
+      caseInsensitive: await probeCaseInsensitive(real, deps),
+      weak,
+      reasons,
+    },
+    deps,
+  );
 }
 
 // ---- probeFs --------------------------------------------------------------------------

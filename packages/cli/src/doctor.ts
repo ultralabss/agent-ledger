@@ -27,6 +27,7 @@ import {
   createTrustDeps,
   detectMachinePlatform,
   probeFs,
+  probeFsStatOnly,
   spoolDir,
   spoolStats,
   type FsCaps,
@@ -91,6 +92,8 @@ export interface DoctorDeps {
   fetchFn?: typeof fetch;
   /** Filesystem capability probe (default platformTrust `probeFs`). */
   probe?: typeof probeFs;
+  /** Stat-only description of the checkout (default `probeFsStatOnly`; creates nothing there). */
+  probeStat?: typeof probeFsStatOnly;
   /** Directory whose filesystem is probed as "the current checkout" (default `process.cwd()`). */
   cwd?: string;
   /** Force WSL on/off (default: detected). */
@@ -107,6 +110,8 @@ interface FsTarget {
   id: string;
   label: string;
   dir: string;
+  /** A directory we do not own (the user's checkout): never create/chmod anything there. */
+  statOnly?: boolean;
 }
 
 /**
@@ -117,6 +122,7 @@ interface FsTarget {
 export async function fsChecks(
   targets: readonly FsTarget[],
   probe: typeof probeFs,
+  probeStat: typeof probeFsStatOnly = probeFsStatOnly,
 ): Promise<{ checks: Check[]; problems: string[]; weak: boolean }> {
   const warn: Check[] = [];
   const rest: Check[] = [];
@@ -127,7 +133,7 @@ export async function fsChecks(
   for (const t of targets) {
     let caps: FsCaps;
     try {
-      caps = await probe(t.dir);
+      caps = await (t.statOnly === true ? probeStat(t.dir) : probe(t.dir));
     } catch (err) {
       const code = (err as { code?: unknown } | null)?.code;
       if (code === 'ENOENT' || code === 'ENOTDIR') {
@@ -233,8 +239,14 @@ export async function cmdDoctor(
   else fsTargets.push({ id: 'ledger', label: cfg.ledgerDir, dir: cfg.ledgerDir });
   const spool = spoolDir(io.env);
   fsTargets.push({ id: 'spool', label: spool, dir: spool });
-  fsTargets.push({ id: 'checkout', label: deps.cwd ?? process.cwd(), dir: deps.cwd ?? process.cwd() });
-  const fsr = await fsChecks(fsTargets, deps.probe ?? probeFs);
+  // W1/W4: the checkout is the user's, not ours — stat-only on POSIX (win32 inspection creates nothing).
+  fsTargets.push({
+    id: 'checkout',
+    label: deps.cwd ?? process.cwd(),
+    dir: deps.cwd ?? process.cwd(),
+    statOnly: platform !== 'win32',
+  });
+  const fsr = await fsChecks(fsTargets, deps.probe ?? probeFs, deps.probeStat ?? probeFsStatOnly);
   checks.push(...fsr.checks);
   problems.push(...fsr.problems);
 
