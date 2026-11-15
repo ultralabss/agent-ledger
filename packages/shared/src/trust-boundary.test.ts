@@ -21,8 +21,6 @@ const ALLOWED: Record<string, string> = {
     'non-private (user-owned ~/.claude) read-open: openPrivate would probe/create files there. ' +
     'win32 branch uses lstat/fstat/lstat identity and the POSIX branch fails closed when the flag is undefined. ' +
     'TODO: platformTrust.openNoFollowRead, then drop this entry',
-  'cli/src/selfheal.ts': 'TODO(B6): migrate to platformTrust.openPrivate / isOwnedByMe',
-  'cli/src/doctor.ts': 'TODO(B6): migrate to platformTrust.isOwnedByMe',
 };
 
 function stripComments(src: string): string {

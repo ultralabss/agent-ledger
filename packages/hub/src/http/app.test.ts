@@ -50,7 +50,7 @@ test('guard: foreign Host is 403, write without a token is 401', async (t) => {
   assert.equal(badToken.status, 401);
 });
 
-test('GET without a token is 401 (except healthz), unauthenticated healthz returns only {ok}', async (t) => {
+test('GET without a token is 401 (except healthz), unauthenticated healthz returns only {ok, platform, ledger_id}', async (t) => {
   const fx = await startTestHub();
   t.after(fx.cleanup);
 
@@ -66,7 +66,11 @@ test('GET without a token is 401 (except healthz), unauthenticated healthz retur
   const anonHealth = await fetch(`${fx.url}/v1/healthz`);
   assert.equal(anonHealth.status, 200);
   const anonBody = (await anonHealth.json()) as Record<string, unknown>;
-  assert.deepEqual(Object.keys(anonBody), ['ok']);
+  // T12: `platform` + `ledger_id` (a hash, never the path) are public so a CLI can refuse a
+  // foreign hub BEFORE sending its bearer; everything else is detail.
+  assert.deepEqual(Object.keys(anonBody), ['ok', 'platform', 'ledger_id']);
+  assert.match(String(anonBody.ledger_id), /^[0-9a-f]{64}$/);
+  assert.ok(!JSON.stringify(anonBody).includes(fx.dir), 'the ledger path must not leak unauthenticated');
 
   const authedHealth = await fetch(`${fx.url}/v1/healthz`, {
     headers: { 'x-hub-token': fx.token },

@@ -37,7 +37,8 @@ a search index and is rebuilt from the markdown if lost.
 
 ## Install
 
-Requirements: Node >= 22.18, pnpm, git; macOS or Linux (Windows: planned).
+Requirements: Node >= 22.18, pnpm, git; macOS, Linux, native Windows (PowerShell) or WSL2.
+See [Platform support](#platform-support) for what is verified and what is not.
 
 ```sh
 git clone https://github.com/ultralabss/agent-ledger.git
@@ -52,6 +53,59 @@ instead of skipping), `--allow-brew` (let it run `brew install gitleaks` as a fa
 writes outside `$HOME`), `--help`. The service label is `AGENT_LEDGER_LABEL`
 (default `io.agent-ledger.hub`). `./uninstall.sh` removes the service, the shim and the
 Claude Code hooks (if you installed them); it never touches your ledger data.
+
+Native Windows (a normal, **not elevated** PowerShell, from the cloned repository):
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\install.ps1
+```
+
+`install.ps1` only orchestrates; every trust decision (private directories and their ACLs,
+the generated shims, the gitleaks digest and archive checks) is made by node through
+`ledger setup` and `scripts/gitleaks-pins.mjs`. It puts `ledger.cmd`, `ledger.ps1` and a Git
+Bash `ledger` shim in `%LOCALAPPDATA%\agent-ledger\bin` (added to your user PATH only after
+you confirm), and registers a Task Scheduler task `agent-ledger` (at logon, as you, not
+elevated). `.\uninstall.ps1` removes the task, shims, PATH entry and hooks and keeps the ledger;
+`-Purge` also deletes it after you type `delete`. Details and limits: [INSTALL.md](INSTALL.md).
+
+## Platform support
+
+| Platform | CI-verified | Manually verified | Unverified |
+|---|---|---|---|
+| Linux, ext4 | yes (`ubuntu-latest`) | none recorded | - |
+| macOS, APFS | yes (`macos-latest`) | none recorded | - |
+| Windows, NTFS | yes (`windows-latest`, a Windows Server image) | **none** | Windows 11 client, installer end to end |
+| WSL2 (ext4 inside the distro) | no | **none** | everything |
+| Windows ARM64, ReFS, Dev Drive | no | no | everything |
+
+Plainly: **no real Windows 11 client and no WSL2 were available to the maintainers.** The Windows
+code paths (PowerShell, `icacls`, SDDL parsing, Task Scheduler, the `.ps1` installer) run in CI on a
+Windows Server runner and, locally, only against fakes and fixtures. That runner is elevated, so
+the real-ACL tests skip there (the installer and the hub refuse to run elevated). Treat Windows and
+WSL2 as "implemented and tested against fixtures", not as "proven on your machine"; reports from real
+machines are welcome. The CI column is only as good as the last green run of
+`.github/workflows/ci.yml`.
+
+**Refused filesystems.** The ledger, spool and token must live on a filesystem that can keep them
+private. exFAT, FAT/FAT32, NFS, SMB and WSL `DrvFs` (`/mnt/c/...`) cannot express owners, modes or
+ACLs, so the hub and the installer REFUSE them (fail-closed). The only bypass is
+`LEDGER_ALLOW_WEAK_FS=1` (exactly `1`, in the environment, never read from the repo or the ledger).
+It relaxes only what the filesystem cannot express (mode bits, owner, hard-link counts, ACLs on
+non-ACL volumes), never the symlink / reparse-point / regular-file / identity checks, and it is
+loud: a warning in the hub log, `fs_weak` in `/v1/healthz`, a banner in the web UI and
+`ledger doctor` exiting 2. Move the ledger instead of using it when you can.
+
+**Known v1 limits.**
+
+- The Task Scheduler task briefly flashes a console window at logon (no wrapper in v1).
+- One hub per machine: a hub in WSL and one in Windows share `127.0.0.1:4747`. Pick one; `ledger
+  doctor` reports two ledgers as an error.
+- Headless features and Claude Code hooks need a native `claude.exe`; the npm `claude.cmd` shim is
+  refused on Windows (no shell is ever used to start a child process).
+- On a profile path with non-ASCII characters `ledger.cmd` is not generated (cmd.exe would read it
+  in the OEM code page); `ledger.ps1` and the Git Bash shim are.
+- Paths containing `%`, `!` or `"` are refused by the installer (they would be re-interpreted by
+  cmd.exe), as are paths over 259 characters unless long paths are enabled.
 
 Then:
 

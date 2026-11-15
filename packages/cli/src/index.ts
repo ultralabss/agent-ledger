@@ -91,6 +91,8 @@ const USAGE = `ledger — shared ledger and intake for parallel AI agent session
   ledger spool failed                       failed spool records (method, path, time, body)
   ledger spool retry <file> --confirm       re-sign and resend the records of one failed file
   ledger hook <event>                       hook transport (Claude Code adapter protocol, §10)
+  ledger setup --platform-init [--ledger-dir <abs>] [--port <n>]
+                                          installer helper (install.ps1): private dirs, hub.env, shims; prints JSON
 
 Exit: 0 ok · 2 conflict · 3 hub not running · 4 validation · 5 secret scanner
        (ledger hook always 0 — fail-open)
@@ -110,6 +112,12 @@ export async function run(argv: string[], io: Io): Promise<number> {
   if (cmd === 'hook') {
     const { runHook } = await import('./hook.ts');
     return runHook(args.positional[1] ?? '', { out: io.out, env: io.env, stdin: io.stdin });
+  }
+  // `ledger setup` is the installer's node half: it runs before any hub exists, so it must not build
+  // the hub client or drain the spool.
+  if (cmd === 'setup') {
+    const { cmdSetup } = await import('./setup.ts');
+    return cmdSetup(args, io);
   }
   // `cfg` is needed by the offline fallback in `catch`, but `readEnvConfig`
   // itself throws on a bad `LEDGER_HUB_URL` (S2) and that must stay a plain exit 4

@@ -2,6 +2,7 @@ import { createHash } from 'node:crypto';
 import type { AddressInfo } from 'node:net';
 import { join } from 'node:path';
 import { serve, type ServerType } from '@hono/node-server';
+import { spoolDir } from '@agent-ledger/shared';
 import { loadConfig, type HubConfig } from './config.ts';
 import { Coordination } from './coord.ts';
 import { RuntimeStore } from './db/store.ts';
@@ -11,6 +12,7 @@ import { GitGuard } from './guard/git-guard.ts';
 import { resolveRoots } from './guard/recap.ts';
 import { GuardSwitch } from './guard/switch.ts';
 import { HeadlessRunner, nextMondayNine } from './headless.ts';
+import { WeakFsMonitor, type FsProbe } from './fsweak.ts';
 import { Hooks } from './hooks.ts';
 import { gitleaksAvailability, gitleaksInfo } from './gitleaks.ts';
 import { hubHealthLine, type ScannerState } from './health.ts';
@@ -80,6 +82,8 @@ export interface StartOptions {
   /** A8-4 test seam: bound the binary trust directory walk to a sandbox root.
    *  Production never sets it — the walk goes to `/`. */
   trustStopAt?: string;
+  /** Test seam: capability probe behind the weak-filesystem warning (default `probeFs`). */
+  fsProbe?: FsProbe;
 }
 
 export async function startHub(opts: StartOptions = {}): Promise<HubHandle> {
@@ -101,6 +105,21 @@ export async function startHub(opts: StartOptions = {}): Promise<HubHandle> {
   const migrated = await ledger.migrateRepairedItems();
   if (migrated > 0) log(`migration: repaired ${migrated} items`);
   const token = await loadOrCreateToken(ledger.paths.tokenPath);
+  // Weak-FS bypass (LEDGER_ALLOW_WEAK_FS=1) is never silent: hub.log line per path here, the
+  // list in authenticated healthz (`fs_weak`) and the web banner. `.hub` is probed (private,
+  // git-ignored) instead of the ledger root so the probe file never shows up in the ledger repo.
+  // The spool is probed only when it is the real one (periodic hub) or a probe is injected.
+  const weakFs = new WeakFsMonitor(
+    () => [
+      { probeDir: ledger.paths.hubDir, label: ledger.paths.root },
+      ...(opts.periodic !== false || opts.fsProbe !== undefined
+        ? [{ probeDir: spoolDir(process.env), label: spoolDir(process.env) }]
+        : []),
+    ],
+    log,
+    opts.fsProbe,
+  );
+  await weakFs.refresh();
   // The UI cookie is keyed by this, NOT by the hub token, so a
   // local process holding the token cannot compute a cookie and pose as "a
   // human at the browser right now" for the owner-level routes. 32 B CSPRNG,
@@ -327,6 +346,7 @@ export async function startHub(opts: StartOptions = {}): Promise<HubHandle> {
     spoolStats,
     health,
     scanner,
+    fsWeak: () => weakFs.paths(),
     // Authenticated-only runtime diagnostics. Fixed shape — the CLI
     // codes against it.
     diag: () => ({
@@ -428,6 +448,7 @@ export async function startHub(opts: StartOptions = {}): Promise<HubHandle> {
   /** Reap dead sessions, refresh live checkouts, reindex as a watch backstop. */
   const sweep = async (): Promise<void> => {
     try {
+      await weakFs.refresh();
       await sessions.reap();
       // A `leak` hold whose token rotation failed is retried
       // from here, so it can lift on its own once the cause is fixed. No-op

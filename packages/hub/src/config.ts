@@ -1,5 +1,8 @@
 import { homedir } from 'node:os';
 import { isAbsolute, resolve } from 'node:path';
+import { defaultLedgerDir, expandHome } from '@agent-ledger/shared';
+
+export { expandHome };
 
 export interface HubConfig {
   /** Absolute path to the ledger git repo. */
@@ -69,12 +72,6 @@ export interface HubConfig {
   headlessTimeoutMs: number;
 }
 
-export function expandHome(p: string): string {
-  if (p === '~') return homedir();
-  if (p.startsWith('~/')) return resolve(homedir(), p.slice(2));
-  return isAbsolute(p) ? p : resolve(p);
-}
-
 const MINUTE = 60_000;
 const HOUR = 60 * MINUTE;
 
@@ -103,7 +100,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): HubConfig {
     throw new Error(`LEDGER_HUB_PORT must be an integer 0–65535, got "${rawPort}"`);
   }
   return {
-    ledgerDir: expandHome(env.LEDGER_DIR?.trim() || '~/.ledger'),
+    ledgerDir: env.LEDGER_DIR?.trim() ? expandHome(env.LEDGER_DIR.trim()) : defaultLedgerDir(),
     port,
     push: env.LEDGER_PUSH?.trim() === '1',
     commitDebounceMs: clampedMs(env.LEDGER_COMMIT_DEBOUNCE_MS, 30_000, 0, 10 * MINUTE),
@@ -148,7 +145,14 @@ function guardEnv(raw: string | undefined): 'on' | 'off' | null {
 function absoluteOrNull(raw: string | undefined): string | null {
   const value = raw?.trim();
   if (!value || value === '') return null;
-  const expanded = value.startsWith('~') ? expandHome(value) : value;
+  let expanded = value;
+  if (value.startsWith('~')) {
+    try {
+      expanded = expandHome(value);
+    } catch {
+      return null; // `~user`: not expanded, not absolute
+    }
+  }
   return isAbsolute(expanded) ? expanded : null;
 }
 

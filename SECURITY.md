@@ -27,10 +27,40 @@ Agent Ledger is a single-user, local tool.
 In scope: authentication/authorization bypass on the hub, DNS rebinding or cross-origin
 access, path traversal or symlink escapes, command injection when the hub spawns
 processes, secret leakage into the ledger, logs or API responses, and unsafe behavior of
-the installers (`install.sh`, `adapters/claude-code/install-hooks.mjs`).
+the installers (`install.sh`, `install.ps1`, `uninstall.ps1`, `adapters/claude-code/install-hooks.mjs`).
 
 Out of scope: attacks that need an already compromised local account, multi-user
 deployments (not supported), and denial of service by a local user.
+
+## Windows and filesystem threats (summary)
+
+Native Windows and WSL2 are implemented with the same single-user threat model; the detailed spec is
+[docs/windows-support-spec.md](docs/windows-support-spec.md). Actors in scope: another local account,
+a malicious repository or checkout, a compromised download channel, untrusted agent input. A same-user
+attacker, a deliberate local administrator and the kernel stay out of scope.
+
+The table lists the controls the spec requires; each one ships with its own work package and test,
+so check the spec for what has landed in your version.
+
+| Threat | Control |
+|---|---|
+| Other user reads or writes ledger, spool, token, bin | One `platformTrust` module: every private path is a real directory or file owned by you, writable only by you, SYSTEM and Administrators (SDDL parsed, protected DACL, no read for others on secrets); POSIX keeps owner and mode checks |
+| Symlink / junction / reparse point, TOCTOU | lstat, open, fstat, lstat identity check; reparse points refused |
+| Hard-link plant, token leak | Secrets need exactly one link; a token readable by others is rotated |
+| Lock DoS | Bounded retries; a lock is stolen only when stale and its owner is dead |
+| Hook planting through git | Hooks path is a verified private empty directory on every OS, `--no-verify` on commit and push |
+| `.cmd` / shell injection (CVE-2024-27980 class) | Children start as `spawn(absolutePath, argv[], {shell:false})`; `.cmd/.bat/.ps1` refused; `shell:true` is a CI-blocked pattern with no exceptions |
+| PATH / CWD hijack | Executables only from absolute, trust-checked candidates; relative or empty candidates are dropped |
+| Shim / Task Scheduler escaping | `assertShimSafePath` refuses `% ! "` and control characters; arguments are CRT-quoted; the task is built from objects, not XML text; generated `ledger.cmd` is pinned by a golden test |
+| gitleaks supply chain | In-repo sha256 pins per asset, zip layout check, fresh private extraction directory, digest recorded beside the managed copy |
+| Case-insensitive claim bypass | Claim globs are canonicalized (case, 8.3 names, ADS, trailing dot) on case-insensitive volumes |
+| Wrong hub (WSL vs Windows) | Hub identity is checked before the bearer token is sent |
+| Weak filesystem | Refused fail-closed; `LEDGER_ALLOW_WEAK_FS=1` relaxes only what the volume cannot express and is always loud |
+| Elevated install | Installers and hub refuse to run elevated |
+
+Honest status: the Windows controls run in CI on a Windows Server runner and against fixtures; they
+have NOT been verified on a real Windows 11 client or on WSL2, and the CI runner is elevated, so the
+real-ACL tests skip there. See the support matrix in [README.md](README.md#platform-support).
 
 ## Supply chain
 

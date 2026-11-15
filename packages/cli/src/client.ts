@@ -2,8 +2,9 @@
  *  0 ok · 2 conflict · 3 hub not running · 4 validation · 5 secret scanner. */
 
 import { readFile } from 'node:fs/promises';
-import { homedir } from 'node:os';
-import { isAbsolute, join, resolve } from 'node:path';
+import { join } from 'node:path';
+import { defaultLedgerDir, expandHome } from '@agent-ledger/shared';
+import { hubIdentityVerdict, identityRefusal } from './identity.ts';
 import { triggerSelfHeal } from './selfheal.ts';
 
 /** Default request budget. Without a timeout a wedged hub would hang `ledger`
@@ -79,11 +80,7 @@ export class CliError extends Error {
   }
 }
 
-export function expandHome(p: string): string {
-  if (p === '~') return homedir();
-  if (p.startsWith('~/')) return resolve(homedir(), p.slice(2));
-  return isAbsolute(p) ? p : resolve(p);
-}
+export { expandHome };
 
 export interface CliEnvConfig {
   baseUrl: string;
@@ -123,7 +120,7 @@ export function readEnvConfig(env: NodeJS.ProcessEnv = process.env): CliEnvConfi
     baseUrl: assertLocalUrl(
       (env.LEDGER_HUB_URL?.trim() || `http://127.0.0.1:${port}`).replace(/\/$/, ''),
     ),
-    ledgerDir: expandHome(env.LEDGER_DIR?.trim() || '~/.ledger'),
+    ledgerDir: env.LEDGER_DIR?.trim() ? expandHome(env.LEDGER_DIR.trim()) : defaultLedgerDir(),
     session: env.LEDGER_SESSION?.trim() || null,
     agent: env.LEDGER_AGENT?.trim() || 'orchestrator',
   };
@@ -151,6 +148,8 @@ export class HubClient {
   /** One self-heal per process, no matter how many requests fail. */
   private healed = false;
   private token: string | null = null;
+  /** Set once `/v1/healthz` proved the port is held by THIS machine's hub for THIS ledger. */
+  private identityOk = false;
 
   constructor(cfg: CliEnvConfig, timeouts: HubTimeouts = {}) {
     this.baseUrl = cfg.baseUrl;
@@ -196,6 +195,35 @@ export class HubClient {
     }
   }
 
+  /**
+   * T12: ask the unauthenticated `/v1/healthz` who holds the port BEFORE the bearer is attached.
+   * No `x-hub-token` is ever sent by this request. Transport errors propagate raw (the caller's
+   * refused/timeout handling applies); a mismatch is a `CliError` 3 that is NOT `hubDown`, so
+   * it is never spooled either. Cached per client: the answer cannot change mid-process
+   * without the token check failing anyway.
+   */
+  private async verifyIdentity(): Promise<void> {
+    if (this.identityOk) return;
+    const res = await fetch(`${this.baseUrl}/v1/healthz`, {
+      redirect: 'manual',
+      signal: AbortSignal.timeout(this.timeouts.healthzMs),
+    });
+    if (res.status === 502 || res.status === 503) {
+      throw new CliError(3, `hub is not answering (${res.status}) at ${this.baseUrl}`, true);
+    }
+    let body: unknown = null;
+    if (res.ok) {
+      try {
+        body = JSON.parse((await res.text()).slice(0, 64 * 1024));
+      } catch {
+        body = null;
+      }
+    }
+    const verdict = hubIdentityVerdict(body, this.ledgerDir);
+    if (!verdict.ok) throw new CliError(3, identityRefusal(verdict));
+    this.identityOk = true;
+  }
+
   /** `SpoolingClient` needs the same token to sign/verify spool records
    *  — protected rather than a second read of the token file. */
   protected async readToken(): Promise<string | null> {
@@ -234,7 +262,7 @@ export class HubClient {
     if (!token) {
       throw new CliError(3, `hub token not found (${this.tokenPath}) — is the hub running? (\`ledger doctor\`)`);
     }
-    headers['x-hub-token'] = token;
+    // The bearer is attached only inside `attempt`, after `verifyIdentity` (T12).
     if (method !== 'GET') {
       headers['content-type'] = 'application/json';
     }
@@ -242,10 +270,15 @@ export class HubClient {
     const timeoutMs = path.endsWith('/healthz')
       ? this.timeouts.healthzMs
       : this.timeouts.requestMs;
+    const attempt = async (): Promise<Response> => {
+      await this.verifyIdentity();
+      return this.send(method, path, { ...headers, 'x-hub-token': token }, body, timeoutMs);
+    };
     let res: Response;
     try {
-      res = await this.send(method, path, headers, body, timeoutMs);
+      res = await attempt();
     } catch (err) {
+      if (err instanceof CliError) throw err;
       if (!isRefusedErr(err)) {
         // Timeout or any other transport error: the request may already have
         // been delivered, so it is NOT retried here — a retried write could
@@ -256,8 +289,9 @@ export class HubClient {
       // port, and retry exactly once.
       await this.selfHeal();
       try {
-        res = await this.send(method, path, headers, body, timeoutMs);
+        res = await attempt();
       } catch (err2) {
+        if (err2 instanceof CliError) throw err2;
         throw this.downError(err2, timeoutMs);
       }
     }

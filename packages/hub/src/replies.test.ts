@@ -9,10 +9,11 @@
  */
 
 import assert from 'node:assert/strict';
-import { chmod, mkdtemp, readFile, writeFile } from 'node:fs/promises';
+import { chmod, mkdtemp, readdir, readFile, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
+import { buildWorkerArgs, buildWorkerSystemPrompt, workerCommitCommand } from './replies.ts';
 import { makeCodeRepo, startTestHub } from './test-helpers.ts';
 
 /**
@@ -230,8 +231,11 @@ test('the worker gets the prompt on stdin, not in argv, and an env without secre
   assert.ok(allowed.includes('Bash(git status*)'));
   // H23-1: the allow rule is narrowed to `-m *` — a bare `commit *` would
   // also match `-F <file>`/`--file=<file>` (arbitrary file as commit message).
-  assert.ok(allowed.includes('Bash(git -c core.hooksPath=/dev/null commit -m *)'));
-  assert.ok(!allowed.includes('Bash(git -c core.hooksPath=/dev/null commit *)'));
+  const commit = allowed.filter((a) => a.includes(' commit '));
+  assert.equal(commit.length, 1, commit.join(' | '));
+  assert.match(commit[0] as string, /^Bash\(git -c core\.hooksPath=\S+\/\.hub\/empty-hooks commit --no-verify -m \*\)$/);
+  assert.ok(!commit[0]!.includes('/dev/null'));
+  assert.ok(!allowed.some((a) => /commit \*\)$/.test(a)));
   assert.ok(
     disallowed.includes('Bash(*commit*-F*)') &&
       disallowed.includes('Bash(*commit*--file*)') &&
@@ -534,4 +538,46 @@ test('the web reply text is inside «…» and cannot escape the envelope', asyn
   // Nothing from the unverified text stands outside the envelope.
   const after = inbox.slice(inbox.indexOf('»') + 1);
   assert.equal(after.trim(), "— the full text is in the item's comments.", inbox);
+});
+
+test('I4: worker commit command embeds only a safely-quotable hub hooks path, else no commit rule', () => {
+  assert.equal(
+    workerCommitCommand('/home/u/.ledger/.hub/empty-hooks'),
+    'git -c core.hooksPath=/home/u/.ledger/.hub/empty-hooks commit --no-verify',
+  );
+  // Windows: backslashes -> forward slashes (Git for Windows accepts them).
+  assert.equal(
+    workerCommitCommand('C:\\Users\\u\\.ledger\\.hub\\empty-hooks'),
+    'git -c core.hooksPath=C:/Users/u/.ledger/.hub/empty-hooks commit --no-verify',
+  );
+  for (const bad of ['/home/John Doe/.hub/empty-hooks', '/a/$(x)/h', '/a/`x`/h', '/a;b/h', '/a/*/h', '/a/"b"/h', '/a/../b', '/dev/null/../x', '', 'rel\n/h']) {
+    assert.equal(workerCommitCommand(bad), null, bad);
+    const args = buildWorkerArgs('/home/u/repo', bad);
+    assert.ok(!args.some((a) => a.startsWith('Bash(') && a.includes(' commit ')), `no commit rule for ${bad}`);
+    assert.ok(!buildWorkerSystemPrompt(bad).includes('core.hooksPath'));
+  }
+  const ok = buildWorkerSystemPrompt('/home/u/.ledger/.hub/empty-hooks');
+  assert.ok(ok.includes('--no-verify') && !ok.includes('/dev/null'));
+});
+
+test('I4: no /dev/null core.hooksPath anywhere in non-test src', async () => {
+  const root = new URL('.', import.meta.url).pathname;
+  const files: string[] = [];
+  async function walk(dir: string): Promise<void> {
+    for (const e of await readdir(dir, { withFileTypes: true })) {
+      const full = join(dir, e.name);
+      if (e.isDirectory()) await walk(full);
+      else if (/\.ts$/.test(e.name) && !/\.test\.ts$/.test(e.name)) files.push(full);
+    }
+  }
+  await walk(root);
+  assert.ok(files.length > 10);
+  for (const f of files) {
+    // Comments may still NAME the idiom (git.ts explains why it is gone); code may not.
+    const text = (await readFile(f, 'utf8'))
+      .split('\n')
+      .filter((l) => !/^\s*(\*|\/\/|\/\*)/.test(l))
+      .join('\n');
+    assert.ok(!/core\.hooksPath=\/dev\/null/.test(text), `${f} still uses core.hooksPath=/dev/null`);
+  }
 });

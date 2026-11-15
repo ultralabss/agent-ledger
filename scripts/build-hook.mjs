@@ -49,6 +49,10 @@ const ENTRIES = [
   'bin.ts',
 ];
 
+/** Shared modules the hook imports by relative path (`../../shared/src/<x>.ts`). Dependency-free
+ *  (node: builtins only) so they can sit next to the hook as `<x>.js`. */
+const SHARED_ENTRIES = ['paths.ts'];
+
 function transpile(source, fileName) {
   const out = ts.transpileModule(source, {
     fileName,
@@ -72,8 +76,16 @@ for (const entry of ENTRIES) {
   // the source tree, because the slow path is not compiled.
   js = js
     .replace(/(['"])\.\/(hook(?:-[a-z]+)?|selfheal)\.ts\1/g, "'./$2.js'")
+    .replace(/(['"])\.\.\/\.\.\/shared\/src\/([a-z]+)\.ts\1/g, "'./$2.js'")
     .replace(/(['"])\.\/index\.ts\1/g, `'${join(srcDir, 'index.ts')}'`);
   const name = entry.replace(/\.ts$/, '.js');
   await writeFile(join(outDir, name), js, 'utf8');
+  process.stdout.write(`build-hook: ${name}\n`);
+}
+
+for (const entry of SHARED_ENTRIES) {
+  const source = await readFile(join(root, 'packages', 'shared', 'src', entry), 'utf8');
+  const name = entry.replace(/\.ts$/, '.js');
+  await writeFile(join(outDir, name), transpile(source, entry), 'utf8');
   process.stdout.write(`build-hook: ${name}\n`);
 }

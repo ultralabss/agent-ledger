@@ -480,7 +480,8 @@ export const SHELL_ESCAPE_DENYLIST: readonly string[] = [
   'Bash(*--ext-diff*)',
   'Bash(*--textconv*)',
   // NOT denied here: `git -c …` and `core.hooksPath` in general. The worker's
-  // own allow rule is `Bash(git -c core.hooksPath=/dev/null commit -m *)` — it
+  // own allow rule is `Bash(git -c core.hooksPath=<hub empty-hooks dir> commit
+  // --no-verify -m *)` (replies.ts `workerCommitCommand`, I4) — it
   // disables repo hooks on purpose — and deny beats allow, so a blanket deny
   // would silently remove the worker's ability to commit at all.
   'Bash(*core.fsmonitor*)',

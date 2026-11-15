@@ -1,7 +1,7 @@
 /**
- * Bring the hub's launchd job back when it is not answering (only relevant if
- * the hub was installed as a launchd job by `install.sh`; otherwise this
- * finds no plist and does nothing).
+ * Bring the hub's supervisor job back when it is not answering: the launchd job
+ * on macOS (`install.sh`), the Task Scheduler task `agent-ledger` on Windows
+ * (`install.ps1`). Anywhere else, or without an installed job, this does nothing.
  *
  * Why this exists: a `session-start` hook that cannot reach the hub prints
  * `AGENT-LEDGER DOWN` and the whole session then treats `QUEUED` as an error.
@@ -9,29 +9,47 @@
  * makes that call itself instead of asking the user to paste one.
  *
  * Hard rules, all of them security- or latency-driven:
- *  - darwin only, `LEDGER_SELFHEAL=0` disables it everywhere.
+ *  - darwin and win32 only, `LEDGER_SELFHEAL=0` disables it everywhere.
  *  - rate limited through a marker file, written BEFORE the spawn, so a loop of
  *    failing hooks cannot turn into a loop of `launchctl` calls.
  *  - never `kickstart -k`: `-k` kills a *running* hub. A hub that is slow is
  *    not a hub that should be shot; we only ever start one that is not running.
+ *    win32: `schtasks /Run` only (never `/End`); the task's MultipleInstances policy
+ *    is `IgnoreNew`, so running it while the hub lives is a no-op.
  *  - the child is `detached` + `stdio: 'ignore'` + `.unref()`, never awaited on
  *    the tool-hook path (§10.1 latency budget).
  *  - everything in `argv` is a module constant except the plist path, which is
  *    derived from `os.userInfo().homedir` (not `$HOME`, which a caller can set)
- *    and validated with `lstat` before it is handed to `bootstrap`.
+ *    and validated with `lstat` before it is handed to `bootstrap`. win32 argv is
+ *    constant (`/Run /TN agent-ledger`); the binary is `<SystemRoot>\\System32\\schtasks.exe`
+ *    with `SystemRoot` shape-validated (single drive-rooted component), never a PATH lookup.
+ *  - no uid / O_NOFOLLOW here (I1): the marker goes through platformTrust.
  *  - fail-open: this never throws and never prints.
  */
 
 import { spawn } from 'node:child_process';
-import { constants as fsConstants } from 'node:fs';
-import { lstat, mkdir, open as openFile, readFile } from 'node:fs/promises';
+import { lstat, readFile, stat } from 'node:fs/promises';
 import { userInfo } from 'node:os';
-import { dirname, join } from 'node:path';
+import path, { dirname, join } from 'node:path';
+import {
+  TrustError,
+  createTrustDeps,
+  ensurePrivateDir,
+  openPrivate,
+  validSystemRoot,
+} from '@agent-ledger/shared';
 
 /** Must match the default `Label` in `ops/launchd/*.plist.tmpl` and `install.sh` (AGENT_LEDGER_LABEL). */
 export const HUB_LABEL = 'io.agent-ledger.hub';
 const LAUNCHCTL = '/bin/launchctl';
 const PLUTIL = '/usr/bin/plutil';
+/** Task Scheduler task name `install.ps1` registers (`schtasks /Query /TN agent-ledger`). */
+export const WIN_TASK_NAME = 'agent-ledger';
+
+/** Absolute `schtasks.exe`; throws when `SystemRoot` is missing or malformed. */
+export function schtasksPath(env: NodeJS.ProcessEnv): string {
+  return path.win32.join(validSystemRoot(env.SystemRoot), 'System32', 'schtasks.exe');
+}
 /** Two attempts inside 30 s would only ever fight each other: `ThrottleInterval`
  *  in the plist is 10 s and a cold hub needs ~1 s to listen. */
 export const SELFHEAL_MIN_INTERVAL_MS = 30_000;
@@ -43,7 +61,7 @@ export interface SpawnedChild {
 export type SpawnFn = (
   command: string,
   args: readonly string[],
-  options: { stdio: 'ignore'; detached: boolean; shell: false },
+  options: { stdio: 'ignore'; detached: boolean; shell: false; windowsHide?: boolean },
 ) => SpawnedChild;
 
 export interface StatFacts {
@@ -56,6 +74,7 @@ export interface StatFacts {
 export interface SelfHealDeps {
   now: () => number;
   platform: string;
+  /** darwin only (`gui/<uid>` launchctl domain and plist ownership). */
   getuid: () => number | undefined;
   homedir: () => string;
   spawnDetached: SpawnFn;
@@ -67,6 +86,8 @@ export interface SelfHealDeps {
   readText: (path: string) => Promise<string>;
   writeMarker: (path: string, text: string) => Promise<void>;
   statOf: (path: string) => Promise<StatFacts>;
+  /** win32: does `schtasks.exe` exist where `SystemRoot` says? */
+  fileExists: (path: string) => Promise<boolean>;
 }
 
 export interface SelfHealOpts {
@@ -91,7 +112,7 @@ export interface SelfHealResult {
   /** Machine-readable, for `ledger doctor` and the tests. Never printed by hooks. */
   reason:
     | 'disabled'
-    | 'not-darwin'
+    | 'not-darwin' // neither darwin nor win32: no supervisor we know how to start
     | 'no-uid'
     | 'rate-limited'
     | 'other-instance'
@@ -99,8 +120,9 @@ export interface SelfHealResult {
     | 'bootstrap'
     | 'bootstrap+kickstart'
     | 'plist-rejected'
+    | 'schtasks-run'
     | 'error';
-  /** Set when `reason` is `plist-rejected`, for `ledger doctor`. */
+  /** Set when `reason` is `plist-rejected` or `error`, for `ledger doctor`: what to fix. */
   detail?: string;
 }
 
@@ -123,31 +145,29 @@ function defaultDeps(): SelfHealDeps {
   return {
     now: () => Date.now(),
     platform: process.platform,
-    getuid: () => process.getuid?.(),
+    getuid: () => createTrustDeps().getuid(),
     homedir: () => userInfo().homedir,
     spawnDetached: spawn as unknown as SpawnFn,
     capture: runCapture,
     readText: (p) => readFile(p, 'utf8'),
-    // `writeFile(p, …, { mode: 0o600 })` only applies that mode when
-    // IT creates the file, and it follows a symlink at `p` — another local
-    // user could pre-create the marker path as a symlink or a world-writable
-    // file and this would happily write through it. `O_NOFOLLOW` makes a
-    // symlink ELOOP instead of being followed, and `fchmod` on the already-
-    // open fd enforces 0600 even on a pre-existing file.
+    // platformTrust (I1): a real private directory owned by us, then `openPrivate('trunc')` —
+    // POSIX no-follow open + fstat owner check, win32 lstat/open/fstat/lstat identity — so a
+    // symlink or a file another account pre-created at the marker path is refused, not
+    // written through.
     writeMarker: async (p, text) => {
-      await mkdir(dirname(p), { recursive: true, mode: 0o700 });
-      const fh = await openFile(
-        p,
-        fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_TRUNC | fsConstants.O_NOFOLLOW,
-        0o600,
-      );
+      await ensurePrivateDir(dirname(p));
+      const fh = await openPrivate(p, 'trunc', 0o600);
       try {
-        await fh.chmod(0o600);
-        await fh.writeFile(text, 'utf8');
+        await fh.writeFile(text);
       } finally {
         await fh.close();
       }
     },
+    fileExists: (p) =>
+      stat(p).then(
+        (st) => st.isFile(),
+        () => false,
+      ),
     statOf: async (p) => {
       const st = await lstat(p);
       return {
@@ -184,6 +204,7 @@ export async function runCapture(
       child = spawn(command, [...args], {
         stdio: ['ignore', 'pipe', 'ignore'],
         shell: false,
+        windowsHide: true,
         timeout: timeoutMs,
       });
     } catch {
@@ -271,8 +292,10 @@ export async function triggerSelfHeal(opts: SelfHealOpts): Promise<SelfHealResul
   const env = opts.env ?? process.env;
   try {
     if (env.LEDGER_SELFHEAL?.trim() === '0') return { attempted: false, reason: 'disabled' };
-    if (d.platform !== 'darwin') return { attempted: false, reason: 'not-darwin' };
-    const uid = d.getuid();
+    const win = d.platform === 'win32';
+    if (d.platform !== 'darwin' && !win) return { attempted: false, reason: 'not-darwin' };
+    // launchd needs a numeric uid for its `gui/<uid>` domain; Task Scheduler does not.
+    const uid = win ? 0 : d.getuid();
     if (typeof uid !== 'number') return { attempted: false, reason: 'no-uid' };
 
     const marker = selfHealMarker(opts.ledgerDir);
@@ -290,9 +313,11 @@ export async function triggerSelfHeal(opts: SelfHealOpts): Promise<SelfHealResul
     // broken session would spawn `launchctl` again).
     try {
       await d.writeMarker(marker, `${now}\n`);
-    } catch {
-      return { attempted: false, reason: 'error' };
+    } catch (err) {
+      return { attempted: false, reason: 'error', detail: markerFixHint(err, marker, d.platform) };
     }
+
+    if (win) return healWin32(d, env);
 
     const target = guiTarget(uid);
     const plist = hubPlistPath(d);
@@ -340,6 +365,40 @@ export async function triggerSelfHeal(opts: SelfHealOpts): Promise<SelfHealResul
   }
 }
 
+/** What to fix when the rate-limit marker cannot be written (EACCES/EPERM, a refusal, ...). */
+export function markerFixHint(err: unknown, marker: string, platform: string): string {
+  if (err instanceof TrustError) return `${marker}: ${err.message}`;
+  const code = (err as { code?: unknown } | null)?.code;
+  if (code === 'EACCES' || code === 'EPERM') {
+    const dir = (platform === 'win32' ? path.win32 : path.posix).dirname(marker);
+    return platform === 'win32'
+      ? `permission denied on ${dir}: your account needs write access there (do not run agent-ledger elevated; fix the folder ACL, e.g. icacls "${dir}" /inheritance:r /grant:r "%USERNAME%:(OI)(CI)F")`
+      : `permission denied on ${dir}: it must be owned and writable by your user (chown -R "$USER" "${dir}" && chmod 700 "${dir}")`;
+  }
+  if (code === 'EROFS') return `${(platform === 'win32' ? path.win32 : path.posix).dirname(marker)} is on a read-only filesystem: move the ledger to a writable local disk`;
+  return `cannot write ${marker} (${typeof code === 'string' ? code : 'error'})`;
+}
+
+/** win32: start the Task Scheduler task. `/Run` on a task that is already running is a no-op
+ *  (`IgnoreNew`), so a slow hub is never interrupted. Detached, unawaited, argv constant. */
+async function healWin32(d: SelfHealDeps, env: NodeJS.ProcessEnv): Promise<SelfHealResult> {
+  let exe: string;
+  try {
+    exe = schtasksPath(env);
+  } catch {
+    return {
+      attempted: false,
+      reason: 'error',
+      detail: 'SystemRoot is missing or malformed: cannot locate System32\\schtasks.exe (check the SystemRoot environment variable)',
+    };
+  }
+  if (!(await d.fileExists(exe))) {
+    return { attempted: false, reason: 'error', detail: `${exe} not found: SystemRoot does not point at a Windows directory` };
+  }
+  fire(d, exe, ['/Run', '/TN', WIN_TASK_NAME]);
+  return { attempted: true, reason: 'schtasks-run' };
+}
+
 interface Settings {
   ledgerDir?: string | undefined;
   port?: string | undefined;
@@ -379,19 +438,20 @@ function mismatch(found: Settings, opts: SelfHealOpts): boolean {
 }
 
 function kick(d: SelfHealDeps, target: string): void {
-  fire(d, ['kickstart', target]);
+  fire(d, LAUNCHCTL, ['kickstart', target]);
 }
 
 function boot(d: SelfHealDeps, uid: number, plist: string): void {
-  fire(d, ['bootstrap', `gui/${uid}`, plist]);
+  fire(d, LAUNCHCTL, ['bootstrap', `gui/${uid}`, plist]);
 }
 
-function fire(d: SelfHealDeps, args: readonly string[]): void {
+function fire(d: SelfHealDeps, command: string, args: readonly string[]): void {
   try {
-    const child = d.spawnDetached(LAUNCHCTL, args, {
+    const child = d.spawnDetached(command, args, {
       stdio: 'ignore',
       detached: true,
       shell: false,
+      windowsHide: true,
     });
     child.unref();
   } catch {

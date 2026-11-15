@@ -107,9 +107,17 @@ function SystemTab() {
   const guard = healthz.data?.guard;
   const spool = healthz.data?.spool;
   const headless = healthz.data?.headless;
+  const fsWeak = healthz.data?.fs_weak ?? [];
 
   return (
     <div className="flex flex-col gap-4">
+      {fsWeak.length > 0 && (
+        <div role="alert" className="rounded px-3 py-2 text-[13px]" style={{ background: 'var(--k-blocking)', color: '#fff' }}>
+          <strong>Weak filesystem: private-permission checks are relaxed</strong> (LEDGER_ALLOW_WEAK_FS=1). Other local
+          accounts may be able to read the ledger, token or spool on: {fsWeak.join(', ')}. Move them to a local NTFS/ext4/APFS
+          volume and unset the variable.
+        </div>
+      )}
       <div className="flex flex-wrap items-center gap-2">
         {guard && (
           <Badge

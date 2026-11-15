@@ -7,10 +7,13 @@ import { chmod, lstat, mkdir, mkdtemp, readFile, rm, stat, symlink, writeFile } 
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
+import { TrustError } from '@agent-ledger/shared';
 import { skipOnWin32 } from '@agent-ledger/shared/testing';
 import {
   SELFHEAL_MIN_INTERVAL_MS,
   lastSelfHealAt,
+  markerFixHint,
+  schtasksPath,
   selfHealMarker,
   triggerSelfHeal,
   validatePlist,
@@ -255,4 +258,110 @@ test('a marker that is a symlink is not followed — fail-open, nothing is writt
   await assert.rejects(stat(evilTarget), 'the symlink target must not be created/written');
   const st = await lstat(marker);
   assert.equal(st.isSymbolicLink(), true, 'the symlink in place of the marker must stay untouched');
+});
+
+/* ---------------- B6: win32 supervisor (Task Scheduler), marker errors ---------------- */
+
+function winHarness(dir: string, over: Partial<SelfHealDeps> = {}) {
+  const spawned: { cmd: string; args: readonly string[]; opts: Record<string, unknown> }[] = [];
+  const deps: Partial<SelfHealDeps> = {
+    now: () => 5_000_000,
+    platform: 'win32',
+    // A uid is meaningless on win32: asking for it would be a bug.
+    getuid: () => {
+      throw new Error('getuid must not be consulted on win32');
+    },
+    fileExists: async () => true,
+    spawnDetached: (cmd, args, opts) => {
+      spawned.push({ cmd, args, opts: { ...opts } });
+      return { unref: () => undefined };
+    },
+    ...over,
+  };
+  return { spawned, deps };
+}
+const WIN_ENV = { SystemRoot: 'C:\\Windows' } as NodeJS.ProcessEnv;
+
+test('win32: schtasks /Run /TN agent-ledger — absolute path, constant argv, no shell, hidden window', async (t) => {
+  const dir = await tmp(t);
+  const h = winHarness(dir, { writeMarker: async () => undefined });
+  const res = await triggerSelfHeal({ ledgerDir: dir, env: WIN_ENV, mode: 'fast', deps: h.deps });
+  assert.deepEqual([res.attempted, res.reason], [true, 'schtasks-run']);
+  assert.equal(h.spawned.length, 1);
+  assert.equal(h.spawned[0]?.cmd, 'C:\\Windows\\System32\\schtasks.exe');
+  assert.deepEqual(h.spawned[0]?.args, ['/Run', '/TN', 'agent-ledger']);
+  assert.deepEqual(h.spawned[0]?.opts, { stdio: 'ignore', detached: true, shell: false, windowsHide: true });
+});
+
+test('win32: same rate limit as launchd — marker is written BEFORE the spawn, a second call within 30 s does nothing', async (t) => {
+  const dir = await tmp(t);
+  const order: string[] = [];
+  let now = 7_000_000;
+  const h = winHarness(dir, {
+    now: () => now,
+    readText: async () => '7000000\n',
+    writeMarker: async () => {
+      order.push('marker');
+    },
+    spawnDetached: () => {
+      order.push('spawn');
+      return { unref: () => undefined };
+    },
+  });
+  now = 7_000_000 + SELFHEAL_MIN_INTERVAL_MS - 1;
+  const limited = await triggerSelfHeal({ ledgerDir: dir, env: WIN_ENV, deps: h.deps });
+  assert.deepEqual([limited.attempted, limited.reason], [false, 'rate-limited']);
+  assert.deepEqual(order, []);
+  now = 7_000_000 + SELFHEAL_MIN_INTERVAL_MS + 1;
+  const go = await triggerSelfHeal({ ledgerDir: dir, env: WIN_ENV, deps: h.deps });
+  assert.equal(go.attempted, true);
+  assert.deepEqual(order, ['marker', 'spawn']);
+});
+
+test('win32: a failed marker write means NO spawn, and the detail says what to fix', async (t) => {
+  const dir = await tmp(t);
+  const h = winHarness(dir, {
+    writeMarker: async () => {
+      throw Object.assign(new Error('EPERM'), { code: 'EPERM' });
+    },
+  });
+  const res = await triggerSelfHeal({ ledgerDir: dir, env: WIN_ENV, deps: h.deps });
+  assert.deepEqual([res.attempted, res.reason], [false, 'error']);
+  assert.equal(h.spawned.length, 0);
+  assert.match(res.detail ?? '', /permission denied on .*\.hub: your account needs write access .*do not run agent-ledger elevated.*icacls/);
+});
+
+test('win32: LEDGER_SELFHEAL=0, malformed SystemRoot and a missing schtasks.exe never spawn', async (t) => {
+  const dir = await tmp(t);
+  const off = winHarness(dir, { writeMarker: async () => undefined });
+  const a = await triggerSelfHeal({ ledgerDir: dir, env: { ...WIN_ENV, LEDGER_SELFHEAL: '0' }, deps: off.deps });
+  assert.equal(a.reason, 'disabled');
+  const bad = winHarness(dir, { writeMarker: async () => undefined });
+  for (const root of [undefined, '..\\evil', 'C:\\a\\b', '\\\\host\\share', 'C:\\Win"dows']) {
+    const r = await triggerSelfHeal({ ledgerDir: dir, env: root === undefined ? {} : { SystemRoot: root }, deps: bad.deps });
+    assert.deepEqual([r.attempted, r.reason], [false, 'error'], String(root));
+    assert.match(r.detail ?? '', /SystemRoot is missing or malformed/);
+  }
+  const gone = winHarness(dir, { writeMarker: async () => undefined, fileExists: async () => false });
+  const g = await triggerSelfHeal({ ledgerDir: dir, env: WIN_ENV, deps: gone.deps });
+  assert.match(g.detail ?? '', /schtasks\.exe not found/);
+  assert.equal(off.spawned.length + bad.spawned.length + gone.spawned.length, 0);
+  assert.throws(() => schtasksPath({}));
+});
+
+test('marker errors: EACCES/EPERM/refusals name the fix on every platform', () => {
+  const eacces = Object.assign(new Error('x'), { code: 'EACCES' });
+  assert.match(markerFixHint(eacces, '/home/a/.ledger/.hub/selfheal.at', 'linux'), /chown -R "\$USER" "\/home\/a\/\.ledger\/\.hub" && chmod 700/);
+  assert.match(markerFixHint(eacces, 'C:\\L\\.hub\\selfheal.at', 'win32'), /icacls "C:\\L\\\.hub"/);
+  assert.match(markerFixHint(new TrustError('PERMS', 'dir is writable by group/other — run `chmod 700`'), '/m', 'darwin'), /^\/m: dir is writable by group\/other — run `chmod 700`$/);
+  assert.match(markerFixHint(Object.assign(new Error('x'), { code: 'EROFS' }), '/ro/.hub/m', 'linux'), /read-only filesystem/);
+  assert.match(markerFixHint(new Error('x'), '/m', 'linux'), /cannot write \/m \(error\)/);
+});
+
+test('darwin still needs a uid: unknown uid → no-uid, nothing spawned (fail-closed)', async (t) => {
+  const dir = await tmp(t);
+  const h = harness(dir, { getuid: () => undefined, writeMarker: async () => undefined });
+  const res = await triggerSelfHeal({ ledgerDir: dir, env: {}, deps: h.deps });
+  assert.deepEqual([res.attempted, res.reason], [false, 'no-uid']);
+  assert.equal(h.calls.length, 0);
 });

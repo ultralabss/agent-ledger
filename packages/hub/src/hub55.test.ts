@@ -293,7 +293,11 @@ test('healthz diag is authenticated-only; the public answer stays {ok}', async (
   t.after(fx.cleanup);
 
   const anon = await fetch(`${fx.url}/v1/healthz`);
-  assert.deepEqual(Object.keys((await anon.json()) as object), ['ok'], 'S7: no detail without a token');
+  assert.deepEqual(
+    Object.keys((await anon.json()) as object),
+    ['ok', 'platform', 'ledger_id'],
+    'S7: no detail without a token (identity fingerprint only, T12)',
+  );
 
   const authed = await fx.api('GET', '/v1/healthz');
   const diag = authed.json.diag as Record<string, unknown>;

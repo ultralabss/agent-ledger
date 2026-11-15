@@ -18,8 +18,8 @@
  */
 
 import { appendFile, readFile, realpath, stat } from 'node:fs/promises';
-import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
+import { defaultLedgerDir, expandHome } from '../../shared/src/paths.ts';
 import { isReadOnlyBash } from './hook-bash.ts';
 import { inboxState, type InboxState } from './hook-inbox.ts';
 
@@ -60,9 +60,15 @@ export function shellQuote(value: string): string {
 
 function ledgerDir(env: NodeJS.ProcessEnv): string {
   const raw = env.LEDGER_DIR?.trim();
-  if (!raw || raw === '') return join(homedir(), '.ledger');
-  if (raw === '~') return homedir();
-  if (raw.startsWith('~/')) return join(homedir(), raw.slice(2));
+  if (!raw || raw === '') return defaultLedgerDir();
+  // Hook never throws: an unexpandable `~user` stays literal, as before.
+  if (raw.startsWith('~')) {
+    try {
+      return expandHome(raw);
+    } catch {
+      return raw;
+    }
+  }
   return raw;
 }
 

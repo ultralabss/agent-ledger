@@ -35,15 +35,14 @@ import {
   open as openFile,
   readFile,
   readdir,
-  rename,
-  rm,
   stat,
 } from 'node:fs/promises';
 import { createReadStream } from 'node:fs';
 import { createInterface } from 'node:readline';
 import { createHmac, randomBytes, timingSafeEqual } from 'node:crypto';
-import { homedir } from 'node:os';
-import { dirname, isAbsolute, join, resolve } from 'node:path';
+import { dirname, join } from 'node:path';
+import { renameRetry, rmRetry } from './fsretry.ts';
+import { spoolDir } from './paths.ts';
 import {
   assertPrivateDir,
   ensurePrivateDir,
@@ -85,13 +84,7 @@ export interface SpoolContext {
   session: string | null;
 }
 
-/** `~` expansion. Duplicated from the CLI on purpose: `shared` must not depend
- *  on the CLI package, and this is four lines. */
-function expandHome(p: string): string {
-  if (p === '~') return homedir();
-  if (p.startsWith('~/')) return resolve(homedir(), p.slice(2));
-  return isAbsolute(p) ? p : resolve(p);
-}
+export { spoolDir };
 
 export interface SpoolRecord {
   /** 128-bit random, hex. Doubles as the `Idempotency-Key` header. */
@@ -199,19 +192,6 @@ function hmacMatches(expected: string, actual: string): boolean {
   const a = Buffer.from(expected, 'hex');
   const b = Buffer.from(actual, 'hex');
   return a.length === b.length && timingSafeEqual(a, b);
-}
-
-/**
- * Spool directory: `LEDGER_SPOOL_DIR` if set, else
- * `$XDG_STATE_HOME/agent-ledger/spool` (absolute `XDG_STATE_HOME` only, as the
- * XDG spec requires), else `~/.local/state/agent-ledger/spool`.
- */
-export function spoolDir(env: NodeJS.ProcessEnv = process.env): string {
-  const raw = env.LEDGER_SPOOL_DIR?.trim();
-  if (raw && raw !== '') return expandHome(raw);
-  const xdg = env.XDG_STATE_HOME?.trim();
-  const stateHome = xdg && isAbsolute(xdg) ? xdg : resolve(homedir(), '.local', 'state');
-  return join(stateHome, 'agent-ledger', 'spool');
 }
 
 /**
@@ -382,14 +362,14 @@ async function writePrivateAtomic(file: string, text: string): Promise<void> {
     await handle.sync();
   } catch (err) {
     await handle.close().catch(() => undefined);
-    await rm(tmp, { force: true }).catch(() => undefined);
+    await rmRetry(tmp, { force: true }).catch(() => undefined);
     throw err;
   }
   await handle.close();
   try {
-    await rename(tmp, file);
+    await renameRetry(tmp, file);
   } catch (err) {
-    await rm(tmp, { force: true }).catch(() => undefined);
+    await rmRetry(tmp, { force: true }).catch(() => undefined);
     throw err;
   }
 }
@@ -479,7 +459,7 @@ async function quarantineOversizedFile(dir: string, file: string): Promise<void>
     return;
   }
   const base = file.split(/[/\\]/).pop() ?? 'spool.jsonl';
-  await rename(file, join(failedDir, `oversized-${Date.now()}-${base}`)).catch(() => undefined);
+  await renameRetry(file, join(failedDir, `oversized-${Date.now()}-${base}`)).catch(() => undefined);
 }
 
 /** Records in replay order: by timestamp, so cross-session order is causal. */
@@ -631,7 +611,7 @@ export async function replaySpool(
     // Rewrite the spool files with only what is still pending. Done last so a
     // crash mid-replay leaves records queued (at-least-once) rather than lost.
     if (done.size > 0) await pruneSpool(dir, done);
-    await rm(lock, { force: true }).catch(() => undefined);
+    await rmRetry(lock, { force: true }).catch(() => undefined);
   }
 }
 
@@ -695,20 +675,74 @@ function isHubDown(err: unknown): boolean {
   return e?.hubDown === true || e?.exitCode === 3;
 }
 
-async function takeLock(lock: string): Promise<boolean> {
+/** Injectable seams so the lock logic is testable without a real filesystem. */
+export interface TakeLockDeps {
+  open?: (lock: string) => Promise<{ writeFile: (d: string) => Promise<void>; close: () => Promise<void> }>;
+  stat?: (lock: string) => Promise<{ mtimeMs: number } | null>;
+  readFile?: (lock: string) => Promise<string | null>;
+  rm?: (lock: string) => Promise<void>;
+  /** `process.kill(pid, 0)` shape: returns normally if the pid exists, throws an errno otherwise. */
+  kill?: (pid: number) => void;
+  now?: () => number;
+}
+
+const LOCK_MAX_ATTEMPTS = 3;
+
+/** Dead only on ESRCH. EPERM (exists, not ours) and any unknown error count as alive: never steal on doubt. */
+function pidIsDead(pid: number, kill: (pid: number) => void): boolean {
   try {
-    const handle = await openFile(lock, 'wx', 0o600);
-    await handle.writeFile(String(process.pid), 'utf8');
-    await handle.close();
-    return true;
-  } catch {
-    const st = await stat(lock).catch(() => null);
-    if (st !== null && Date.now() - st.mtimeMs > LOCK_STALE_MS) {
-      await rm(lock, { force: true }).catch(() => undefined);
-      return takeLock(lock);
-    }
+    kill(pid);
     return false;
+  } catch (err) {
+    return (err as NodeJS.ErrnoException)?.code === 'ESRCH';
   }
+}
+
+/**
+ * Take the replay lock. At most {@link LOCK_MAX_ATTEMPTS} attempts, no recursion. An existing lock
+ * is stolen only when it is stale (mtime older than {@link LOCK_STALE_MS}) AND its owner pid is
+ * provably dead; a lock with a live pid is never stolen, however old. If removing the stale lock
+ * fails (EPERM/EBUSY on Windows) we give up (`false`) rather than loop.
+ */
+export async function takeLock(lock: string, deps: TakeLockDeps = {}): Promise<boolean> {
+  const open =
+    deps.open ??
+    (async (l: string) => {
+      const h = await openFile(l, 'wx', 0o600);
+      return { writeFile: (d: string) => h.writeFile(d, 'utf8'), close: () => h.close() };
+    });
+  const statLock = deps.stat ?? ((l: string) => stat(l).catch(() => null));
+  const readLock = deps.readFile ?? ((l: string) => readFile(l, 'utf8').catch(() => null));
+  const removeLock = deps.rm ?? ((l: string) => rmRetry(l, { force: true }));
+  const kill = deps.kill ?? ((pid: number) => void process.kill(pid, 0));
+  const now = deps.now ?? Date.now;
+
+  for (let attempt = 0; attempt < LOCK_MAX_ATTEMPTS; attempt += 1) {
+    try {
+      const handle = await open(lock);
+      try {
+        await handle.writeFile(String(process.pid));
+      } finally {
+        await handle.close();
+      }
+      return true;
+    } catch {
+      const st = await statLock(lock);
+      // Lock vanished between open and stat: just try again. Fresh lock: someone else holds it.
+      if (st === null) continue;
+      if (Math.abs(now() - st.mtimeMs) <= LOCK_STALE_MS) return false;
+      const text = await readLock(lock);
+      const pid = text === null ? Number.NaN : Number.parseInt(text.trim(), 10);
+      // A stale lock without a readable pid (crash between create and write) has no live owner.
+      if (Number.isInteger(pid) && pid > 0 && !pidIsDead(pid, kill)) return false;
+      try {
+        await removeLock(lock);
+      } catch {
+        return false;
+      }
+    }
+  }
+  return false;
 }
 
 async function pruneSpool(dir: string, done: Set<string>): Promise<void> {
@@ -716,7 +750,7 @@ async function pruneSpool(dir: string, done: Set<string>): Promise<void> {
     const text = await readFile(file, 'utf8').catch(() => null);
     if (text === null) continue;
     const keep: string[] = [];
-    for (const line of text.split('\n')) {
+    for (const line of text.split(/\r?\n/)) {
       if (line.trim() === '') continue;
       try {
         const rec = JSON.parse(line) as SpoolRecord;
@@ -726,7 +760,7 @@ async function pruneSpool(dir: string, done: Set<string>): Promise<void> {
       }
     }
     if (keep.length === 0) {
-      await rm(file, { force: true }).catch(() => undefined);
+      await rmRetry(file, { force: true }).catch(() => undefined);
       continue;
     }
     // tmp + rename: a reader never sees a half-rewritten spool file.
@@ -809,7 +843,7 @@ function validateFailedFileName(name: string): string {
 
 async function rewriteFailedFile(file: string, keep: FailedSpoolRecord[]): Promise<void> {
   if (keep.length === 0) {
-    await rm(file, { force: true }).catch(() => undefined);
+    await rmRetry(file, { force: true }).catch(() => undefined);
     return;
   }
   await writePrivateAtomic(file, `${keep.map((r) => JSON.stringify(r)).join('\n')}\n`);

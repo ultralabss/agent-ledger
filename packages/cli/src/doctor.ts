@@ -9,7 +9,10 @@
  *
  * Every probe produces a `Check` ({id, status ok|warn|fail|info, detail}); the
  * human output prints the `detail` lines, `--json` prints the same checks plus
- * a summary. A `fail` is a problem and drives exit 1; `warn` and `info` never do.
+ * a summary. A `fail` is a problem and drives exit 1; `warn` and `info` never do,
+ * with one exception: a path running on a weak filesystem only because
+ * `LEDGER_ALLOW_WEAK_FS=1` is a loud WARN block FIRST in the output and exit 2
+ * (when nothing is down — a real problem keeps exit 1).
  *
  * Read-only by default: no `launchctl` verb other than `print`, no writes, no
  * self-heal. `--fix` is the one exception and it still goes through the normal
@@ -19,12 +22,21 @@
 import { access, constants, open, readFile, stat } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { delimiter, join } from 'node:path';
-import { spoolStats } from '@agent-ledger/shared';
+import {
+  TrustError,
+  createTrustDeps,
+  detectMachinePlatform,
+  probeFs,
+  spoolDir,
+  spoolStats,
+  type FsCaps,
+} from '@agent-ledger/shared';
 import { bool, type Args } from './args.ts';
 import type { CliEnvConfig } from './client.ts';
 import { formatCheck, remoteCheck, type Check, type CheckStatus } from './doctor-checks.ts';
 import { linuxChecks } from './doctor-linux.ts';
-import { hubServesLedger } from './identity.ts';
+import { win32Checks, wslChecks } from './doctor-win32.ts';
+import { hubIdentityVerdict, hubServesLedger, type IdentityVerdict } from './identity.ts';
 import {
   HUB_LABEL,
   guiTarget,
@@ -77,6 +89,109 @@ export interface DoctorDeps {
   /** Existence probe for the systemctl/loginctl binaries. */
   exists?: (path: string) => Promise<boolean>;
   fetchFn?: typeof fetch;
+  /** Filesystem capability probe (default platformTrust `probeFs`). */
+  probe?: typeof probeFs;
+  /** Directory whose filesystem is probed as "the current checkout" (default `process.cwd()`). */
+  cwd?: string;
+  /** Force WSL on/off (default: detected). */
+  wsl?: boolean;
+  /** Entries of `/mnt/c/Users` for the WSL dual-ledger check (default: read the directory). */
+  listWinUsers?: () => Promise<string[]>;
+}
+
+const WEAK_FS_FIX =
+  'move it to a local filesystem (NTFS, ext4, APFS) and unset LEDGER_ALLOW_WEAK_FS';
+
+/** One probe target of the FS section. */
+interface FsTarget {
+  id: string;
+  label: string;
+  dir: string;
+}
+
+/**
+ * FS section: weak filesystems (bypass active => WARN block, no bypass => the hub refuses there =>
+ * fail), permission errors with the fix, never anything for a missing directory beyond an info
+ * line. `weak` is true when ANY path runs on the bypass (drives exit 2).
+ */
+export async function fsChecks(
+  targets: readonly FsTarget[],
+  probe: typeof probeFs,
+): Promise<{ checks: Check[]; problems: string[]; weak: boolean }> {
+  const warn: Check[] = [];
+  const rest: Check[] = [];
+  /** Healthy / not-yet-existing targets share ONE line (the doctor output has a line budget). */
+  const fine: string[] = [];
+  const problems: string[] = [];
+  let weak = false;
+  for (const t of targets) {
+    let caps: FsCaps;
+    try {
+      caps = await probe(t.dir);
+    } catch (err) {
+      const code = (err as { code?: unknown } | null)?.code;
+      if (code === 'ENOENT' || code === 'ENOTDIR') {
+        fine.push(`${t.id} absent`);
+      } else if (code === 'EACCES' || code === 'EPERM') {
+        rest.push({
+          id: `fs_${t.id}`,
+          status: 'warn',
+          detail: `fs ${t.id}: permission denied probing ${t.label} — your account must own and be able to write it (POSIX: chown -R "$USER" <dir> && chmod 700 <dir>; Windows: fix the folder ACL, do not run elevated)`,
+        });
+      } else if (err instanceof TrustError) {
+        rest.push({ id: `fs_${t.id}`, status: 'fail', detail: `fs ${t.id}: ${err.message}` });
+        problems.push(`${t.id} ${t.label} failed the trust check (${err.code})`);
+      } else {
+        rest.push({ id: `fs_${t.id}`, status: 'info', detail: `fs ${t.id}: not probed (${code === undefined ? 'error' : String(code)})` });
+      }
+      continue;
+    }
+    const why = caps.reasons.length > 0 ? caps.reasons.join(', ') : 'capabilities missing';
+    if (caps.weak && caps.bypassed) {
+      weak = true;
+      warn.push({
+        id: `fs_${t.id}`,
+        status: 'warn',
+        detail: `WARNING: weak filesystem ${t.label} (${caps.fsType}: ${why}) — LEDGER_ALLOW_WEAK_FS=1 is set, so private-permission checks are OFF there; ${WEAK_FS_FIX}`,
+      });
+    } else if (caps.weak) {
+      rest.push({
+        id: `fs_${t.id}`,
+        status: 'fail',
+        detail: `fs ${t.id}: ${t.label} is on ${caps.fsType} which cannot enforce private permissions (${why}); the hub refuses to run there — ${WEAK_FS_FIX.replace('and unset LEDGER_ALLOW_WEAK_FS', 'or, accepting the risk, set LEDGER_ALLOW_WEAK_FS=1')}`,
+      });
+      problems.push(`${t.id} ${t.label} is on a filesystem without private permissions`);
+    } else {
+      fine.push(`${t.id} ${caps.fsType}`);
+    }
+  }
+  const line: Check[] =
+    fine.length > 0 ? [{ id: 'fs', status: 'ok', detail: `fs: ${fine.join(' · ')}` }] : [];
+  // The bypass block goes first; then the line for healthy targets, then everything else.
+  return { checks: [...warn, ...line, ...rest], problems, weak };
+}
+
+type IdentityProbe = { state: 'unreachable' } | { state: 'answered'; verdict: IdentityVerdict };
+
+/** Unauthenticated healthz, no token: who holds the port? (T12 — decided BEFORE the token is sent.) */
+async function probeIdentity(baseUrl: string, ledgerDir: string): Promise<IdentityProbe> {
+  try {
+    const res = await fetch(`${baseUrl}/v1/healthz`, {
+      redirect: 'manual',
+      signal: AbortSignal.timeout(HEALTHZ_TIMEOUT_MS),
+    });
+    let body: unknown = null;
+    if (res.ok) {
+      try {
+        body = JSON.parse((await res.text()).slice(0, 64 * 1024));
+      } catch {
+        body = null;
+      }
+    }
+    return { state: 'answered', verdict: hubIdentityVerdict(body, ledgerDir) };
+  } catch {
+    return { state: 'unreachable' };
+  }
 }
 
 /** First executable `name` found in `pathVar`, or `null`. No process is spawned. */
@@ -104,11 +219,24 @@ export async function cmdDoctor(
   const problems: string[] = [];
   let suggestion = 'ledger doctor --fix';
   const platform = deps.platform ?? process.platform;
-  const uid = deps.uid ?? process.getuid?.();
+  const uid = deps.uid ?? createTrustDeps().getuid();
   const capture = deps.capture ?? runCapture;
   const add = (id: string, status: CheckStatus, detail: string): void => {
     checks.push({ id, status, detail });
   };
+
+  /* ---- filesystem (weak/bypass WARN block goes first) ---- */
+  const fsTargets: FsTarget[] = [];
+  const hubDir = join(cfg.ledgerDir, '.hub');
+  // `.hub` is the private, git-ignored part of the ledger: the probe file never reaches the repo.
+  if (await exists(hubDir)) fsTargets.push({ id: 'ledger', label: cfg.ledgerDir, dir: hubDir });
+  else fsTargets.push({ id: 'ledger', label: cfg.ledgerDir, dir: cfg.ledgerDir });
+  const spool = spoolDir(io.env);
+  fsTargets.push({ id: 'spool', label: spool, dir: spool });
+  fsTargets.push({ id: 'checkout', label: deps.cwd ?? process.cwd(), dir: deps.cwd ?? process.cwd() });
+  const fsr = await fsChecks(fsTargets, deps.probe ?? probeFs);
+  checks.push(...fsr.checks);
+  problems.push(...fsr.problems);
 
   if (bool(args, 'fix')) {
     const res = await triggerSelfHeal({
@@ -130,6 +258,24 @@ export async function cmdDoctor(
     checks.push(...linux.checks);
     problems.push(...linux.problems);
     if (linux.suggestion !== null) suggestion = linux.suggestion;
+    const isWsl = deps.wsl ?? detectMachinePlatform() === 'wsl';
+    if (isWsl) {
+      const wsl = await wslChecks({
+        env: io.env,
+        ledgerDir: cfg.ledgerDir,
+        spoolDir: spool,
+        exists: deps.exists ?? exists,
+        ...(deps.listWinUsers === undefined ? {} : { listUsers: deps.listWinUsers }),
+      });
+      checks.push(...wsl.checks);
+      problems.push(...wsl.problems);
+      if (wsl.suggestion !== null) suggestion = wsl.suggestion;
+    }
+  } else if (platform === 'win32') {
+    const win = await win32Checks({ capture, env: io.env, exists: deps.exists ?? exists });
+    checks.push(...win.checks);
+    problems.push(...win.problems);
+    if (win.suggestion !== null) suggestion = win.suggestion;
   } else if (platform !== 'darwin' || typeof uid !== 'number') {
     add('service', 'info', `service: no supervisor probe on ${platform}`);
   } else {
@@ -204,7 +350,11 @@ export async function cmdDoctor(
   }
 
   /* ---- healthz ---- */
-  const token = await readToken(cfg.ledgerDir);
+  // T12: the token is read and sent only to a hub that proved it is THIS machine's hub for THIS
+  // ledger (platform + ledger_id from the unauthenticated healthz). Anything else gets no token.
+  const ident = await probeIdentity(cfg.baseUrl, cfg.ledgerDir);
+  const verified = ident.state === 'answered' && ident.verdict.ok;
+  const token = verified ? await readToken(cfg.ledgerDir) : null;
   const samples: (number | null)[] = [];
   let diag: HubDiag | null = null;
   let reportedLedger: unknown;
@@ -231,7 +381,22 @@ export async function cmdDoctor(
   /* ---- identity: does the process on the port serve THIS ledger? ---- */
   // `ledger` is reported only to a caller with the right token, so a missing
   // value means an older hub or a hub of another ledger that rejected our token.
-  if (ok > 0) {
+  if (ok > 0 && ident.state === 'answered' && !ident.verdict.ok) {
+    if (ident.verdict.unidentified) {
+      add(
+        'identity',
+        'warn',
+        'identity: healthz did not name its platform/ledger — token not sent (older hub: restart it; or another service holds the port)',
+      );
+    } else {
+      add(
+        'identity',
+        'fail',
+        `identity: the hub on this port serves another ledger or platform (${ident.verdict.detail}) — token not sent`,
+      );
+      problems.push(`another hub owns ${cfg.baseUrl} (LEDGER_DIR / LEDGER_HUB_PORT mismatch, WSL vs Windows?)`);
+    }
+  } else if (ok > 0) {
     if (await hubServesLedger(reportedLedger, cfg.ledgerDir)) {
       add('identity', 'ok', 'identity: hub serves this ledger');
     } else if (typeof reportedLedger === 'string' && reportedLedger !== '') {
@@ -306,7 +471,8 @@ export async function cmdDoctor(
   const room = Math.max(0, MAX_LINES - 1 - checks.length);
   for (const line of errs.slice(0, room)) add('log', 'warn', `log: ${line}`);
 
-  const exit = problems.length === 0 ? 0 : 1;
+  // 1 = something is wrong; 2 = nothing is down but a path runs on the weak-FS bypass.
+  const exit = problems.length > 0 ? 1 : fsr.weak ? 2 : 0;
   if (bool(args, 'json')) {
     const count = (s: CheckStatus): number => checks.filter((c) => c.status === s).length;
     io.out(
@@ -317,9 +483,10 @@ export async function cmdDoctor(
         summary: {
           ok: exit === 0,
           exit,
+          weak_fs: fsr.weak,
           counts: { ok: count('ok'), warn: count('warn'), fail: count('fail'), info: count('info') },
           problems,
-          suggestion: exit === 0 ? null : suggestion,
+          suggestion: exit === 0 ? null : exit === 2 ? WEAK_FS_FIX : suggestion,
         },
       }),
     );
@@ -329,6 +496,10 @@ export async function cmdDoctor(
   if (exit === 0) {
     io.out('OK');
     return 0;
+  }
+  if (exit === 2) {
+    io.out(`WEAK-FS BYPASS ACTIVE → ${WEAK_FS_FIX}`);
+    return 2;
   }
   io.out(`DOWN: ${problems.slice(0, 3).join('; ')} → ${suggestion}`);
   return 1;

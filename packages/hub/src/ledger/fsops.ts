@@ -1,7 +1,7 @@
 import { randomBytes } from 'node:crypto';
-import { appendFile, chmod, mkdir, readFile, rename, writeFile } from 'node:fs/promises';
+import { appendFile, chmod, mkdir, readFile, writeFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
-import { sanitizeLine } from '@agent-ledger/shared';
+import { renameRetry, sanitizeLine } from '@agent-ledger/shared';
 
 export async function ensureDir(path: string, mode = 0o700): Promise<void> {
   await mkdir(path, { recursive: true, mode });
@@ -13,7 +13,7 @@ export async function writeAtomic(path: string, data: string, mode = 0o600): Pro
   await ensureDir(dir);
   const tmp = join(dir, `.${randomBytes(6).toString('hex')}.tmp`);
   await writeFile(tmp, data, { encoding: 'utf8', mode });
-  await rename(tmp, path);
+  await renameRetry(tmp, path);
 }
 
 /**

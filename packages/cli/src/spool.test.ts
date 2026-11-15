@@ -15,7 +15,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
 import { startTestHub } from '@agent-ledger/hub/test-helpers';
-import { computeSpoolHmac } from '@agent-ledger/shared';
+import { computeSpoolHmac, hubIdentity } from '@agent-ledger/shared';
 import type { CliEnvConfig } from './client.ts';
 import { SpoolingClient } from './index.ts';
 
@@ -328,6 +328,12 @@ test('a write that merely timed out is spooled with the SAME Idempotency-Key the
   const seenKeys: (string | undefined)[] = [];
   let hits = 0;
   const server = createServer((req, res) => {
+    // T12: the identity probe (unauthenticated healthz) precedes every authenticated request.
+    if (req.url === '/v1/healthz') {
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ ok: true, ...hubIdentity(fx.dir) }));
+      return;
+    }
     hits += 1;
     const n = hits;
     seenKeys.push(req.headers['idempotency-key'] as string | undefined);

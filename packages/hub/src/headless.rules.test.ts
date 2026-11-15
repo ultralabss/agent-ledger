@@ -12,7 +12,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { buildHeadlessArgs, CLAUDE_HOME_READ_DENYLIST, SHELL_ESCAPE_DENYLIST } from './headless.ts';
-import { buildWorkerArgs } from './replies.ts';
+import { buildWorkerArgs, workerCommitCommand } from './replies.ts';
 
 /* ---------------- rule matcher ---------------- */
 
@@ -110,7 +110,9 @@ function decide(rules: Split, tool: string, arg: string): 'allow' | 'deny' | 'as
 
 /* ---------------- fixtures ---------------- */
 
-const worker = split(buildWorkerArgs('/home/user/repo'));
+const HOOKS = '/home/user/.ledger/.hub/empty-hooks';
+const COMMIT = workerCommitCommand(HOOKS) as string;
+const worker = split(buildWorkerArgs('/home/user/repo', HOOKS));
 const triage = split(buildHeadlessArgs('/home/user/.ledger', 'p', 's'));
 
 /* ---------------- matcher sanity ---------------- */
@@ -179,10 +181,10 @@ test('`~/.ssh/config` is denied, not just nested ssh paths', () => {
 
 test('the worker keeps the capabilities it is supposed to have', () => {
   // A deny rule that also kills the legitimate path is a broken sandbox, not a
-  // strict one. `git -c core.hooksPath=/dev/null commit` is the worker's
+  // strict one. `git -c core.hooksPath=<empty-hooks> commit --no-verify` is the worker's
   // sanctioned commit form and must survive SHELL_ESCAPE_DENYLIST.
   assert.equal(
-    decide(worker, 'Bash', 'git -c core.hooksPath=/dev/null commit -m "x"'),
+    decide(worker, 'Bash', `${COMMIT} -m "x"`),
     'allow',
   );
   assert.equal(decide(worker, 'Bash', 'git status --short'), 'allow');
@@ -192,11 +194,11 @@ test('the worker keeps the capabilities it is supposed to have', () => {
 
 test('H23-1: commit -F/--file/--gpg-sign/-S/--template are denied, precondition matched', () => {
   const attacks = [
-    'git -c core.hooksPath=/dev/null commit -F ~/.ssh/id_ed25519',
-    'git -c core.hooksPath=/dev/null commit --file=~/.ssh/id_ed25519',
-    'git -c core.hooksPath=/dev/null commit -m "x" --gpg-sign=evil',
-    'git -c core.hooksPath=/dev/null commit -S -m "x"',
-    'git -c core.hooksPath=/dev/null commit --template=~/.ssh/id_ed25519 -m "x"',
+    `${COMMIT} -F ~/.ssh/id_ed25519`,
+    `${COMMIT} --file=~/.ssh/id_ed25519`,
+    `${COMMIT} -m "x" --gpg-sign=evil`,
+    `${COMMIT} -S -m "x"`,
+    `${COMMIT} --template=~/.ssh/id_ed25519 -m "x"`,
   ];
   for (const cmd of attacks) {
     // Precondition: the narrowed `-m *` allow rule no longer even matches a
@@ -259,7 +261,7 @@ test('triage and worker share one denylist, no drift', () => {
 });
 
 test('AL-1: worker git allowlist is exact read-only forms; --output/--no-index/ext-diff denied', () => {
-  const args = buildWorkerArgs('/home/user/repo');
+  const args = buildWorkerArgs('/home/user/repo', HOOKS);
   const allowed = args.slice(args.indexOf('--allowedTools') + 1, args.indexOf('--disallowedTools'));
   for (const wide of ['Bash(git diff*)', 'Bash(git log*)', 'Bash(git show*)', 'Read']) {
     assert.ok(!allowed.includes(wide), `allowlist still contains ${wide}`);

@@ -12,6 +12,7 @@ import { mkdir, mkdtemp, rm, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
+import { hubIdentity } from '@agent-ledger/shared';
 import { skipOnWin32 } from '@agent-ledger/shared/testing';
 import { git } from '../git.ts';
 import { makeCommittedRepo, startTestHub, type HubFixture } from '../test-helpers.ts';
@@ -669,9 +670,9 @@ test('kill switch: `ledger guard off` lets everything through and shows in healt
   assert.match(onDemand.text, /Guard: OFF/, '`ledger brief` too');
   assert.ok(fx.hub.ledger.listJournal('ops').some((e) => e.type === 'guard'), 'the change goes to the journal');
 
-  // Unauthenticated healthz must not reveal anything except `ok`.
+  // Unauthenticated healthz reveals nothing but `ok` and the identity fingerprint (T12), no guard state.
   const anon = await fetch(`${fx.url}/v1/healthz`, { headers: { host: `127.0.0.1:${fx.hub.port}` } });
-  assert.deepEqual(await anon.json(), { ok: true });
+  assert.deepEqual(await anon.json(), { ok: true, ...hubIdentity(fx.dir) });
 
   const on = await fx.api('POST', '/v1/guard', { state: 'on' });
   assert.equal(on.json.guard.state, 'on');

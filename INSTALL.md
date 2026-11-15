@@ -17,7 +17,8 @@ pnpm --version
 ```
 
 If one is missing or too old, stop and tell the user what to install (Node:
-https://nodejs.org, pnpm: `corepack enable`). Supported: macOS and Linux.
+https://nodejs.org, pnpm: `corepack enable`). Supported: macOS, Linux, native Windows and WSL2
+(see the support matrix in `README.md`; Windows and WSL2 are not verified on real machines).
 
 ## 2. Run the installer
 
@@ -44,6 +45,47 @@ systemd user unit on Linux).
   writes outside `$HOME`, so it happens only with `./install.sh --allow-brew` (or an
   interactive yes). Do not pass `--allow-brew` unless the user agreed.
 - `~/.local/bin` must be in `PATH` (the installer prints a note if it is not).
+
+### Native Windows
+
+Use PowerShell, **not elevated** (both scripts and the hub refuse to run as Administrator), and the
+same checkout:
+
+```powershell
+cd <repo-dir>
+powershell -ExecutionPolicy Bypass -File .\install.ps1
+```
+
+Options: `-LedgerDir <path>`, `-Port <n>`, `-NodePath <absolute node.exe>`, `-NoService`,
+`-SkipGitleaks`, `-AddToPath`. Same requirements as above (node >= 22.18, pnpm, Git for Windows in its
+standard location). What it does, all inside your profile:
+
+- the node half (`node packages/cli/src/bin.ts setup --platform-init`) verifies node.exe, creates the
+  private directories (ledger, `.hub`, `.hub\bin`, `%LOCALAPPDATA%\agent-ledger` and its `bin`) with an
+  ACL for you and SYSTEM only, writes `hub.env` (private, read by `node --env-file`) and the shims
+  `ledger.cmd`, `ledger.ps1` and `ledger` (Git Bash) into `%LOCALAPPDATA%\agent-ledger\bin`;
+- gitleaks: pinned digest check (`scripts/gitleaks-pins.mjs check-file windows_x64`), zip layout check,
+  extraction with `System32\tar.exe` into a fresh private directory, layout check, then a verified copy
+  with `.sha256` and `.origin` next to it in `<ledger>\.hub\bin`. On any failure nothing is installed
+  and the hub commits without the second check;
+- the shim directory goes on your user PATH **only after you answer yes** (or pass `-AddToPath`);
+- Task Scheduler task `agent-ledger`: at logon, as you, interactive, run level Limited, started with
+  `node.exe --env-file=<hub.env> <hub bin.ts>`. v1 limit: a console window flashes at logon.
+
+A path that fails `assertShimSafePath` (`%`, `!`, `"`, control characters, over 259 characters) aborts
+the install; it is refused, never escaped. Call `ledger status` from a new terminal or the full shim
+path. A native `claude.exe` is required for headless features; `claude.cmd` is refused.
+
+**Claude Code hooks on Windows.** `install-hooks.mjs` writes `"<node.exe>" "<bin.ts>" hook <event>`
+(forward slashes, node.exe and the script directly, never a `.cmd`). `hooks/auto-commit-nudge.sh` is
+still a bash script (it needs `bash`, `curl`, `sed`, `tr`, which Git Bash provides); wire it as
+`bash <path>/auto-commit-nudge.sh` by hand if you want it. A node rewrite is not done yet.
+
+**WSL2.** Use `./install.sh` inside the distro and keep the ledger on the distro's own filesystem
+(ext4), not under `/mnt/c`: DrvFs is refused. Do not run a second hub on the Windows side.
+
+**Weak filesystems.** exFAT, FAT, NFS, SMB and DrvFs are refused; `LEDGER_ALLOW_WEAK_FS=1` bypasses
+that with loud warnings (see `README.md`, Platform support). Do not set it on the user's behalf.
 
 ## 3. Verify the hub is THIS ledger's hub
 
@@ -139,6 +181,10 @@ whether gitleaks is active (`ledger status` prints a line when it is missing).
 ```sh
 cd <repo-dir> && ./uninstall.sh
 ```
+
+(Windows: `powershell -ExecutionPolicy Bypass -File .\uninstall.ps1`; it removes the task, the
+shims, `hub.env`, the PATH entry and the hooks, and keeps the ledger unless you pass `-Purge` and
+type `delete` to confirm.)
 
 Removes the service, the `ledger` shim and, when `node` is available, the Claude
 Code hook entries (the same as `node adapters/claude-code/install-hooks.mjs

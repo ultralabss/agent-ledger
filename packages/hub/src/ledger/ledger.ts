@@ -6,7 +6,7 @@
  */
 
 import { createHash } from 'node:crypto';
-import { mkdir, readdir, rename, stat } from 'node:fs/promises';
+import { mkdir, readdir, stat } from 'node:fs/promises';
 import { basename, join } from 'node:path';
 import { parse as parseYaml, stringify as stringifyYaml } from 'yaml';
 import {
@@ -49,7 +49,7 @@ import {
   type ReposFile,
   type Transition,
 } from '@agent-ledger/shared';
-import { day, isoLocal, month, shortSession, stamp } from '@agent-ledger/shared';
+import { day, isoLocal, month, renameRetry, shortSession, stamp } from '@agent-ledger/shared';
 import { expandHome, type HubConfig } from '../config.ts';
 import { conflict, invalid, notFound, LedgerError } from '../errors.ts';
 import { gitToplevel, LedgerGit } from '../git.ts';
@@ -393,7 +393,7 @@ export class Ledger {
         for (let i = 2; await stat(dest).then(() => true).catch(() => false); i += 1) {
           dest = join(archiveRoot, `${base}-${i}`);
         }
-        await rename(src, dest);
+        await renameRetry(src, dest);
         archived = dest;
       }
 

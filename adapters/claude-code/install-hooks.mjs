@@ -41,7 +41,9 @@ import { readFile, writeFile, rename, copyFile, mkdir, chmod, open, unlink, real
 import { homedir } from 'node:os';
 import { createInterface } from 'node:readline/promises';
 import { dirname, isAbsolute, join, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import {
+  HOOK_SPECS,
   backupName,
   diffText,
   installedCount,
@@ -59,9 +61,23 @@ function arg(name, fallback = null) {
 const has = (name) => process.argv.includes(`--${name}`);
 
 const settingsFile = resolve(arg('settings', join(homedir(), '.claude', 'settings.json')));
-// The shim `install.sh` creates. Overridable so a test (or a non-standard
-// SHIM_DIR) can point at its own.
-const ledgerPath = arg('ledger', join(homedir(), '.local', 'bin', 'ledger'));
+// What precedes ` hook <event>` in a hook command. POSIX: the shim `install.sh` creates (overridable
+// so a test or a non-standard SHIM_DIR can point at its own). win32: node.exe + bin.ts DIRECTLY —
+// never a `.cmd` shim (needs a shell; CVE-2024-27980 class) — resolved here from this very node and
+// checkout, with forward slashes so Git Bash and cmd both parse it. `--ledger` still wins everywhere.
+const CLI_BIN = fileURLToPath(new URL('../../packages/cli/src/bin.ts', import.meta.url));
+let ledgerPath = arg('ledger', null);
+let winSetup = null;
+if (process.platform === 'win32' && ledgerPath === null) {
+  winSetup = await import('../../packages/cli/src/setup.ts');
+  try {
+    ledgerPath = winSetup.winHookLauncher({ node: process.execPath, cliBin: CLI_BIN });
+  } catch (err) {
+    console.error(`install-hooks: ${err.message} — pass --ledger <launcher> or move the checkout/node to a plainer path`);
+    process.exit(1);
+  }
+}
+ledgerPath ??= join(homedir(), '.local', 'bin', 'ledger');
 const dryRun = has('dry-run');
 const uninstall = has('uninstall');
 const assumeYes = has('yes');
@@ -182,9 +198,20 @@ async function main() {
     }
   }
 
-  const { settings: after, changes } = uninstall
-    ? planUninstall(before, ledgerPath)
-    : planInstall(before, ledgerPath);
+  let plan;
+  if (uninstall && winSetup !== null) {
+    // node.exe may have moved since the install: also remove entries that point at THIS checkout's
+    // bin.ts through any other node path (other entries are never touched).
+    const launchers = new Set([ledgerPath, ...winSetup.findWinHookLaunchers(before, CLI_BIN, HOOK_SPECS.map((h) => h.arg))]);
+    plan = { settings: before, changes: [] };
+    for (const l of launchers) {
+      const step = planUninstall(plan.settings, l);
+      plan = { settings: step.settings, changes: [...plan.changes, ...step.changes] };
+    }
+  } else {
+    plan = uninstall ? planUninstall(before, ledgerPath) : planInstall(before, ledgerPath);
+  }
+  const { settings: after, changes } = plan;
 
   if (dryRun) {
     process.stdout.write(diffText(before, after));

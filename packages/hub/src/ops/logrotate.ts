@@ -8,7 +8,8 @@
  *  is not worth an fd handshake with launchd.
  */
 
-import { copyFile, lstat, rename, rm, truncate } from 'node:fs/promises';
+import { copyFile, lstat, truncate } from 'node:fs/promises';
+import { renameRetry, rmRetry } from '@agent-ledger/shared';
 
 export const HUB_LOG_MAX_BYTES = 5 * 1024 * 1024;
 export const HUB_LOG_KEEP = 3;
@@ -39,12 +40,12 @@ export async function rotateLog(
   if (st.size <= maxBytes) return { rotated: false, size: st.size, skippedSymlink: false };
 
   // hub.log.2 → hub.log.3, hub.log.1 → hub.log.2, drop what falls off the end.
-  await rm(`${path}.${keep}`, { force: true });
+  await rmRetry(`${path}.${keep}`, { force: true });
   for (let i = keep - 1; i >= 1; i -= 1) {
-    await rename(`${path}.${i}`, `${path}.${i + 1}`).catch(() => undefined);
+    await renameRetry(`${path}.${i}`, `${path}.${i + 1}`).catch(() => undefined);
   }
   // S-4: never copy through a planted symlink sitting at `hub.log.1`.
-  await rm(`${path}.1`, { force: true });
+  await rmRetry(`${path}.1`, { force: true });
   await copyFile(path, `${path}.1`);
   await truncate(path, 0);
   return { rotated: true, size: st.size, skippedSymlink: false };

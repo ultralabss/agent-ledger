@@ -225,8 +225,18 @@ export interface BriefResponse {
 
 export interface HealthzResponse {
   ok: boolean;
+  /** Also in the unauthenticated answer: lets a CLI refuse a hub of another machine flavour
+   *  (WSL vs Windows) before it sends the bearer token. */
+  platform?: 'win32' | 'linux' | 'wsl' | 'darwin' | 'other';
+  /** Also unauthenticated: sha256 fingerprint of platform + ledger realpath (never the path). */
+  ledger_id?: string;
   startedAt?: string;
   ledger?: string;
+  /** Authenticated: realpath of the ledger directory. */
+  ledger_real?: string;
+  /** Authenticated: paths running on a weak filesystem ONLY because `LEDGER_ALLOW_WEAK_FS=1`.
+   *  Empty unless that bypass is active. */
+  fs_weak?: string[];
   port?: number;
   repos?: number;
   items?: number;

@@ -6,7 +6,7 @@ import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
-import { TIDY_DATA_NOTICE, type ItemOrigin, type TidyEntry, type TidyResponse } from '@agent-ledger/shared';
+import { TIDY_DATA_NOTICE, hubIdentity, type ItemOrigin, type TidyEntry, type TidyResponse } from '@agent-ledger/shared';
 import { run, type Io } from './index.ts';
 import {
   formatOrigin,
@@ -257,7 +257,7 @@ async function stubHub(t: { after: (fn: () => unknown) => void }, body: unknown)
     req.on('end', () => {
       if (req.url === '/v1/healthz') {
         res.writeHead(200, { 'content-type': 'application/json' });
-        res.end('{"ok":true}');
+        res.end(JSON.stringify({ ok: true, ...hubIdentity(dir) }));
         return;
       }
       requests.push({ method: req.method ?? '', url: req.url ?? '', body: raw });

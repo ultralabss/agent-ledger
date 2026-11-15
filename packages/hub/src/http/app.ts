@@ -7,12 +7,14 @@
 
 import { stat } from 'node:fs/promises';
 import { createHash } from 'node:crypto';
+import { realpathSync } from 'node:fs';
 import { Hono, type Context } from 'hono';
 import { preToolUseDeny } from '../guard/output.ts';
 import { bodyLimit } from 'hono/body-limit';
 import { streamSSE } from 'hono/streaming';
 import type { TypeOf, ZodTypeAny } from 'zod';
 import {
+  hubIdentity,
   repoKindOf,
   blockSchema,
   claimSchema,
@@ -91,6 +93,7 @@ import {
   type SessionView,
   type TouchedVia,
   type TouchedView,
+  type HubIdentity,
 } from '@agent-ledger/shared';
 import { buildBrief } from '../brief.ts';
 import { claimWidthWarnings, inboxLine, type Coordination } from '../coord.ts';
@@ -191,6 +194,9 @@ export interface AppDeps {
   health?: () => string | null;
   /** Gitleaks availability, resolved once per hub. */
   scanner?: () => ScannerState;
+  /** Paths on a weak filesystem that run only because `LEDGER_ALLOW_WEAK_FS=1` (authenticated
+   *  `/v1/healthz` `fs_weak`; empty unless the bypass is active). */
+  fsWeak?: () => string[];
   /** Runtime diagnostics for `/v1/healthz` (authenticated only).
    *  Absent → the `diag` object is omitted from the response. */
   diag?: () => HubDiag;
@@ -493,6 +499,21 @@ export function createApp(deps: AppDeps) {
 
   /* ---------- healthz ---------- */
 
+  // Realpath + fingerprint are computed once: the ledger root does not move under a live hub.
+  let identityCache: HubIdentity | undefined;
+  const identity = (): HubIdentity => (identityCache ??= hubIdentity(ledger.paths.root));
+  let realCache: string | undefined;
+  const ledgerReal = (): string => {
+    if (realCache === undefined) {
+      try {
+        realCache = realpathSync.native(ledger.paths.root);
+      } catch {
+        realCache = ledger.paths.root;
+      }
+    }
+    return realCache;
+  };
+
   v1.get('/healthz', (c) => {
     const warnings = [...ledger.warnings.entries()].map(([file, reason]) => ({ file, reason }));
     // A gitleaks finding held back a ledger commit — that is a health
@@ -516,12 +537,18 @@ export function createApp(deps: AppDeps) {
     // unauthenticated on purpose) — reading its verdict keeps one source of
     // truth instead of a second, drifting copy of the rules here.
     const authed = authPathOf(c) !== null;
-    if (!authed) return c.json({ ok });
+    // T12: a CLI decides whether this process is ITS hub before it sends the bearer, so the
+    // unauthenticated answer carries `platform` + `ledger_id` (a hash — the path itself stays
+    // authenticated). Misconfiguration guard only; the token remains the authority.
+    if (!authed) return c.json({ ok, ...identity() });
     const live = deps.sessions?.list({ liveOnly: true }) ?? [];
     return c.json({
       ok,
       startedAt: startedAt.toISOString(),
+      ...identity(),
       ledger: ledger.paths.root,
+      ledger_real: ledgerReal(),
+      fs_weak: deps.fsWeak?.() ?? [],
       port: deps.guard.port,
       repos: Object.keys(ledger.repos()).length,
       items: ledger.listItems().length,

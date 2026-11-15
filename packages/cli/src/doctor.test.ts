@@ -7,6 +7,7 @@ import { createServer } from 'node:http';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
+import { hubIdentity, type FsCaps } from '@agent-ledger/shared';
 import { skipOnWin32 } from '@agent-ledger/shared/testing';
 import type { CliEnvConfig } from './client.ts';
 import { cmdDoctor, findInPath, logErrors, pickEntryScript, type DoctorDeps } from './doctor.ts';
@@ -25,6 +26,8 @@ function hermetic(dir: string, extra: DoctorDeps = {}): DoctorDeps {
   return {
     platform: 'linux',
     exists: async () => false,
+    cwd: dir,
+    wsl: false,
     homeDir: dir,
     codeRepoDir: dir,
     searchPath: '',
@@ -66,6 +69,7 @@ test('doctor: live hub with diag → OK, exit 0, at most 14 lines', async (t) =>
     res.end(
       JSON.stringify({
         ok: true,
+        ...hubIdentity(dir),
         diag: {
           startedAt: '2026-10-11T08:00:00.000Z',
           lastWakeAt: null,
@@ -317,7 +321,7 @@ function run(cfg: CliEnvConfig, argv: string[], deps: DoctorDeps, env: NodeJS.Pr
 
 test('doctor: hub of ANOTHER ledger on the port → identity fail, exit 1', async (t) => {
   const dir = await ledger(t);
-  const baseUrl = await serve(t, { ok: true, ledger: '/somewhere/else/.ledger' });
+  const baseUrl = await serve(t, { ok: true, ...hubIdentity('/somewhere/else/.ledger') });
   const res = await run({ baseUrl, ledgerDir: dir, session: null, agent: 'test' }, [], hermetic(dir));
   assert.equal(res.code, 1);
   assert.ok(res.out.some((l) => /^identity: .*another ledger/.test(l)), res.out.join('\n'));
@@ -326,11 +330,11 @@ test('doctor: hub of ANOTHER ledger on the port → identity fail, exit 1', asyn
 
 test('doctor: hub naming OUR ledger → identity ok; unnamed → warn, exit stays 0', async (t) => {
   const dir = await ledger(t);
-  const named = await serve(t, { ok: true, ledger: dir });
+  const named = await serve(t, { ok: true, ...hubIdentity(dir), ledger: dir });
   const a = await run({ baseUrl: named, ledgerDir: dir, session: null, agent: 'test' }, [], hermetic(dir));
   assert.ok(a.out.includes('identity: hub serves this ledger'), a.out.join('\n'));
   assert.equal(a.code, 0);
-  const unnamed = await serve(t, { ok: true });
+  const unnamed = await serve(t, { ok: true, ...hubIdentity(dir) });
   const b = await run({ baseUrl: unnamed, ledgerDir: dir, session: null, agent: 'test' }, [], hermetic(dir));
   assert.ok(b.out.some((l) => /^identity: healthz did not name/.test(l)), b.out.join('\n'));
   assert.equal(b.code, 0);
@@ -338,7 +342,7 @@ test('doctor: hub naming OUR ledger → identity ok; unnamed → warn, exit stay
 
 test('doctor --json: stable structure, same exit code as the text mode', async (t) => {
   const dir = await ledger(t);
-  const baseUrl = await serve(t, { ok: true, ledger: dir });
+  const baseUrl = await serve(t, { ok: true, ...hubIdentity(dir), ledger: dir });
   const cfg = { baseUrl, ledgerDir: dir, session: null, agent: 'test' };
   const res = await run(cfg, ['--json'], hermetic(dir));
   assert.equal(res.out.length, 1);
@@ -498,4 +502,208 @@ test('remote: network only with online; public → fail, 404 → ok', async (t) 
   const priv = await remoteCheck({ ledgerDir: root, codeRepoDir: root + '-none', online: true, fetchFn: mk(404) });
   assert.equal(priv.status, 'ok');
   assert.equal(calls, 2);
+});
+
+/* ---------------- B6: filesystem section, weak-FS bypass, win32 supervisor, WSL ---------------- */
+
+const caps = (over: Partial<FsCaps> = {}): FsCaps => ({
+  posixModes: true,
+  ownerMatches: true,
+  hardlinks: true,
+  acl: false,
+  fsType: 'ext4',
+  caseInsensitive: false,
+  weak: false,
+  bypassed: false,
+  reasons: [],
+  ...over,
+});
+const vfat = (bypassed: boolean): FsCaps =>
+  caps({ posixModes: false, ownerMatches: false, hardlinks: false, fsType: 'vfat', weak: true, bypassed, reasons: ['mode bits do not stick'] });
+
+test('doctor FS: weak filesystem WITH the bypass → WARN block first, exit 2, JSON weak_fs', async (t) => {
+  const dir = await ledger(t);
+  const baseUrl = await serve(t, { ok: true, ...hubIdentity(dir), ledger: dir });
+  const cfg = { baseUrl, ledgerDir: dir, session: null, agent: 'test' };
+  const probe = async (d: string): Promise<FsCaps> => (d === join(dir, '.hub') ? vfat(true) : caps());
+  const res = await run(cfg, [], hermetic(dir, { probe }));
+  assert.equal(res.code, 2, res.out.join('\n'));
+  assert.match(res.out[0] ?? '', /^WARNING: weak filesystem .* \(vfat: mode bits do not stick\) — LEDGER_ALLOW_WEAK_FS=1 is set, so private-permission checks are OFF there; move it to a local filesystem/);
+  assert.match(res.out.at(-1) ?? '', /^WEAK-FS BYPASS ACTIVE → /);
+  const js = await run(cfg, ['--json'], hermetic(dir, { probe }));
+  const doc = JSON.parse(js.out[0] ?? '') as { summary: { exit: number; ok: boolean; weak_fs: boolean } };
+  assert.deepEqual([js.code, doc.summary.exit, doc.summary.ok, doc.summary.weak_fs], [2, 2, false, true]);
+});
+
+test('doctor FS: weak filesystem WITHOUT the bypass → fail (the hub refuses there), exit 1, says how to fix', async (t) => {
+  const dir = await ledger(t);
+  const baseUrl = await serve(t, { ok: true, ...hubIdentity(dir), ledger: dir });
+  const res = await run({ baseUrl, ledgerDir: dir, session: null, agent: 'test' }, [], hermetic(dir, { probe: async () => vfat(false) }));
+  assert.equal(res.code, 1);
+  const line = res.out.find((l) => l.startsWith('fs ledger:')) ?? '';
+  assert.match(line, /cannot enforce private permissions .* refuses to run there — move it to a local filesystem .* or, accepting the risk, set LEDGER_ALLOW_WEAK_FS=1/);
+  assert.ok(!res.out.some((l) => l.startsWith('WARNING: weak filesystem')), 'no bypass wording without the bypass');
+});
+
+test('doctor FS: a real problem outranks the bypass (exit 1) but the WARN block stays first', async (t) => {
+  const dir = await ledger(t);
+  const res = await run({ baseUrl: 'http://127.0.0.1:1', ledgerDir: dir, session: null, agent: 'test' }, [], hermetic(dir, { probe: async () => vfat(true) }));
+  assert.equal(res.code, 1);
+  assert.match(res.out[0] ?? '', /^WARNING: weak filesystem/);
+  assert.match(res.out.at(-1) ?? '', /^DOWN: /);
+});
+
+test('doctor FS: EACCES says what to fix; a missing directory is just "absent"; healthy targets share one line', async (t) => {
+  const dir = await ledger(t);
+  const baseUrl = await serve(t, { ok: true, ...hubIdentity(dir), ledger: dir });
+  const errno = (code: string): Error => Object.assign(new Error(code), { code });
+  const probe = async (d: string): Promise<FsCaps> => {
+    if (d === join(dir, '.hub')) throw errno('EACCES');
+    if (d.endsWith('spool')) throw errno('ENOENT');
+    return caps({ fsType: 'apfs' });
+  };
+  const res = await run({ baseUrl, ledgerDir: dir, session: null, agent: 'test' }, [], hermetic(dir, { probe }));
+  assert.match(res.out.find((l) => l.startsWith('fs ledger:')) ?? '', /permission denied probing .* chown -R "\$USER" .* chmod 700 .*icacls|fix the folder ACL/s);
+  assert.ok(res.out.includes('fs: spool absent · checkout apfs'), res.out.join('\n'));
+  assert.equal(res.code, 0, 'a permission problem on a probe is a warning, never DOWN');
+});
+
+import { parseTaskAction, win32Checks, wslChecks } from './doctor-win32.ts';
+
+const TASK_XML = `<?xml version="1.0" encoding="UTF-16"?>
+<Task><Actions Context="Author"><Exec>
+  <Command>"C:\\Program Files\\nodejs\\node.exe"</Command>
+  <Arguments>--env-file=C:\\Users\\a&amp;b\\hub.env hub.ts</Arguments>
+</Exec></Actions></Task>`;
+
+test('parseTaskAction: action path only, quotes stripped, entities decoded, nothing else read', () => {
+  assert.equal(parseTaskAction(TASK_XML), 'C:\\Program Files\\nodejs\\node.exe');
+  assert.equal(parseTaskAction('<Exec><Command>C:\\a&amp;b\\n.exe</Command></Exec>'), 'C:\\a&b\\n.exe');
+  assert.equal(parseTaskAction('<Task></Task>'), null);
+  assert.equal(parseTaskAction('<Exec><Command>  </Command></Exec>'), null);
+  // NUL noise from a UTF-16 console capture does not hide the tag.
+  assert.equal(parseTaskAction('<\0E\0x\0e\0c\0><Command>C:\\n.exe</Command></Exec>'), 'C:\\n.exe');
+});
+
+test('win32 supervisor: absolute System32\\schtasks.exe, constant argv, action path must exist', async () => {
+  const calls: { cmd: string; args: readonly string[] }[] = [];
+  const mk = (xml: string, code = 0, present = true) =>
+    win32Checks({
+      env: { SystemRoot: 'C:\\Windows' },
+      exists: async () => present,
+      capture: async (cmd, args) => {
+        calls.push({ cmd, args });
+        return { code, stdout: xml };
+      },
+    });
+  const ok = await mk(TASK_XML);
+  assert.deepEqual(ok.problems, []);
+  assert.equal(ok.checks[0]?.status, 'ok');
+  assert.match(ok.checks[0]?.detail ?? '', /action C:\\Program Files\\nodejs\\node\.exe/);
+  assert.deepEqual(calls[0], { cmd: 'C:\\Windows\\System32\\schtasks.exe', args: ['/Query', '/TN', 'agent-ledger', '/XML'] });
+
+  const missing = await mk(TASK_XML, 0, false);
+  assert.equal(missing.checks[0]?.status, 'fail');
+  assert.match(missing.checks[0]?.detail ?? '', /does not exist/);
+  assert.equal(missing.problems.length, 1);
+
+  const none = await mk('', 1);
+  assert.match(none.checks[0]?.detail ?? '', /not registered/);
+  assert.match(none.suggestion ?? '', /install\.ps1/);
+
+  const relative = await mk('<Exec><Command>node.exe</Command></Exec>');
+  assert.match(relative.checks[0]?.detail ?? '', /not drive-rooted/);
+  assert.equal(relative.problems.length, 1);
+
+  const calls0 = calls.length;
+  const badRoot = await win32Checks({
+    env: { SystemRoot: '..\\evil' },
+    exists: async () => true,
+    capture: async () => {
+      throw new Error('must not spawn');
+    },
+  });
+  assert.equal(calls.length, calls0);
+  assert.match(badRoot.checks[0]?.detail ?? '', /SystemRoot is missing or malformed/);
+});
+
+test('doctor on platform win32 routes through the injected spawn (no shell, no real process)', async (t) => {
+  const dir = await ledger(t);
+  const seen: string[] = [];
+  const res = await run(
+    { baseUrl: 'http://127.0.0.1:1', ledgerDir: dir, session: null, agent: 'test' },
+    [],
+    hermetic(dir, {
+      platform: 'win32',
+      exists: async () => true,
+      capture: async (cmd, args) => {
+        seen.push(`${cmd} ${args.join(' ')}`);
+        return { code: 0, stdout: TASK_XML };
+      },
+    }),
+    { SystemRoot: 'C:\\Windows' },
+  );
+  assert.deepEqual(seen, ['C:\\Windows\\System32\\schtasks.exe /Query /TN agent-ledger /XML']);
+  assert.ok(res.out.some((l) => l.startsWith('scheduler: task agent-ledger registered')), res.out.join('\n'));
+});
+
+test('WSL: a ledger on the Windows side is an ERROR (one hub per machine); DrvFs ledger/spool warn', async () => {
+  const have = new Set(['/mnt/c/Users/alice/.ledger']);
+  const r = await wslChecks({
+    env: {},
+    ledgerDir: '/home/alice/.ledger',
+    spoolDir: '/home/alice/.local/state/agent-ledger/spool',
+    exists: async (p) => have.has(p),
+    listUsers: async () => ['Public', 'Default', 'alice', 'bob'],
+  });
+  const dual = r.checks.find((c) => c.id === 'wsl_dual_ledger');
+  assert.equal(dual?.status, 'fail');
+  assert.match(dual?.detail ?? '', /^ERROR: a second ledger exists on the Windows side \(\/mnt\/c\/Users\/alice\/\.ledger\); one hub per machine/);
+  assert.equal(r.problems.length, 1);
+
+  // The ledger in use IS the Windows-side one: not a second ledger, but it sits on DrvFs.
+  const drv = await wslChecks({
+    env: {},
+    ledgerDir: '/mnt/c/Users/alice/.ledger',
+    spoolDir: '/mnt/d/spool',
+    exists: async (p) => have.has(p),
+    listUsers: async () => ['alice'],
+  });
+  assert.deepEqual(drv.problems, []);
+  assert.deepEqual(drv.checks.map((c) => [c.id, c.status]), [['wsl_drvfs_ledger', 'warn'], ['wsl_drvfs_spool', 'warn']]);
+  assert.match(drv.checks[0]?.detail ?? '', /DrvFs.*move it into the WSL filesystem/);
+
+  const clean = await wslChecks({ env: {}, ledgerDir: '/home/a/.ledger', spoolDir: '/home/a/s', exists: async () => false, listUsers: async () => ['a'] });
+  assert.deepEqual(clean.checks, []);
+});
+
+test('doctor on WSL: dual ledger makes the doctor fail with exit 1', async (t) => {
+  const dir = await ledger(t);
+  const baseUrl = await serve(t, { ok: true, ...hubIdentity(dir), ledger: dir });
+  const res = await run(
+    { baseUrl, ledgerDir: dir, session: null, agent: 'test' },
+    [],
+    hermetic(dir, { wsl: true, listWinUsers: async () => ['alice'], exists: async (p) => p === '/mnt/c/Users/alice/.ledger' }),
+  );
+  assert.equal(res.code, 1, res.out.join('\n'));
+  assert.ok(res.out.some((l) => l.startsWith('ERROR: a second ledger exists on the Windows side')));
+});
+
+test('doctor T12: a hub of another platform gets NO token; identity fails', async (t) => {
+  const dir = await ledger(t);
+  const mine = hubIdentity(dir);
+  const seenTokens: (string | undefined)[] = [];
+  const server = createServer((req, res) => {
+    seenTokens.push(req.headers['x-hub-token'] as string | undefined);
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ ok: true, platform: mine.platform === 'win32' ? 'wsl' : 'win32', ledger_id: mine.ledger_id }));
+  });
+  await new Promise<void>((r) => server.listen(0, '127.0.0.1', r));
+  t.after(() => new Promise<void>((r) => { server.closeAllConnections(); server.close(() => r()); }));
+  const addr = server.address();
+  const baseUrl = `http://127.0.0.1:${typeof addr === 'object' && addr !== null ? addr.port : 0}`;
+  const res = await run({ baseUrl, ledgerDir: dir, session: null, agent: 'test' }, [], hermetic(dir));
+  assert.equal(res.code, 1);
+  assert.ok(res.out.some((l) => /^identity: .*another ledger or platform .*token not sent/.test(l)), res.out.join('\n'));
+  assert.ok(seenTokens.length > 0 && seenTokens.every((x) => x === undefined), 'no x-hub-token was sent');
 });

@@ -290,7 +290,8 @@ test('status: a foreign process or a hub of another ledger on the port is NOT re
   });
   const wrongLedger = await ledger(['status'], { LEDGER_HUB_URL: fx.url, LEDGER_DIR: other });
   assert.equal(wrongLedger.code, 3, wrongLedger.stdout);
-  assert.match(wrongLedger.stderr, /does not answer for ledger/);
+  // T12: caught before the token is sent — the hub's ledger_id is not ours.
+  assert.match(wrongLedger.stderr, /port held by another agent-ledger/);
   assert.doesNotMatch(wrongLedger.stdout, /^hub ok/m);
 
   // A stranger that answers `{ok:true}` to everything and never reveals a ledger.
@@ -310,6 +311,6 @@ test('status: a foreign process or a hub of another ledger on the port is NOT re
   const url = `http://127.0.0.1:${typeof addr === 'object' && addr !== null ? addr.port : 0}`;
   const foreign = await ledger(['status'], { LEDGER_HUB_URL: url, LEDGER_DIR: other });
   assert.equal(foreign.code, 3, foreign.stdout);
-  assert.match(foreign.stderr, /did not accept this ledger token/);
+  assert.match(foreign.stderr, /refusing to send the hub token/);
   assert.equal(foreign.stdout, '');
 });
