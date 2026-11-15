@@ -924,7 +924,10 @@ test('win32: assertPrivateDir passes on the DACL ensurePrivateDir produces; one 
   assert.equal(w.spawns.length, 1);
   const call = w.spawns[0]!;
   assert.equal(call.file, PS_EXE);
-  assert.deepEqual(call.args, ['-NoProfile', '-NonInteractive', '-NoLogo', '-Command', WIN_PS_SCRIPT]);
+  assert.deepEqual(call.args, [
+    '-NoProfile', '-NonInteractive', '-NoLogo', '-ExecutionPolicy', 'Bypass', '-EncodedCommand',
+    Buffer.from(WIN_PS_SCRIPT, 'utf16le').toString('base64'),
+  ]);
   assert.deepEqual(JSON.parse(call.env.LEDGER_TRUST_PATHS ?? ''), [LEDGER, LA, 'C:\\Users\\me\\AppData', 'C:\\Users\\me', 'C:\\Users', 'C:\\']);
   assert.ok(!call.args.join(' ').includes('agent-ledger'), 'paths must not be interpolated into the command line');
   assert.equal(call.env.PSModulePath, `${SYSROOT}\\System32\\WindowsPowerShell\\v1.0\\Modules`);
@@ -987,7 +990,7 @@ test('win32: a git.exe probe that times out is REJECTED with the real reason in 
   const info = await resolveTrustedExecutable([GIT], {}, { ...winDeps(w), spawnFile });
   assert.equal(info.path, null, 'fail-closed: no binary is trusted when the probe does not finish');
   assert.equal(info.rejected.length, 1);
-  assert.match(info.rejected[0] ?? '', /windows trust probe failed: powershell timed out after 15000 ms \[stderr: Windows PowerShell boom\]/);
+  assert.match(info.rejected[0] ?? '', /windows trust probe failed: powershell timed out after 45000 ms \[stderr: Windows PowerShell boom\]/);
 });
 
 test('win32: UNC / device / relative paths are refused before any process runs', async () => {

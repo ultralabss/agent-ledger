@@ -39,6 +39,16 @@ jobs:
       # No lifecycle scripts of any dependency run in CI.
       - run: pnpm install --frozen-lockfile --ignore-scripts
       - run: pnpm typecheck
+      # Diagnostics only (never fails): how long does the fixed trust probe take on this runner?
+      - name: Windows PowerShell probe timing
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ps = "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe"
+          foreach ($i in 1..3) {
+            $t = Measure-Command { & $ps -NoProfile -NonInteractive -NoLogo -Command '(Get-Acl -LiteralPath $env:SystemRoot).Sddl.Length' | Out-String | Write-Host }
+            Write-Host "probe run $i : $([int]$t.TotalMilliseconds) ms"
+          }
       # Hosted Windows runners are elevated; the product refuses to run elevated
       # (T14, not relaxed), so tests run as a non-elevated local user there.
       - run: pnpm test

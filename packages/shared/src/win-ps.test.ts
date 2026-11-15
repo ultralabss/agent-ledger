@@ -78,7 +78,7 @@ test('inspectWindowsPaths: batch limits, env is minimal and never carries the ca
   assert.equal(seen?.env.NODE_OPTIONS, undefined);
   assert.equal(seen?.env.LOCALAPPDATA, 'C:\\Users\\me\\AppData\\Local');
   assert.equal(seen?.cwd, 'C:\\Windows');
-  assert.equal(seen?.timeoutMs, 15_000);
+  assert.equal(seen?.timeoutMs, 45_000);
   assert.equal(seen?.maxBuffer, 1024 * 1024);
   await assert.rejects(inspectWindowsPaths([], ctx(spawn)), WinPsError);
   await assert.rejects(inspectWindowsPaths(Array.from({ length: 65 }, () => 'C:\\a'), ctx(spawn)), WinPsError);
@@ -147,7 +147,7 @@ test('inspectWindowsPaths: timeout / non-zero exit say why (bounded, printable s
   const spawnT: SpawnFile = async () => ({ ...okRes(), code: null, timedOut: true, stderr: `\u001bboom\u0000\n${noisy}` });
   await assert.rejects(inspectWindowsPaths(['C:\\Users\\me'], ctx(spawnT)), (e: unknown) => {
     assert.ok(e instanceof WinPsError);
-    assert.match(e.message, /^powershell timed out after 15000 ms \[stderr: boom x+\]$/);
+    assert.match(e.message, /^powershell timed out after 45000 ms \[stderr: boom x+\]$/);
     assert.ok(e.message.length < 400);
     assert.doesNotMatch(e.message, /[\u0000-\u001f]/);
     return true;

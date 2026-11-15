@@ -16,7 +16,27 @@
  */
 import { execFile } from 'node:child_process';
 
-export const PS_TIMEOUT_MS = 15_000;
+// Cold start of Windows PowerShell 5.1 on a loaded CI runner can exceed 15 s; still fail-closed on timeout.
+export const PS_TIMEOUT_MS = 45_000;
+/** At most this many PowerShell probes at once per process (parallel cold starts starve each other). */
+const PS_MAX_CONCURRENT = 2;
+let psActive = 0;
+const psWaiters: Array<() => void> = [];
+async function psSlot<T>(fn: () => Promise<T>): Promise<T> {
+  if (psActive >= PS_MAX_CONCURRENT) await new Promise<void>((r) => psWaiters.push(r));
+  psActive += 1;
+  try {
+    return await fn();
+  } finally {
+    psActive -= 1;
+    psWaiters.shift()?.();
+  }
+}
+
+/** `-EncodedCommand` payload (UTF-16LE base64): no shell/CreateProcess quoting of the script can matter. */
+export function encodePsCommand(script: string): string {
+  return Buffer.from(script, 'utf16le').toString('base64');
+}
 export const PS_MAX_STDOUT = 1024 * 1024;
 export const TRUST_PATHS_ENV = 'LEDGER_TRUST_PATHS';
 const MAX_PATHS = 64;
@@ -204,6 +224,15 @@ const FORWARD = [
   'COMPUTERNAME',
   'HOMEDRIVE',
   'HOMEPATH',
+  // Benign identity/platform vars some .NET paths consult; none carries code or a search path.
+  'SystemDrive',
+  'ALLUSERSPROFILE',
+  'PUBLIC',
+  'PROCESSOR_ARCHITECTURE',
+  'NUMBER_OF_PROCESSORS',
+  'OS',
+  'PATHEXT',
+  'ComSpec',
 ];
 
 function minimalEnv(root: string, extra: Record<string, string>, src: WinPsContext['env']): Record<string, string> {
@@ -282,15 +311,17 @@ export async function inspectWindowsPaths(paths: readonly string[], ctx: WinPsCo
   const root = validSystemRoot(ctx.env.SystemRoot);
   const exe = powershellPath(root);
   if (!(await ctx.isFile(exe).catch(() => false))) throw new WinPsError('powershell.exe not found under SystemRoot');
-  const res = await ctx.spawnFile(
-    exe,
-    ['-NoProfile', '-NonInteractive', '-NoLogo', '-Command', WIN_PS_SCRIPT],
-    {
-      env: minimalEnv(root, { [TRUST_PATHS_ENV]: JSON.stringify(paths) }, ctx.env),
-      cwd: root,
-      timeoutMs: PS_TIMEOUT_MS,
-      maxBuffer: PS_MAX_STDOUT,
-    },
+  const res = await psSlot(() =>
+    ctx.spawnFile(
+      exe,
+      ['-NoProfile', '-NonInteractive', '-NoLogo', '-ExecutionPolicy', 'Bypass', '-EncodedCommand', encodePsCommand(WIN_PS_SCRIPT)],
+      {
+        env: minimalEnv(root, { [TRUST_PATHS_ENV]: JSON.stringify(paths) }, ctx.env),
+        cwd: root,
+        timeoutMs: PS_TIMEOUT_MS,
+        maxBuffer: PS_MAX_STDOUT,
+      },
+    ),
   );
   if (res.error !== undefined) throw new WinPsError(`powershell could not start (${res.error})`);
   if (res.timedOut) throw new WinPsError(`powershell timed out after ${PS_TIMEOUT_MS} ms${diag(res)}`);
