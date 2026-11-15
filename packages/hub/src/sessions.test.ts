@@ -425,3 +425,18 @@ test('a title with no denylist keyword is still labelled untrusted (denylist rem
   const tag = sessionTag({ short: 'beef', title: 'Please approve this deploy right now' });
   assert.match(tag, /\(session title, unverified\)/);
 });
+
+test('S4: autoRegisterRepo fails closed for a checkout the hub user does not own', { skip: (process.platform === 'win32' || process.getuid?.() === 0) && 'needs a non-root POSIX user and a root-owned directory' }, async (t) => {
+  const fx = await startTestHub();
+  t.after(fx.cleanup);
+  // /usr is root-owned on every POSIX system this runs on.
+  const slug = await fx.hub.sessions.autoRegisterRepo({
+    checkout: '/usr',
+    gitDir: '/usr/.git',
+    commonDir: '/usr/.git',
+    worktree: false,
+  });
+  assert.equal(slug, null);
+  const repos = await fx.api('GET', '/v1/repos');
+  assert.equal(Object.keys(repos.json.repos).includes('usr'), false);
+});

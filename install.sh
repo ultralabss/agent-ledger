@@ -655,22 +655,35 @@ chmod 600 "$GITATTR_FILE"
 # every spawn and runs nothing else. After upgrading gitleaks the copy no
 # longer matches — just run `./install.sh` again.
 #
-# The preferred source is the official GitHub release: download
-# `gitleaks_<ver>_<os>_<arch>.tar.gz` AND `gitleaks_<ver>_checksums.txt` over
-# HTTPS, verify the tarball against the checksums line for exactly that asset,
-# and take the binary out of the verified tarball. The version is PINNED here
-# (not "latest"), so an upgrade is a reviewable change to this file rather than
-# whatever upstream published this morning.
+# The only source is the official GitHub release, verified against IN-REPO pins:
+# `ops/gitleaks-pins.json` holds the version and the sha256 of every release
+# asset we accept (reviewed in the same diff that bumps the version). The archive
+# `gitleaks_<ver>_<os>_<arch>.tar.gz` is downloaded over HTTPS, its digest is
+# compared (by `scripts/gitleaks-pins.mjs`, shared with install.ps1) with the pin
+# for exactly that asset, and only then is the binary taken out. NOTHING is
+# trusted from the network: no checksums file is fetched, and the old
+# `GITLEAKS_VERSION=<any>` escape hatch is gone — an unpinned version has no
+# digest to check, so it is refused. To upgrade gitleaks: edit
+# `ops/gitleaks-pins.json` (version + digests from the official
+# `gitleaks_<ver>_checksums.txt`, cross-checked against the downloaded assets).
 #
-# Residual TOFU — deliberately not solved here: the checksums file is fetched
-# over the same channel as the tarball and is NOT signed, so this proves
-# "tarball matches the checksums GitHub served us", not "upstream authored it".
-# A GitHub compromise (or a TLS-terminating proxy trusted by this machine)
-# defeats it. Closing that needs the cosign/SLSA attestation for the release.
-# What it DOES close is the local half of the problem — the scanner no longer
-# comes from a directory any admin account on the machine can write.
-GITLEAKS_VERSION="${GITLEAKS_VERSION:-8.30.1}"
+# Residual: the pins prove "this is the archive the maintainers reviewed", not
+# "upstream authored it" (no cosign/SLSA verification yet). A compromised GitHub
+# release or TLS-intercepting proxy can no longer substitute the archive AND its
+# checksum together, which was the weakness of fetching both from one channel.
+GITLEAKS_PINS_TOOL="$REPO/scripts/gitleaks-pins.mjs"
 GITLEAKS_BASE_URL="${GITLEAKS_BASE_URL:-https://github.com/gitleaks/gitleaks/releases/download}"
+if [[ -n "${GITLEAKS_VERSION:-}" ]]; then
+  echo "    note: GITLEAKS_VERSION is ignored — the version comes from ops/gitleaks-pins.json" >&2
+fi
+GITLEAKS_VERSION=""
+if [[ "$SKIP_GITLEAKS" != "1" ]]; then
+  GITLEAKS_VERSION="$("$NODE" "$GITLEAKS_PINS_TOOL" version 2>/dev/null || true)"
+  if [[ ! "$GITLEAKS_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+    echo "    note: ops/gitleaks-pins.json is missing or invalid — no verified gitleaks can be fetched" >&2
+    GITLEAKS_VERSION=""
+  fi
+fi
 
 sha256_of() {
   if command -v shasum >/dev/null 2>&1; then
@@ -701,42 +714,31 @@ gitleaks_asset_platform() {
 # Everything (including the failure path) is quiet except the echoed path, so
 # the caller can capture it with `$( )`.
 gitleaks_fetch_verified() {
-  local platform tarball url_tar url_sums tmp expected actual
+  local platform asset url_tar tmp
+  [[ -n "$GITLEAKS_VERSION" ]] || return 1
   platform="$(gitleaks_asset_platform)" || return 1
-  tarball="gitleaks_${GITLEAKS_VERSION}_${platform}.tar.gz"
-  url_tar="$GITLEAKS_BASE_URL/v$GITLEAKS_VERSION/$tarball"
-  url_sums="$GITLEAKS_BASE_URL/v$GITLEAKS_VERSION/gitleaks_${GITLEAKS_VERSION}_checksums.txt"
+  # Unknown platform key => no pin => refused (the tool exits non-zero).
+  asset="$("$NODE" "$GITLEAKS_PINS_TOOL" asset "$platform" 2>/dev/null)" || return 1
+  [[ "$asset" =~ ^gitleaks_[0-9.]+_[a-z0-9_]+\.tar\.gz$ ]] || return 1
+  url_tar="$GITLEAKS_BASE_URL/v$GITLEAKS_VERSION/$asset"
   tmp="$(mktemp -d "${TMPDIR:-/tmp}/agent-ledger-gitleaks.XXXXXX")" || return 1
   chmod 700 "$tmp"
   # `--proto '=https'` refuses a plaintext redirect; `-f` makes a 404 (a version
   # that does not exist) a failure instead of saving an HTML error page.
   if ! curl --proto '=https' --tlsv1.2 -fsSL --max-time 120 \
-    -o "$tmp/$tarball" "$url_tar" 2>/dev/null; then
+    -o "$tmp/$asset" "$url_tar" 2>/dev/null; then
     rm -rf "$tmp"
     return 1
   fi
-  if ! curl --proto '=https' --tlsv1.2 -fsSL --max-time 60 \
-    -o "$tmp/checksums.txt" "$url_sums" 2>/dev/null; then
-    rm -rf "$tmp"
-    return 1
-  fi
-  # Anchored on the exact asset name: a checksums file listing many assets must
-  # not let the line for a DIFFERENT platform satisfy this check.
-  expected="$(awk -v want="$tarball" '$2 == want || $2 == "*" want { print $1; exit }' \
-    "$tmp/checksums.txt")"
-  if [[ ! "$expected" =~ ^[0-9a-f]{64}$ ]]; then
-    rm -rf "$tmp"
-    return 1
-  fi
-  actual="$(sha256_of "$tmp/$tarball")"
-  if [[ "$actual" != "$expected" ]]; then
-    echo "install: sha256 of $tarball does NOT match the official checksums — discarding" >&2
+  # The digest comes from the repository, never from the download channel.
+  if ! "$NODE" "$GITLEAKS_PINS_TOOL" check-file "$platform" "$tmp/$asset" >&2; then
+    echo "install: $asset does NOT match the in-repo sha256 pin — discarding" >&2
     rm -rf "$tmp"
     return 1
   fi
   # Only now is the archive touched. `-C` keeps the extraction inside the temp
   # dir even if the archive carries absolute or `..` paths.
-  if ! tar -xzf "$tmp/$tarball" -C "$tmp" gitleaks 2>/dev/null; then
+  if ! tar -xzf "$tmp/$asset" -C "$tmp" gitleaks 2>/dev/null; then
     rm -rf "$tmp"
     return 1
   fi
@@ -754,11 +756,11 @@ GITLEAKS_TMPDIR=""
 if [[ "$SKIP_GITLEAKS" == "1" ]]; then
   echo "==> gitleaks: skipped (--skip-gitleaks)"
 else
-  echo "==> gitleaks: verifying the official release v$GITLEAKS_VERSION"
+  echo "==> gitleaks: fetching the official release v${GITLEAKS_VERSION:-?} (verified against ops/gitleaks-pins.json)"
   if GITLEAKS_REAL="$(gitleaks_fetch_verified)" && [[ -n "$GITLEAKS_REAL" ]]; then
     GITLEAKS_TMPDIR="$(dirname "$GITLEAKS_REAL")"
-    GITLEAKS_ORIGIN="upstream v$GITLEAKS_VERSION (sha256 verified against gitleaks_${GITLEAKS_VERSION}_checksums.txt)"
-    echo "    sha256 matches the official checksums"
+    GITLEAKS_ORIGIN="upstream v$GITLEAKS_VERSION (sha256 verified against the in-repo pin ops/gitleaks-pins.json)"
+    echo "    sha256 matches the in-repo pin"
   else
     GITLEAKS_REAL=""
     echo "    note: could not download/verify the official release (network, version, platform)."

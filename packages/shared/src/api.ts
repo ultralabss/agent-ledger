@@ -598,7 +598,9 @@ export type GuardRule =
   | 'guard-off'
   | 'git-mutation'
   | 'git-add-all'
-  | 'git-commit-foreign';
+  | 'git-commit-foreign'
+  /** S8: the path cannot be canonicalised safely (ADS, device name, `\\?\\`, escape from the checkout). */
+  | 'invalid-path';
 
 export interface GuardDecisionView {
   decision: 'allow' | 'deny';

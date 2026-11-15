@@ -94,3 +94,42 @@ test('parallel starts get the same token', async () => {
   );
   assert.equal(new Set(tokens).size, 1, 'link() must not overwrite another process token');
 });
+
+const posixOnly = process.platform === 'win32' && 'POSIX mode-bit / hard-link test';
+
+test('S3/T3: a token with a second hard link is treated as leaked and rotated', { skip: posixOnly }, async () => {
+  const root = await tmpdir();
+  const file = path.join(root, 'token');
+  const first = await loadOrCreateToken(file);
+  const alias = path.join(root, 'alias');
+  await fs.link(file, alias); // someone planted a second name for the secret
+  const second = await loadOrCreateToken(file);
+  assert.notEqual(second, first, 'a hard-linked token must be invalidated');
+  assert.equal((await fs.stat(file)).nlink, 1);
+  assert.equal((await fs.readFile(alias, 'utf8')).trim(), first, 'only our name is replaced');
+});
+
+test('S3/T1: a group-writable token directory is refused, not chmod-and-continued', { skip: posixOnly }, async () => {
+  const root = await tmpdir();
+  const dir = path.join(root, '.hub');
+  await fs.mkdir(dir, { mode: 0o700 });
+  await fs.chmod(dir, 0o770);
+  await assert.rejects(() => loadOrCreateToken(path.join(dir, 'token')), /group\/other/);
+  assert.equal((await fs.stat(dir)).mode & 0o777, 0o770, 'the directory is left as found');
+});
+
+test('S3/T2: a symlinked token directory is refused', { skip: posixOnly }, async () => {
+  const root = await tmpdir();
+  const real = path.join(root, 'real');
+  await fs.mkdir(real, { mode: 0o700 });
+  const link = path.join(root, '.hub');
+  await fs.symlink(real, link);
+  await assert.rejects(() => loadOrCreateToken(path.join(link, 'token')), /symlink/);
+});
+
+test('S3: no stray probe or tmp files are left next to the token', async () => {
+  const root = await tmpdir();
+  const dir = path.join(root, '.hub');
+  await loadOrCreateToken(path.join(dir, 'token'));
+  assert.deepEqual((await fs.readdir(dir)).sort(), ['token']);
+});

@@ -17,7 +17,7 @@
  *   - owner is the uid we run as,
  *   - neither group nor other can write it,
  *   - every directory from it up to `/` is owned by root or us and is not
- *     group/other-writable (`dirChainTrusted`, strict — no group enumeration),
+ *     group/other-writable (`assertTrustedAncestors`, strict — no group enumeration),
  *   - the same rules hold for the `.sha256` side-car, and
  *   - sha256(file) equals the recorded digest, compared with
  *     `timingSafeEqual`.
@@ -32,7 +32,7 @@
 import { createHash, timingSafeEqual } from 'node:crypto';
 import { createReadStream } from 'node:fs';
 import { lstat, readFile } from 'node:fs/promises';
-import { dirChainTrusted } from './git.ts';
+import { assertPrivateFile, assertTrustedAncestors, TrustError } from '@agent-ledger/shared';
 
 export type ManagedBinState =
   /** Verified — safe to spawn. */
@@ -52,11 +52,30 @@ export interface ManagedBinary {
   detail: string | null;
 }
 
-/** Owner is us and nobody outside {root, us} can write the file itself. */
-async function fileOwnedByUs(
-  file: string,
-  uid: number | undefined,
-): Promise<{ ok: true } | { ok: false; detail: string }> {
+/** Secret-free, stable wording for a platformTrust refusal on a managed file. */
+function describeRefusal(err: unknown): string {
+  if (!(err instanceof TrustError)) return 'could not be verified';
+  switch (err.code) {
+    case 'SYMLINK':
+      return 'is a symlink (the install copies, it does not link)';
+    case 'REPARSE':
+      return 'is a reparse point (junction/symlink)';
+    case 'OWNER':
+      return 'not owned by the hub user';
+    case 'PERMS':
+      return 'writable by group/other';
+    case 'ACL':
+      return 'writable by someone other than {you, SYSTEM, Administrators}';
+    case 'IDENTITY':
+      return 'is not a regular file';
+    default:
+      return `trust check refused (${err.code})`;
+  }
+}
+
+/** Owner is us and nobody outside {root/SYSTEM, us} can write the file itself.
+ *  The owner / mode / ACL decision is platformTrust's; unknown = refuse (I1). */
+async function fileOwnedByUs(file: string): Promise<{ ok: true } | { ok: false; detail: string }> {
   let st;
   try {
     st = await lstat(file);
@@ -65,8 +84,11 @@ async function fileOwnedByUs(
   }
   if (st.isSymbolicLink()) return { ok: false, detail: 'is a symlink (the install copies, it does not link)' };
   if (!st.isFile()) return { ok: false, detail: 'is not a regular file' };
-  if (uid === undefined || st.uid !== uid) return { ok: false, detail: 'not owned by the hub user' };
-  if ((st.mode & 0o022) !== 0) return { ok: false, detail: 'writable by group/other' };
+  try {
+    await assertPrivateFile(file);
+  } catch (err) {
+    return { ok: false, detail: describeRefusal(err) };
+  }
   return { ok: true };
 }
 
@@ -96,21 +118,25 @@ export async function verifyManagedBinary(
   binPath: string,
   opts: { stopAt?: string } = {},
 ): Promise<ManagedBinary> {
-  const uid = process.getuid?.();
   const shaPath = `${binPath}.sha256`;
 
-  const bin = await fileOwnedByUs(binPath, uid);
+  const bin = await fileOwnedByUs(binPath);
   if (!bin.ok) {
     if (bin.detail === 'missing') return { path: null, state: 'missing', detail: null };
     return { path: null, state: 'untrusted', detail: bin.detail };
   }
-  if (!(await dirChainTrusted(binPath, uid, opts.stopAt))) {
+  try {
+    await assertTrustedAncestors(binPath, {
+      executable: true,
+      ...(opts.stopAt !== undefined ? { stopAt: opts.stopAt } : {}),
+    });
+  } catch {
     return { path: null, state: 'untrusted', detail: 'directory is writable outside {root, us}' };
   }
 
   // The digest is only evidence if the file holding it is as protected as the
   // binary — otherwise an attacker swaps both and the check self-approves.
-  const sha = await fileOwnedByUs(shaPath, uid);
+  const sha = await fileOwnedByUs(shaPath);
   if (!sha.ok) {
     return {
       path: null,

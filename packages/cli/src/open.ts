@@ -11,18 +11,24 @@
  *    a broken/spoofed hub · a path from an argument used as an open redirect.
  *
  * Hence: the code is issued by `POST /v1/ui/login-code` (token only in the
- * header), `spawn` gets an argument array and never `shell: true`, and the URL
+ * header), `spawn` gets an argument array and never runs through a shell, and the URL
  * returned by the hub is validated before the browser is launched (http,
  * loopback, path `/login`).
  */
 
 import { spawn } from 'node:child_process';
+import os from 'node:os';
+import { resolveTrustedExecutable } from '@agent-ledger/shared';
 import { bool, type Args } from './args.ts';
 import { CliError, type CliEnvConfig, type HubClient } from './client.ts';
 import type { Io } from './index.ts';
 
 /** macOS launcher, absolute path — no `PATH` lookup. */
 const OPEN_BIN = '/usr/bin/open';
+const XDG_OPEN_BIN = '/usr/bin/xdg-open';
+const WSLVIEW_BIN = '/usr/bin/wslview';
+/** `%SystemRoot%` must be a plain drive-rooted directory; anything else is not trusted. */
+const SYSTEM_ROOT_RE = /^[A-Za-z]:\\[^\\/:*?"<>|\r\n]+$/;
 /** The friendly name the UI is opened under. `*.localhost` resolves to loopback
  *  in browsers (RFC 6761); the hub accepts exactly this label and nothing else
  *  under `.localhost`. */
@@ -94,27 +100,80 @@ function assertLoginUrl(raw: unknown, baseUrl: string): string {
   return `http://${UI_HOST}:${portOf(u)}${u.pathname}${u.search}`;
 }
 
+export interface LauncherPlan {
+  bin: string;
+  /** win32 `explorer.exe <url>` reports exit code 1 even when it opened the page. */
+  ignoreExit1: boolean;
+}
+
+export interface LauncherEnv {
+  platform: NodeJS.Platform;
+  env: NodeJS.ProcessEnv;
+  release: string;
+  /** Test seam: trust verdict for an absolute executable (production: platformTrust). */
+  trust?: (candidates: readonly string[]) => Promise<string | null>;
+}
+
+const PRINT_HINT = 'use `ledger open --print`';
+
+function isWslEnv(e: LauncherEnv): boolean {
+  return e.platform === 'linux' && (/microsoft/i.test(e.release) || (e.env.WSL_DISTRO_NAME ?? '') !== '');
+}
+
+/**
+ * Which absolute launcher may open the browser on this OS. Never a `PATH` lookup, never a
+ * shell. win32: `%SystemRoot%\explorer.exe` (SystemRoot validated), Linux `/usr/bin/xdg-open`,
+ * WSL `/usr/bin/wslview` when it passes the trust rules (otherwise print the URL instead).
+ */
+export async function planLauncher(e: LauncherEnv): Promise<LauncherPlan> {
+  const trust =
+    e.trust ??
+    (async (c: readonly string[]): Promise<string | null> => (await resolveTrustedExecutable(c)).path);
+  if (e.platform === 'darwin') return { bin: OPEN_BIN, ignoreExit1: false };
+  if (e.platform === 'win32') {
+    const root = e.env.SystemRoot ?? e.env.SYSTEMROOT ?? '';
+    if (!SYSTEM_ROOT_RE.test(root)) {
+      throw new CliError(3, `SystemRoot is not a plain drive-rooted path — ${PRINT_HINT}`);
+    }
+    const bin = await trust([`${root}\\explorer.exe`]);
+    if (bin === null) throw new CliError(3, `explorer.exe could not be verified — ${PRINT_HINT}`);
+    return { bin, ignoreExit1: true };
+  }
+  if (e.platform === 'linux') {
+    const wanted = isWslEnv(e) ? WSLVIEW_BIN : XDG_OPEN_BIN;
+    const bin = await trust([wanted]);
+    if (bin === null) throw new CliError(3, `${wanted} is missing or not trusted — ${PRINT_HINT}`);
+    return { bin, ignoreExit1: false };
+  }
+  throw new CliError(3, `no browser launcher for ${e.platform} — ${PRINT_HINT}`);
+}
+
 /** `spawn` with an argument array, no shell — the URL never passes an interpreter. */
 function launchBrowser(url: string): Promise<void> {
   return new Promise((resolvePromise, reject) => {
-    const child = spawn(OPEN_BIN, [url], { stdio: 'ignore', shell: false });
-    child.on('error', () =>
-      reject(
-        new CliError(3, `could not run ${OPEN_BIN} — use \`ledger open --print\``),
-      ),
-    );
-    child.on('close', (code) => {
-      if (code === 0) resolvePromise();
-      else
-        reject(
-          new CliError(3, `${OPEN_BIN} exited with code ${code} — use \`ledger open --print\``),
+    // Defence in depth: assertLoginUrl already produced this from a parsed URL.
+    if (/[\s"\x00-\x1f\x7f]/.test(url)) {
+      reject(new CliError(4, 'refusing to launch a URL with unsafe characters'));
+      return;
+    }
+    planLauncher({ platform: process.platform, env: process.env, release: os.release() }).then(
+      (plan) => {
+        const child = spawn(plan.bin, [url], { stdio: 'ignore', shell: false, windowsHide: true });
+        child.on('error', () =>
+          reject(new CliError(3, `could not run ${plan.bin} — ${PRINT_HINT}`)),
         );
-    });
+        child.on('close', (code) => {
+          if (code === 0 || (plan.ignoreExit1 && code === 1)) resolvePromise();
+          else reject(new CliError(3, `${plan.bin} exited with code ${code} — ${PRINT_HINT}`));
+        });
+      },
+      reject,
+    );
   });
 }
 
 export interface OpenDeps {
-  /** Injectable for tests — production runs `/usr/bin/open`. */
+  /** Injectable for tests — production picks the OS launcher (planLauncher). */
   launch?: (url: string) => Promise<void>;
 }
 

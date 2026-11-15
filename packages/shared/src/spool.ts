@@ -32,21 +32,26 @@
  */
 
 import {
-  lstat,
-  mkdir,
   open as openFile,
   readFile,
   readdir,
   rename,
   rm,
   stat,
-  writeFile,
 } from 'node:fs/promises';
-import { constants as fsConstants, createReadStream } from 'node:fs';
+import { createReadStream } from 'node:fs';
 import { createInterface } from 'node:readline';
 import { createHmac, randomBytes, timingSafeEqual } from 'node:crypto';
 import { homedir } from 'node:os';
 import { dirname, isAbsolute, join, resolve } from 'node:path';
+import {
+  assertPrivateDir,
+  ensurePrivateDir,
+  isRootOwnedTrustedParent,
+  openPrivate,
+  TrustError,
+  type TrustHandle,
+} from './platformTrust.ts';
 import { scanSecrets } from './secrets.ts';
 
 /**
@@ -210,91 +215,33 @@ export function spoolDir(env: NodeJS.ProcessEnv = process.env): string {
 }
 
 /**
- * Create the spool directory chain with the same guarantees as `install.sh`:
- * every component from `$HOME` down must be a real directory owned by us and not
- * writable by group or other. A symlinked or group-writable component is refused
- * rather than fixed — silently chmod'ing somebody's directory is worse.
+ * Map a platformTrust refusal to the CLI exit code spool failures carry (4). Anything
+ * that is not a TrustError (ENOSPC, EACCES, ...) is rethrown untouched.
+ */
+function toSpoolError(err: unknown): unknown {
+  if (err instanceof TrustError) return new SpoolError(4, `spool: ${err.message}`);
+  return err;
+}
+
+/**
+ * Create the spool directory chain, or verify it when it exists. The trust decision
+ * (every component from `$HOME` down is a real directory owned by us and not writable
+ * by group or other; a symlinked or group-writable component is refused rather than
+ * fixed; win32: owner + protected DACL) lives in platformTrust, shared with the token
+ * and the ledger. A refusal surfaces as `SpoolError(4)`.
  */
 export async function ensureSpoolDir(dir: string): Promise<string> {
-  const home = homedir();
-  const parts: string[] = [];
-  let cursor = dir;
-  // Walk up to $HOME collecting the components we may have to create.
-  while (cursor !== home && cursor !== dirname(cursor)) {
-    parts.unshift(cursor);
-    cursor = dirname(cursor);
-  }
-  if (cursor !== home) {
-    // Outside $HOME (a test tmpdir, or LEDGER_SPOOL_DIR pointing elsewhere): we
-    // cannot walk a chain we do not own, so only the leaf and its immediate
-    // parent are checked. checking only the leaf let a symlinked
-    // *parent* redirect the whole spool tree — `mkdir(dir, {recursive:true})`
-    // happily creates `dir` through a symlinked parent, and the leaf itself
-    // (the newly created real directory) passes `assertSafeDir` cleanly.
-    await assertSafeParentDir(dir);
-    await mkdir(dir, { recursive: true, mode: 0o700 });
-    await assertSafeDir(dir);
-    return dir;
-  }
-  for (const part of parts) {
-    await mkdir(part, { mode: 0o700 }).catch((err: NodeJS.ErrnoException) => {
-      if (err.code !== 'EEXIST') throw err;
-    });
-    await assertSafeDir(part);
+  try {
+    await ensurePrivateDir(dir);
+  } catch (err) {
+    throw toSpoolError(err);
   }
   return dir;
 }
 
-/** At least the immediate parent of an out-of-`$HOME` spool dir must
- *  not be a symlink and must be owned by us. Missing parent is fine — `mkdir`
- *  creates it directly, nothing to redirect through. */
-async function assertSafeParentDir(dir: string): Promise<void> {
-  const parent = dirname(dir);
-  if (parent === dir) return;
-  let st;
-  try {
-    st = await lstat(parent);
-  } catch (err) {
-    if ((err as NodeJS.ErrnoException).code === 'ENOENT') return;
-    throw err;
-  }
-  if (st.isSymbolicLink()) {
-    throw new SpoolError(4, `spool: ${parent} is a symlink — refusing to write there`);
-  }
-  if (st.uid !== process.getuid?.() && !isTrustedRootParent(st)) {
-    throw new SpoolError(4, `spool: ${parent} is not owned by you — refusing to write there`);
-  }
-}
-
-/** A root-owned parent we may sit under: either not writable by group/other
- *  (e.g. `0755`), or sticky (`/tmp` on Linux: root, `1777`). The sticky bit means nobody but the
- *  entry's owner (or root) can rename or replace our directory inside it, so a
- *  root-owned *sticky* parent cannot be used to redirect the spool. A root-owned
- *  parent that others can write to WITHOUT the sticky bit is still refused. */
-export function isTrustedRootParent(st: { uid: number; mode: number }): boolean {
-  if (st.uid !== 0) return false;
-  const othersCanWrite = (st.mode & 0o022) !== 0;
-  return !othersCanWrite || (st.mode & 0o1000) !== 0;
-}
-
-async function assertSafeDir(dir: string): Promise<void> {
-  // `lstat` semantics matter: `stat` would follow a symlink and approve the
-  // target's mode while the link itself is the attack. this used to
-  // call `stat`, which does exactly that — a symlinked component anywhere in
-  // the chain sailed through on the target's mode/owner.
-  const st = await lstat(dir);
-  if (st.isSymbolicLink()) {
-    throw new SpoolError(4, `spool: ${dir} is a symlink — refusing to write there`);
-  }
-  if (!st.isDirectory()) throw new SpoolError(4, `spool: ${dir} is not a directory`);
-  if (st.uid !== process.getuid?.()) {
-    throw new SpoolError(4, `spool: ${dir} is not owned by you — refusing to write there`);
-  }
-  // 0o022 = group-write | other-write.
-  if ((st.mode & 0o022) !== 0) {
-    throw new SpoolError(4, `spool: ${dir} is writable by group/other — run \`chmod 700\``);
-  }
-}
+/** A root-owned parent we may sit under (`/tmp`: root, sticky). Kept as a re-export:
+ *  the rule itself moved into the platformTrust POSIX backend, unchanged. */
+export const isTrustedRootParent = isRootOwnedTrustedParent;
 
 function sessionFile(dir: string, session: string | null): string {
   // The session id is an agent-supplied uuid; the pid fallback keeps two concurrent
@@ -392,27 +339,58 @@ export async function enqueue(
 }
 
 /**
- * Append with `O_NOFOLLOW` and an owner check on the open fd.
- *
- * `appendFile` follows a symlink at `file` and happily appends through it —
- * another local user could pre-create `<session>.jsonl` as a symlink to
- * anything writable by this uid (or, worse, have it re-created between two
- * calls) and have ledger content written wherever they pointed it. Opening
- * with `O_NOFOLLOW` makes that `ELOOP`, and `fstat`-ing the already-open fd
- * (not the path, which is a second, racy syscall) confirms the file this
- * process is actually writing to is still ours.
+ * Append through platformTrust.openPrivate: the file is opened without following links
+ * and identity / ownership are verified on the open descriptor (not the path, which is a
+ * second, racy syscall). `appendFile` would follow a symlink at `file` and write
+ * wherever another local user pointed it.
  */
 async function safeAppend(file: string, data: string): Promise<void> {
-  const flags = fsConstants.O_WRONLY | fsConstants.O_APPEND | fsConstants.O_CREAT | fsConstants.O_NOFOLLOW;
-  const handle = await openFile(file, flags, 0o600);
+  let handle: TrustHandle;
   try {
-    const st = await handle.stat();
-    if (st.uid !== process.getuid?.()) {
-      throw new SpoolError(4, `spool: ${file} is not owned by you — refusing to write there`);
-    }
-    await handle.appendFile(data, 'utf8');
+    handle = await openPrivate(file, 'append', 0o600);
+  } catch (err) {
+    throw toSpoolError(err);
+  }
+  try {
+    await handle.writeFile(data);
   } finally {
     await handle.close();
+  }
+}
+
+/**
+ * Atomic private rewrite: the data goes to a random-named, exclusively created 0600
+ * sibling (never a predictable `${file}.tmp` an attacker could pre-plant as a symlink or
+ * hard link), is synced, then renamed over `file`. The containing directory is verified
+ * private first. A failure removes the temp file.
+ */
+async function writePrivateAtomic(file: string, text: string): Promise<void> {
+  try {
+    await assertPrivateDir(dirname(file));
+  } catch (err) {
+    throw toSpoolError(err);
+  }
+  const tmp = `${file}.${randomBytes(8).toString('hex')}.tmp`;
+  let handle: TrustHandle;
+  try {
+    handle = await openPrivate(tmp, 'excl', 0o600);
+  } catch (err) {
+    throw toSpoolError(err);
+  }
+  try {
+    await handle.writeFile(text);
+    await handle.sync();
+  } catch (err) {
+    await handle.close().catch(() => undefined);
+    await rm(tmp, { force: true }).catch(() => undefined);
+    throw err;
+  }
+  await handle.close();
+  try {
+    await rename(tmp, file);
+  } catch (err) {
+    await rm(tmp, { force: true }).catch(() => undefined);
+    throw err;
   }
 }
 
@@ -494,7 +472,12 @@ async function forEachSpoolLine(
 
 async function quarantineOversizedFile(dir: string, file: string): Promise<void> {
   const failedDir = join(dir, 'failed');
-  await mkdir(failedDir, { recursive: true, mode: 0o700 }).catch(() => undefined);
+  // Fail-closed: if `failed/` cannot be verified private the file stays where it is.
+  try {
+    await ensurePrivateDir(failedDir);
+  } catch {
+    return;
+  }
   const base = file.split(/[/\\]/).pop() ?? 'spool.jsonl';
   await rename(file, join(failedDir, `oversized-${Date.now()}-${base}`)).catch(() => undefined);
 }
@@ -747,9 +730,7 @@ async function pruneSpool(dir: string, done: Set<string>): Promise<void> {
       continue;
     }
     // tmp + rename: a reader never sees a half-rewritten spool file.
-    const tmp = `${file}.tmp`;
-    await writeFile(tmp, `${keep.join('\n')}\n`, { encoding: 'utf8', mode: 0o600 });
-    await rename(tmp, file);
+    await writePrivateAtomic(file, `${keep.join('\n')}\n`);
   }
 }
 
@@ -758,7 +739,11 @@ async function moveToFailed(
   records: { record: SpoolRecord; reason: string }[],
 ): Promise<void> {
   const failedDir = join(dir, 'failed');
-  await mkdir(failedDir, { recursive: true, mode: 0o700 }).catch(() => undefined);
+  try {
+    await ensurePrivateDir(failedDir);
+  } catch (err) {
+    throw toSpoolError(err);
+  }
   const file = join(failedDir, `${new Date().toISOString().slice(0, 10)}.jsonl`);
   const lines = records
     .map((r) => JSON.stringify({ ...r.record, failed_at: Date.now(), reason: r.reason }))
@@ -827,9 +812,7 @@ async function rewriteFailedFile(file: string, keep: FailedSpoolRecord[]): Promi
     await rm(file, { force: true }).catch(() => undefined);
     return;
   }
-  const tmp = `${file}.tmp`;
-  await writeFile(tmp, `${keep.map((r) => JSON.stringify(r)).join('\n')}\n`, { encoding: 'utf8', mode: 0o600 });
-  await rename(tmp, file);
+  await writePrivateAtomic(file, `${keep.map((r) => JSON.stringify(r)).join('\n')}\n`);
 }
 
 export interface RetryResult extends ReplayResult {

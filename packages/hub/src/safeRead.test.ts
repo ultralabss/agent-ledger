@@ -16,7 +16,7 @@ import { link, mkdir, mkdtemp, realpath, rm, symlink, writeFile } from 'node:fs/
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
-import { readHeadVerified, readTailVerified, resolveRoots } from './safeRead.ts';
+import { matchedRoot, parentChain, readHeadVerified, readTailVerified, resolveRoots, snapshotChain } from './safeRead.ts';
 import { readTranscriptTitle } from './transcript.ts';
 
 interface Fixture {
@@ -168,4 +168,26 @@ test('a path outside the roots is not read at all', async (t) => {
   assert.equal(await readTranscriptTitle(fx.file, []), null);
   assert.equal(await readTranscriptTitle('', fx.roots), null);
   assert.equal(await readTranscriptTitle(null, fx.roots), null);
+});
+
+test('S4: matchedRoot casefolds and unifies separators on win32 only', () => {
+  const roots = ['C:\\Users\\Me\\.claude'];
+  assert.equal(matchedRoot('c:/users/me/.CLAUDE/projects/x.jsonl', roots, 'win32'), roots[0]);
+  assert.equal(matchedRoot('C:\\Users\\Me\\.claude', roots, 'win32'), roots[0], 'the root itself');
+  assert.equal(matchedRoot('C:\\Users\\Me\\.claude-evil\\x', roots, 'win32'), null, 'prefix is not containment');
+  assert.equal(matchedRoot('D:\\Users\\Me\\.claude\\x', roots, 'win32'), null);
+  // POSIX stays case-sensitive: a different case is a different directory.
+  assert.equal(matchedRoot('/home/me/.CLAUDE/x', ['/home/me/.claude'], 'linux'), null);
+  assert.equal(matchedRoot('/home/me/.claude/x', ['/home/me/.claude'], 'linux'), '/home/me/.claude');
+});
+
+test('S4: chain snapshots carry bigint dev/ino (no Number precision loss)', async (t) => {
+  const fx = await fixture('x');
+  t.after(fx.cleanup);
+  const snaps = await snapshotChain(parentChain(fx.root, fx.file));
+  assert.ok(snaps !== null && snaps.length > 0);
+  for (const s of snaps) {
+    assert.equal(typeof s.dev, 'bigint');
+    assert.equal(typeof s.ino, 'bigint');
+  }
 });

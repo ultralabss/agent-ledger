@@ -21,8 +21,9 @@
  */
 
 import { spawn } from 'node:child_process';
-import { join } from 'node:path';
+import { dirname, join, win32 as winPath } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { resolveTrustedExecutable } from '@agent-ledger/shared';
 import { verifyManagedBinary, type ManagedBinary } from './managedbin.ts';
 
 /**
@@ -36,8 +37,46 @@ import { verifyManagedBinary, type ManagedBinary } from './managedbin.ts';
  */
 export const GITLEAKS_REL_PATH = '.hub/bin/gitleaks';
 
-export function gitleaksPath(ledgerRoot: string): string {
-  return join(ledgerRoot, GITLEAKS_REL_PATH);
+/** The release asset for win32 is `gitleaks.exe`; CreateProcess does not apply PATHEXT to an absolute path. */
+export function gitleaksPath(ledgerRoot: string, platform: NodeJS.Platform = process.platform): string {
+  return join(ledgerRoot, platform === 'win32' ? `${GITLEAKS_REL_PATH}.exe` : GITLEAKS_REL_PATH);
+}
+
+const WIN_SYSTEM_ROOT_RE = /^[A-Za-z]:\\[^\\/:*?"<>|\r\n]+$/;
+
+/**
+ * S7/I3: the scanner's environment. POSIX keeps the fixed minimal PATH. On win32 the PATH is
+ * built from absolute, trust-checked locations only (the directory of the verified git.exe plus
+ * `%SystemRoot%\System32`), never inherited — gitleaks execs `git` and must not find a planted one.
+ * No value is taken from the hub environment except a validated `SystemRoot`.
+ */
+export function scanEnv(
+  platform: NodeJS.Platform,
+  hostEnv: NodeJS.ProcessEnv,
+  cwd: string,
+  gitDir: string | null,
+): Record<string, string> {
+  if (platform !== 'win32') return { PATH: '/usr/bin:/bin', HOME: cwd, GITLEAKS_NO_UPDATE: '1' };
+  const env: Record<string, string> = { HOME: cwd, USERPROFILE: cwd, GITLEAKS_NO_UPDATE: '1' };
+  const root = hostEnv.SystemRoot ?? hostEnv.SYSTEMROOT ?? '';
+  if (WIN_SYSTEM_ROOT_RE.test(root)) {
+    env.SystemRoot = root;
+    const dirs = [gitDir, `${root}\\System32`].filter((d): d is string => d !== null && /^[A-Za-z]:\\/.test(d));
+    env.PATH = dirs.join(';');
+  }
+  return env;
+}
+
+/** win32 only: directory of a trust-verified git.exe (same candidates as `git.ts`), else null. */
+async function trustedWinGitDir(env: NodeJS.ProcessEnv): Promise<string | null> {
+  const candidates = [
+    env.ProgramW6432 === undefined ? undefined : `${env.ProgramW6432}\\Git\\cmd\\git.exe`,
+    env.ProgramFiles === undefined ? undefined : `${env.ProgramFiles}\\Git\\cmd\\git.exe`,
+    env.LOCALAPPDATA === undefined ? undefined : `${env.LOCALAPPDATA}\\Programs\\Git\\cmd\\git.exe`,
+  ].filter((c): c is string => c !== undefined && /^[A-Za-z]:\\/.test(c));
+  if (candidates.length === 0) return null;
+  const info = await resolveTrustedExecutable(candidates);
+  return info.path === null ? null : winPath.dirname(info.path);
 }
 
 const TIMEOUT_MS = 10_000;
@@ -140,7 +179,13 @@ interface RunResult {
   stderr: string;
 }
 
-function run(bin: string, args: string[], cwd: string, timeoutMs = TIMEOUT_MS): Promise<RunResult> {
+function run(
+  bin: string,
+  args: string[],
+  cwd: string,
+  timeoutMs = TIMEOUT_MS,
+  env: Record<string, string> = scanEnv(process.platform, process.env, cwd, null),
+): Promise<RunResult> {
   return new Promise((resolvePromise) => {
     // `spawn` can throw SYNCHRONOUSLY (ENOEXEC on a file that passed
     // every permission check but is not a program, EACCES, ENOMEM) — the
@@ -164,8 +209,11 @@ function run(bin: string, args: string[], cwd: string, timeoutMs = TIMEOUT_MS): 
         // real user's — scoped to the scanned root (same allowlist spirit as
         // `headless.ts`'s `ENV_ALLOWLIST`), so gitleaks cannot resolve `~` into
         // the actual user's home (global gitleaks config, shell rc files, etc).
-        env: { PATH: '/usr/bin:/bin', HOME: cwd, GITLEAKS_NO_UPDATE: '1' },
+        // See `scanEnv` (win32: absolute trust-checked PATH only).
+        env,
         stdio: ['ignore', 'pipe', 'pipe'],
+        shell: false,
+        windowsHide: true,
       });
     } catch (err) {
       resolvePromise({ code: -1, stdout: '', stderr: `spawn failed: ${String(err)}` });
@@ -289,15 +337,22 @@ export async function scanStaged(
   // a `.gitleaks.toml` planted inside the ledger must never be picked up.
   const configArgs = ['--config', DEFAULT_CONFIG_PATH];
   const budget = opts.timeoutMs ?? TIMEOUT_MS;
+  const env = scanEnv(
+    process.platform,
+    process.env,
+    root,
+    process.platform === 'win32' ? await trustedWinGitDir(process.env) : null,
+  );
   let res = await run(
     bin,
     ['protect', '--staged', '--no-banner', '--redact', ...configArgs],
     root,
     budget,
+    env,
   );
   // Unknown subcommand (newer gitleaks): retry with the modern spelling.
   if (res.code !== 0 && res.code !== 1 && /unknown command|unknown flag/i.test(res.stderr)) {
-    res = await run(bin, ['git', '--staged', '--no-banner', '--redact', ...configArgs], root, budget);
+    res = await run(bin, ['git', '--staged', '--no-banner', '--redact', ...configArgs], root, budget, env);
   }
 
   // A scanner that was supposed to run and did not finish is

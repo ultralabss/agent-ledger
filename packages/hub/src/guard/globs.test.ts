@@ -2,7 +2,16 @@
 
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { isExcludedPath, isLedgerContextFile, matchAny, matchGlob } from './globs.ts';
+import nodePath from 'node:path';
+import {
+  canonicalRel,
+  checkoutCaseInsensitive,
+  isExcludedPath,
+  isLedgerContextFile,
+  matchAny,
+  matchGlob,
+  resetCaseCache,
+} from './globs.ts';
 
 test('matchGlob: `**` crosses `/`, `*` does not', () => {
   assert.equal(matchGlob('apps/server/src/auth/**', 'apps/server/src/auth/guard.ts'), true);
@@ -128,4 +137,127 @@ test('S2: `**` across levels, `[!…]` and ranges in a class', () => {
   assert.equal(matchGlob('[a-c]/a.ts', 'b/a.ts'), true);
   assert.equal(matchGlob('[a-c]/a.ts', 'd/a.ts'), false);
   assert.equal(matchGlob('a[.ts', 'a[.ts'), true, 'an unclosed class is a literal');
+});
+
+/* ---------------- S8 / T11: canonicalRel + case-insensitive claim matching ---------------- */
+
+/** Fake `realpath.native` of a case-insensitive Windows volume: lookup folds case, answer keeps the on-disk spelling. */
+function winFs(entries: Record<string, string>): (p: string) => Promise<string> {
+  const norm = (p: string): string => nodePath.win32.normalize(p).replace(/[\\/]+$/, '').toLowerCase();
+  const table = new Map(Object.entries(entries).map(([k, v]) => [norm(k), v]));
+  return async (p) => {
+    const hit = table.get(norm(p));
+    if (hit === undefined) throw Object.assign(new Error('ENOENT'), { code: 'ENOENT' });
+    return hit;
+  };
+}
+
+const WIN_FS = winFs({
+  'C:\\repo': 'C:\\repo',
+  'C:\\': 'C:\\',
+  'C:\\repo\\src': 'C:\\repo\\Src',
+  'C:\\repo\\src\\auth': 'C:\\repo\\Src\\Auth',
+  'C:\\repo\\src\\auth\\x.ts': 'C:\\repo\\Src\\Auth\\x.ts',
+  'C:\\repo\\caf\u00e9.ts': 'C:\\repo\\cafe\u0301.ts',
+  'C:\\repo\\progra~1': 'C:\\repo\\Program Files',
+  'C:\\repo\\link': 'D:\\elsewhere',
+  'C:\\repo\\link\\x.ts': 'D:\\elsewhere\\x.ts',
+});
+const win = { platform: 'win32' as const, realpath: WIN_FS };
+
+test('S8 canonicalRel(win32): on-disk casing, NFC, relative input joined to the checkout', async () => {
+  assert.deepEqual(await canonicalRel('C:\\repo', 'c:\\REPO\\src\\auth\\X.TS', win), { ok: true, rel: 'Src/Auth/x.ts' });
+  assert.deepEqual(await canonicalRel('C:\\repo', 'src\\auth\\x.ts', win), { ok: true, rel: 'Src/Auth/x.ts' });
+  // decomposed é on disk -> composed in the canonical spelling
+  assert.deepEqual(await canonicalRel('C:\\repo', 'C:\\repo\\caf\u00e9.ts', win), { ok: true, rel: 'caf\u00e9.ts' });
+  // 8.3 alias of an EXISTING file is resolved by the OS to the long name
+  assert.deepEqual(await canonicalRel('C:\\repo', 'C:\\repo\\PROGRA~1', win), { ok: true, rel: 'Program Files' });
+  // a new file: nearest existing ancestor + tail
+  assert.deepEqual(await canonicalRel('C:\\repo', 'C:\\repo\\src\\auth\\new.ts', win), { ok: true, rel: 'Src/Auth/new.ts' });
+  assert.deepEqual(await canonicalRel('C:\\repo', 'C:\\repo', win), { ok: true, rel: '' });
+});
+
+test('S8 canonicalRel(win32): ADS, trailing dot/space, device names, namespaces, short names, escapes are refused', async () => {
+  const refused = [
+    'C:\\repo\\a.ts::$DATA',
+    'C:\\repo\\a.ts:evil',
+    'C:\\repo\\src\\auth\\x.ts::$DATA',
+    'C:\\repo\\a.ts.',
+    'C:\\repo\\a.ts ',
+    'C:\\repo\\src\\auth.\\new.ts',
+    'C:\\repo\\CON',
+    'C:\\repo\\nul.txt',
+    'C:\\repo\\COM1',
+    'C:\\repo\\LPT\u00b9.log',
+    '\\\\?\\C:\\repo\\a.ts',
+    '\\\\.\\C:\\repo\\a.ts',
+    'C:\\repo\\NEWFIL~1.TXT',
+    'C:evil.ts',
+    'C:\\repo\\..\\x',
+    'C:\\repo\\src\\..\\..\\x',
+    'C:\\repo\\link\\x.ts', // junction out of the checkout
+    'C:\\repo\\a<b.ts',
+    'C:\\repo\\a\0b.ts',
+    '',
+  ];
+  for (const p of refused) {
+    const r = await canonicalRel('C:\\repo', p, win);
+    assert.equal(r.ok, false, JSON.stringify(p));
+  }
+});
+
+test('S8 canonicalRel(posix): colons/device names are ordinary names; escape and `..` tails are still refused', async () => {
+  const entries = new Set(['/r', '/r/src']);
+  // Like the OS: every component must exist before a following `..` is applied.
+  const realpath = async (p: string): Promise<string> => {
+    let cur = '';
+    for (const seg of p.split('/').filter((x) => x !== '')) {
+      if (seg === '..') {
+        cur = nodePath.posix.dirname(cur) === '.' ? '' : nodePath.posix.dirname(cur);
+        continue;
+      }
+      const next = `${cur}/${seg}`;
+      if (!entries.has(next)) throw Object.assign(new Error('ENOENT'), { code: 'ENOENT' });
+      cur = next;
+    }
+    return cur === '' ? '/' : cur;
+  };
+  const deps = { platform: 'linux' as const, realpath };
+  assert.deepEqual(await canonicalRel('/r', '/r/src/a:b.ts', deps), { ok: true, rel: 'src/a:b.ts' });
+  assert.deepEqual(await canonicalRel('/r', '/r/CON', deps), { ok: true, rel: 'CON' });
+  assert.equal((await canonicalRel('/r', '/elsewhere/x', deps)).ok, false);
+  assert.equal((await canonicalRel('/r', '/r/nope/../../x', deps)).ok, false);
+  assert.equal((await canonicalRel('/r', '/r/nope/../y', deps)).ok, false, '`..` after a missing dir is not resolved lexically');
+});
+
+test('T11: claim `src/auth/**` blocks `SRC/Auth/x.ts` only on a case-insensitive volume', () => {
+  assert.equal(matchGlob('src/auth/**', 'SRC/Auth/x.ts'), false, 'case-sensitive volume: exact');
+  assert.equal(matchGlob('src/auth/**', 'SRC/Auth/x.ts', { caseInsensitive: true }), true);
+  assert.equal(matchGlob('SRC/AUTH/**', 'src/auth/x.ts', { caseInsensitive: true }), true);
+  assert.equal(matchGlob('src/[A-C]*.ts', 'src/Bar.ts', { caseInsensitive: true }), true);
+  assert.equal(matchAny(['docs/**', 'Src/Auth'], 'src/auth/deep/x.ts', { caseInsensitive: true }), 'Src/Auth');
+  // NFD on one side, NFC on the other: the same name
+  assert.equal(matchGlob('docs/caf\u00e9.md', 'docs/cafe\u0301.md'), true);
+  assert.equal(matchGlob('docs/cafe\u0301.md', 'docs/caf\u00e9.md'), true);
+  // folding never turns a different name into a match
+  assert.equal(matchGlob('src/auth/**', 'src/author/x.ts', { caseInsensitive: true }), false);
+});
+
+test('S8 checkoutCaseInsensitive: cached 10 min, clock jumps re-probe, probe failure => true (widens claims only)', async () => {
+  resetCaseCache();
+  let calls = 0;
+  let t = 1_000_000;
+  const o = { now: () => t, probe: async () => (calls += 1, false) };
+  assert.equal(await checkoutCaseInsensitive('/c1', o), false);
+  assert.equal(await checkoutCaseInsensitive('/c1', o), false);
+  assert.equal(calls, 1);
+  t += 11 * 60 * 1000;
+  await checkoutCaseInsensitive('/c1', o);
+  assert.equal(calls, 2);
+  t -= 60 * 60 * 1000; // clock jumped back an hour
+  await checkoutCaseInsensitive('/c1', o);
+  assert.equal(calls, 3);
+  const boom = { now: () => t, probe: async (): Promise<boolean> => { throw new Error('x'); } };
+  assert.equal(await checkoutCaseInsensitive('/c2', boom), true);
+  resetCaseCache();
 });

@@ -9,7 +9,7 @@ import test from 'node:test';
 import { skipOnWin32 } from '@agent-ledger/shared/testing';
 import { git, LedgerGit } from './git.ts';
 import { createHash } from 'node:crypto';
-import { gitleaksInfoFor, resetGitleaksCache, scanStaged, summariseFindings } from './gitleaks.ts';
+import { gitleaksInfoFor, gitleaksPath, resetGitleaksCache, scanEnv, scanStaged, summariseFindings } from './gitleaks.ts';
 
 /** A8-4: the hub only runs the install-managed copy, so every fake binary in
  *  this file also gets the 0500 mode and the recorded sha256 the install
@@ -340,4 +340,29 @@ test('ahead/behind and the last push are read from the ledger repo', async (t) =
   assert.equal(restarted.status.ahead, 2);
   assert.equal(restarted.status.behind, 0);
   assert.ok(restarted.status.lastPushAt, 'last push time comes from the origin/main reflog');
+});
+
+test('S7: gitleaksPath carries .exe on win32 only; scanEnv never inherits PATH', async () => {
+  assert.match(gitleaksPath('/l', 'win32').replaceAll('\\', '/'), /\/\.hub\/bin\/gitleaks\.exe$/);
+  assert.match(gitleaksPath('/l', 'linux'), /\/\.hub\/bin\/gitleaks$/);
+  assert.deepEqual(scanEnv('linux', { PATH: '/evil' }, '/l', null), {
+    PATH: '/usr/bin:/bin',
+    HOME: '/l',
+    GITLEAKS_NO_UPDATE: '1',
+  });
+  const host = { SystemRoot: 'C:\\Windows', PATH: 'C:\\evil', Path: 'C:\\evil' };
+  const withGit = scanEnv('win32', host, 'D:\\ledger', 'C:\\Program Files\\Git\\cmd');
+  assert.equal(withGit.PATH, 'C:\\Program Files\\Git\\cmd;C:\\Windows\\System32');
+  assert.equal(withGit.HOME, 'D:\\ledger');
+  assert.equal(withGit.USERPROFILE, 'D:\\ledger');
+  assert.ok(!JSON.stringify(withGit).includes('evil'));
+  assert.equal(scanEnv('win32', host, 'D:\\l', null).PATH, 'C:\\Windows\\System32');
+  // Hostile SystemRoot: no PATH at all (the scan then fails closed), nothing relative ever lands in it.
+  for (const bad of ['', 'Windows', '\\\\srv\\x', 'C:\\Windows\\..', 'C:\\a;C:\\evil']) {
+    const e = scanEnv('win32', { SystemRoot: bad }, 'D:\\l', 'relative\\dir');
+    assert.equal(e.PATH, undefined, bad);
+    assert.equal(e.SystemRoot, undefined);
+  }
+  // A relative git dir is dropped even with a good SystemRoot.
+  assert.equal(scanEnv('win32', host, 'D:\\l', 'relative\\dir').PATH, 'C:\\Windows\\System32');
 });

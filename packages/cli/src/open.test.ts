@@ -8,7 +8,7 @@ import { startTestHub } from '@agent-ledger/hub/test-helpers';
 import { parseArgs } from './args.ts';
 import { CliError, HubClient, readEnvConfig, type CliEnvConfig } from './client.ts';
 import type { Io } from './index.ts';
-import { cmdOpen, safeUiPath } from './open.ts';
+import { cmdOpen, planLauncher, safeUiPath } from './open.ts';
 
 function io(): Io & { lines: string[]; errs: string[] } {
   const lines: string[] = [];
@@ -188,4 +188,42 @@ test('safeUiPath: only a relative path on the hub origin passes', () => {
   for (const bad of ['//evil', '/\\evil', '/%2f%2fevil', 'https://evil', 'x', '', '/a b', '/%zz']) {
     assert.equal(safeUiPath(bad), null, bad);
   }
+});
+
+test('planLauncher: per-OS absolute launcher, never a PATH lookup', async () => {
+  const seen: string[][] = [];
+  const trust = async (c: readonly string[]): Promise<string | null> => {
+    seen.push([...c]);
+    return c[0] ?? null;
+  };
+  const win = await planLauncher({
+    platform: 'win32',
+    env: { SystemRoot: 'C:\\Windows' },
+    release: '',
+    trust,
+  });
+  assert.deepEqual(win, { bin: 'C:\\Windows\\explorer.exe', ignoreExit1: true });
+  const lin = await planLauncher({ platform: 'linux', env: {}, release: '6.1.0-generic', trust });
+  assert.deepEqual(lin, { bin: '/usr/bin/xdg-open', ignoreExit1: false });
+  const wsl = await planLauncher({ platform: 'linux', env: {}, release: '5.15.0-microsoft-standard-WSL2', trust });
+  assert.deepEqual(wsl, { bin: '/usr/bin/wslview', ignoreExit1: false });
+  const mac = await planLauncher({ platform: 'darwin', env: {}, release: '', trust });
+  assert.equal(mac.bin, '/usr/bin/open');
+  for (const c of seen) assert.ok(c.every((p) => p.startsWith('/') || /^[A-Za-z]:\\/.test(p)));
+});
+
+test('planLauncher: malformed SystemRoot / untrusted launcher end in exit 3 with the --print hint', async () => {
+  const untrusted = async (): Promise<string | null> => null;
+  for (const root of ['', 'Windows', '\\\\srv\\share', 'C:\\Windows\\..\\x', 'C:\\a"b', 'C:\\']) {
+    const err = await planLauncher({ platform: 'win32', env: { SystemRoot: root }, release: '', trust: untrusted }).then(
+      () => null,
+      (e: unknown) => e,
+    );
+    assert.ok(err instanceof CliError && err.exitCode === 3, `root ${JSON.stringify(root)}`);
+  }
+  const err = await planLauncher({ platform: 'linux', env: {}, release: 'microsoft', trust: untrusted }).then(
+    () => null,
+    (e: unknown) => e,
+  );
+  assert.ok(err instanceof CliError && /--print/.test(err.message));
 });

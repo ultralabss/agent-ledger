@@ -34,11 +34,15 @@ systemd user unit on Linux).
   stops with a clear message (it never silently continues). Re-run with
   `./install.sh --port <n>` (or `LEDGER_HUB_PORT=<n>`). Use the same port for
   every `ledger` command afterwards (`export LEDGER_HUB_PORT=<n>`).
-- gitleaks (second secret check before every ledger commit) is downloaded and
-  checksum-verified. Only if that fails and `brew` exists does the installer
-  offer `brew install gitleaks`; that writes outside `$HOME`, so it happens only
-  with `./install.sh --allow-brew` (or an interactive yes). Do not pass
-  `--allow-brew` unless the user agreed.
+- gitleaks (second secret check before every ledger commit) is downloaded from the official
+  GitHub release and verified against the sha256 pins in the repository
+  (`ops/gitleaks-pins.json`: version + digest per asset). The digest is never fetched from the
+  network, and there is no `GITLEAKS_VERSION=` override: to upgrade gitleaks, change the pins
+  file (version and digests from the official `gitleaks_<ver>_checksums.txt`) in a reviewed
+  commit and re-run `./install.sh`. A digest mismatch discards the download. Only if the
+  download fails and `brew` exists does the installer offer `brew install gitleaks`; that
+  writes outside `$HOME`, so it happens only with `./install.sh --allow-brew` (or an
+  interactive yes). Do not pass `--allow-brew` unless the user agreed.
 - `~/.local/bin` must be in `PATH` (the installer prints a note if it is not).
 
 ## 3. Verify the hub is THIS ledger's hub

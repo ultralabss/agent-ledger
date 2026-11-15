@@ -7,8 +7,9 @@
  * reach outside it — and a pattern is never used as a filesystem path.
  */
 
-import { sep } from 'node:path';
-import { slugSchema } from '@agent-ledger/shared';
+import { realpath as fsRealpath } from 'node:fs';
+import nodePath, { sep } from 'node:path';
+import { probeCaseInsensitive, slugSchema } from '@agent-ledger/shared';
 
 /** Longest pattern we parse. A longer one is treated as "matches nothing". */
 const MAX_PATTERN = 300;
@@ -21,6 +22,22 @@ interface Parsed {
 }
 
 const cache = new Map<string, Parsed | null>();
+
+/** S8 (T11): matching options. `caseInsensitive` = the checkout's volume ignores case. */
+export interface MatchOpts {
+  caseInsensitive?: boolean;
+}
+
+/**
+ * Pattern and path are both NFC-normalised (a decomposed `é` must not slip past a claim written
+ * with `é`; on a case-sensitive volume this only ever widens a claim, never narrows it) and,
+ * on a case-insensitive volume, case-folded the same way. Over-matching is the safe direction.
+ */
+function foldText(text: string, opts: MatchOpts): string {
+  if (typeof text !== 'string') return text;
+  const nfc = text.normalize('NFC');
+  return opts.caseInsensitive === true ? nfc.toLowerCase() : nfc;
+}
 
 /** `a\b` → `a/b`. `touched.rel_path` is stored `/`-separated; so are patterns. */
 export function toPosix(rel: string): string {
@@ -77,10 +94,10 @@ function build(pattern: string): Parsed | null {
  * "too complex": that would silently turn a claim into "protects nothing",
  * which is a fail-OPEN, and the guard must not have one.
  */
-export function matchGlob(pattern: string, relPath: string): boolean {
-  const parsed = parse(pattern);
+export function matchGlob(pattern: string, relPath: string, opts: MatchOpts = {}): boolean {
+  const parsed = parse(foldText(pattern, opts));
   if (parsed === null) return false;
-  const path = toPosix(relPath)
+  const path = toPosix(foldText(relPath, opts))
     .replace(/^\.\//, '')
     .replace(/^\/+/, '')
     .split('/')
@@ -216,9 +233,9 @@ function matchClass(pat: string, at: number, ch: string): { ok: boolean; next: n
 }
 
 /** First matching pattern, or null. Used for the deny reason text. */
-export function matchAny(patterns: readonly string[], relPath: string): string | null {
+export function matchAny(patterns: readonly string[], relPath: string, opts: MatchOpts = {}): string | null {
   for (const pattern of patterns) {
-    if (matchGlob(pattern, relPath)) return pattern;
+    if (matchGlob(pattern, relPath, opts)) return pattern;
   }
   return null;
 }
@@ -289,4 +306,142 @@ export function isLedgerContextFile(abs: string, ledgerRoot: string): boolean {
   // doubles as the "is it actually a registered-repo-shaped segment" check
   // without needing the repo list here.
   return parts.length === 2 && parts[1] === 'CONTEXT.md' && slugSchema.safeParse(parts[0]).success;
+}
+
+/* ---------------- canonical checkout-relative path (S8, T11) ---------------- */
+
+export type CanonicalRel = { ok: true; rel: string } | { ok: false; reason: string };
+
+export interface CanonicalDeps {
+  platform?: NodeJS.Platform;
+  /** Test seam; production is `fs.realpath.native`. */
+  realpath?: (p: string) => Promise<string>;
+}
+
+const MAX_CANON_PATH = 4096;
+const WIN_DEVICE_RE = /^(?:con|prn|aux|nul|conin\$|conout\$|clock\$|com[1-9\u00b9\u00b2\u00b3]|lpt[1-9\u00b9\u00b2\u00b3])(?:\..*)?$/i;
+/** `PROGRA~1`, `FOO~1.TXT`: a name that may alias a long name that does not exist yet. */
+const WIN_SHORT_NAME_RE = /^[^.]{1,6}~\d+(?:\.[^.]{0,3})?$/;
+
+function nativeRealpath(p: string): Promise<string> {
+  return new Promise((resolvePromise, reject) => {
+    fsRealpath.native(p, (err, out) => (err === null ? resolvePromise(out) : reject(err)));
+  });
+}
+
+/**
+ * Windows-only refusals on the segments of an (absolute, realpath'd or about-to-exist) name:
+ * alternate data streams, trailing dot/space (silently stripped by Win32, so `a.ts.` IS `a.ts`),
+ * device names (`CON`, `NUL.txt`), the `\\?\` / `\\.\` namespaces.
+ */
+function winSegmentProblem(seg: string): string | null {
+  if (seg.includes(':')) return 'alternate data stream or drive in a path segment';
+  if (/[. ]$/.test(seg)) return 'trailing dot or space (Win32 strips it, so the name is not what it looks like)';
+  if (WIN_DEVICE_RE.test(seg)) return 'reserved device name';
+  if (/[<>"|?*\u0000-\u001f]/.test(seg)) return 'invalid character in a Windows name';
+  return null;
+}
+
+/**
+ * The ONE spelling the guard compares against claims and holds: checkout-relative, `/`-separated,
+ * NFC, symlinks/junctions/8.3 aliases resolved by the OS (`realpath.native` of the file, or of its
+ * nearest existing ancestor plus the not-yet-existing tail for a new file).
+ *
+ * Refuses (never guesses) when: the path has a NUL or is absurdly long; the unresolved tail contains
+ * `.`/`..`; the result is outside the checkout; on win32 the raw or resolved name uses `\\?\`, an
+ * ADS `:`, a trailing dot/space, a device name, or a not-yet-existing 8.3 short name.
+ * Case folding is NOT applied here: `rel` is also an exact-match key for `touched` rows, which carry
+ * the on-disk spelling; claim matching folds at match time (`MatchOpts.caseInsensitive`).
+ */
+export async function canonicalRel(checkout: string, p: string, deps: CanonicalDeps = {}): Promise<CanonicalRel> {
+  const platform = deps.platform ?? process.platform;
+  const win = platform === 'win32';
+  const api = win ? nodePath.win32 : nodePath.posix;
+  const realpath = deps.realpath ?? nativeRealpath;
+  const bad = (reason: string): CanonicalRel => ({ ok: false, reason });
+  if (typeof p !== 'string' || p === '' || typeof checkout !== 'string' || checkout === '') return bad('empty path');
+  if (p.includes('\0') || checkout.includes('\0')) return bad('NUL in path');
+  if (p.length > MAX_CANON_PATH) return bad('path too long');
+  if (win && /^[\\/]{2}[?.][\\/]/.test(p)) return bad('Win32 device/extended-length namespace (\\\\?\\ or \\\\.\\)');
+
+  // Not normalised on purpose: `a/link/../b` must be resolved by the OS (link first), not folded
+  // lexically. `..` in the part that does not exist yet is refused below.
+  const abs = api.isAbsolute(p) ? p : `${checkout.replace(/[\\/]+$/, '')}${api.sep}${p}`;
+  if (win && /^[A-Za-z]:(?![\\/])/.test(abs)) return bad('drive-relative path');
+
+  let realCheckout: string;
+  try {
+    realCheckout = await realpath(checkout);
+  } catch {
+    return bad('checkout cannot be resolved');
+  }
+
+  const tail: string[] = [];
+  let current = abs;
+  let real: string | null = null;
+  for (let i = 0; i < 64 && real === null; i += 1) {
+    try {
+      real = await realpath(current);
+    } catch (err) {
+      const code = (err as NodeJS.ErrnoException).code;
+      if (code !== 'ENOENT' && code !== 'ENOTDIR') return bad('path cannot be resolved');
+      const parent = api.dirname(current);
+      if (parent === current) return bad('path cannot be resolved');
+      tail.unshift(api.basename(current));
+      current = parent;
+    }
+  }
+  if (real === null) return bad('path too deep');
+  if (tail.some((s) => s === '.' || s === '..' || s === '')) return bad('`.`/`..` in a path that does not exist yet');
+  if (win) {
+    for (const seg of tail) {
+      if (WIN_SHORT_NAME_RE.test(seg)) return bad('8.3 short name for a file that does not exist yet');
+    }
+  }
+  const full = tail.length === 0 ? real : api.join(real, ...tail);
+
+  const relRaw = api.relative(realCheckout, full);
+  if (relRaw === '') return { ok: true, rel: '' };
+  if (relRaw === '..' || relRaw.startsWith(`..${api.sep}`) || api.isAbsolute(relRaw)) {
+    return bad('outside the checkout');
+  }
+  const segs = relRaw.split(api.sep);
+  if (win) {
+    for (const seg of segs) {
+      const problem = winSegmentProblem(seg);
+      if (problem !== null) return bad(problem);
+    }
+  }
+  return { ok: true, rel: segs.join('/').normalize('NFC') };
+}
+
+const CI_TTL_MS = 10 * 60 * 1000;
+const ciCache = new Map<string, { v: boolean; at: number }>();
+
+/**
+ * Is the volume under `checkout` case-insensitive? Stat-only (`probeCaseInsensitive` creates
+ * nothing in the user's repo); cached per checkout for 10 min, with `Math.abs` so a clock that
+ * jumped backwards just re-probes. Any doubt answers `true`: folding case only widens a claim.
+ */
+export async function checkoutCaseInsensitive(
+  checkout: string,
+  opts: { now?: () => number; probe?: (dir: string) => Promise<boolean> } = {},
+): Promise<boolean> {
+  const now = (opts.now ?? Date.now)();
+  const hit = ciCache.get(checkout);
+  if (hit !== undefined && Math.abs(now - hit.at) < CI_TTL_MS) return hit.v;
+  let v: boolean;
+  try {
+    v = await (opts.probe ?? ((d) => probeCaseInsensitive(d)))(checkout);
+  } catch {
+    v = true;
+  }
+  if (ciCache.size > 256) ciCache.clear();
+  ciCache.set(checkout, { v, at: now });
+  return v;
+}
+
+/** Test seam. */
+export function resetCaseCache(): void {
+  ciCache.clear();
 }

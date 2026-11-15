@@ -40,10 +40,10 @@
  * repeated snapshot is what the platform allows.
  */
 
-import { constants as FS } from 'node:fs';
+import { constants as FS, type BigIntStats } from 'node:fs';
 import { lstat, open, realpath } from 'node:fs/promises';
 import type { FileHandle } from 'node:fs/promises';
-import { sep } from 'node:path';
+import { sep, win32 } from 'node:path';
 
 /** Why a verified read produced no text. `aliased` is deliberately distinct
  *  from `unreadable`: it means the path changed identity between the root
@@ -70,19 +70,32 @@ export function insideAny(abs: string, roots: readonly string[]): boolean {
 }
 
 /** Which of `roots` contains `abs`, or `null`. Roots are realpath'd too: on
- *  macOS `~/.claude` under a symlinked home would otherwise never match. */
-export function matchedRoot(abs: string, roots: readonly string[]): string | null {
+ *  macOS `~/.claude` under a symlinked home would otherwise never match.
+ *  win32 volumes are case-insensitive and accept both separators, so both sides are
+ *  folded before comparing (a root `C:\Users\Me\.claude` must match `c:/users/me/.CLAUDE/x`);
+ *  the ORIGINAL root string is returned. `platform` is a test seam. */
+export function matchedRoot(
+  abs: string,
+  roots: readonly string[],
+  platform: NodeJS.Platform = process.platform,
+): string | null {
+  const win = platform === 'win32';
+  const separator = win ? win32.sep : sep;
+  const fold = (p: string): string => (win ? p.replace(/\//g, '\\').toLowerCase() : p);
+  const a = fold(abs);
   for (const root of roots) {
     if (typeof root !== 'string' || root === '') continue;
-    if (abs === root || abs.startsWith(root.endsWith(sep) ? root : `${root}${sep}`)) return root;
+    const r = fold(root);
+    if (a === r || a.startsWith(r.endsWith(separator) ? r : `${r}${separator}`)) return root;
   }
   return null;
 }
 
 export interface ComponentSnapshot {
   path: string;
-  dev: number;
-  ino: number;
+  /** bigint: a 64-bit inode / NTFS file id does not survive `Number` (I2, identity). */
+  dev: bigint;
+  ino: bigint;
   isSymlink: boolean;
 }
 
@@ -107,7 +120,7 @@ export function parentChain(root: string, real: string): string[] {
 export async function snapshotChain(chain: readonly string[]): Promise<ComponentSnapshot[] | null> {
   const out: ComponentSnapshot[] = [];
   for (const p of chain) {
-    const st = await lstat(p).catch(() => null);
+    const st = await lstat(p, { bigint: true }).catch(() => null);
     if (st === null) return null;
     out.push({ path: p, dev: st.dev, ino: st.ino, isSymlink: st.isSymbolicLink() });
   }
@@ -143,25 +156,49 @@ export async function readWindowVerified(
     if (before === null) return { text: null, skipped: 'unreadable' };
     if (before.some((s) => s.isSymlink)) return { text: null, skipped: 'aliased' };
 
-    handle = await open(real, FS.O_RDONLY | FS.O_NOFOLLOW);
-    const st = await handle.stat();
+    // win32 has no O_NOFOLLOW (undefined; `|`-ing it in would silently drop the protection).
+    // There the open is bracketed by identity checks instead: lstat -> open -> fstat -> lstat,
+    // all bigint, dev+ino equal and never a symlink/junction. POSIX keeps O_NOFOLLOW and
+    // FAILS CLOSED if the platform does not define it (I1).
+    const win = process.platform === 'win32';
+    let pre: BigIntStats | null = null;
+    let flags: number = FS.O_RDONLY;
+    if (win) {
+      pre = await lstat(real, { bigint: true }).catch(() => null);
+      if (pre === null) return { text: null, skipped: 'unreadable' };
+      if (pre.isSymbolicLink()) return { text: null, skipped: 'aliased' };
+    } else {
+      const noFollow = FS.O_NOFOLLOW;
+      if (typeof noFollow !== 'number') return { text: null, skipped: 'unreadable' };
+      flags |= noFollow;
+    }
+    handle = await open(real, flags);
+    const st = await handle.stat({ bigint: true });
     if (!st.isFile()) return { text: null, skipped: 'unreadable' };
     // Identity check: the name we validated must still resolve to this inode.
-    const named = await lstat(real).catch(() => null);
+    const named = await lstat(real, { bigint: true }).catch(() => null);
     if (named === null) return { text: null, skipped: 'unreadable' };
+    if (named.isSymbolicLink()) return { text: null, skipped: 'aliased' };
     if (named.dev !== st.dev || named.ino !== st.ino) return { text: null, skipped: 'aliased' };
+    if (win) {
+      // id 0 = the volume gives no stable file identity: nothing was proven.
+      if (st.ino === 0n || pre === null || pre.dev !== st.dev || pre.ino !== st.ino) {
+        return { text: null, skipped: 'aliased' };
+      }
+    }
     // A transcript is a plain file written by Claude Code; more than one link
     // to it means something else is deliberately aliasing it.
-    if (st.nlink !== 1) return { text: null, skipped: 'aliased' };
+    if (st.nlink !== 1n) return { text: null, skipped: 'aliased' };
 
     const after = await snapshotChain(chain);
     if (after === null) return { text: null, skipped: 'unreadable' };
     if (!chainStable(before, after)) return { text: null, skipped: 'aliased' };
 
-    const length = Math.min(st.size, max);
+    const size = Number(st.size);
+    const length = Math.min(size, max);
     if (length === 0) return { text: '', skipped: null };
     const buf = Buffer.alloc(length);
-    const position = window === 'tail' ? st.size - length : 0;
+    const position = window === 'tail' ? size - length : 0;
     const { bytesRead } = await handle.read(buf, 0, length, position);
     return { text: buf.subarray(0, bytesRead).toString('utf8'), skipped: null };
   } catch {

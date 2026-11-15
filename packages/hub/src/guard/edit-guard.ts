@@ -18,7 +18,14 @@ import type { GuardRule, SessionView, TouchedView } from '@agent-ledger/shared';
 import { STALE_OWNER_MS, type LeaseRow, type RuntimeStore, type TouchedRow } from '../db/store.ts';
 import type { Ledger } from '../ledger/ledger.ts';
 import { realpathOrParent, sessionLabel, type ResolvedPath, type Sessions } from '../sessions.ts';
-import { isExcludedPath, isLedgerContextFile, matchAny, toPosix } from './globs.ts';
+import {
+  canonicalRel,
+  checkoutCaseInsensitive,
+  isExcludedPath,
+  isLedgerContextFile,
+  matchAny,
+  toPosix,
+} from './globs.ts';
 import type { GuardSwitch } from './switch.ts';
 
 export interface EditGuardDeps {
@@ -143,6 +150,20 @@ export class EditGuard {
     const now = this.now();
     const intrude = this.deps.intrude ?? false;
     const checkout = resolved.layout.checkout;
+    // S8 (T11): one canonical spelling. `rel` stays the on-disk spelling (exact-match key of the
+    // `touched` rows); `claimRel` is NFC and is case-folded at match time on case-insensitive
+    // volumes, so `src/auth/**` blocks `SRC/Auth/x.ts` there. An unrepresentable name (ADS,
+    // trailing dot, device name, `\\?\`, 8.3 alias of a new file, escape) is refused, not guessed.
+    const canon = await canonicalRel(checkout, resolved.abs);
+    if (!canon.ok) {
+      return deny(
+        'invalid-path',
+        `The path cannot be checked safely (${canon.reason}) — use the plain, real file name inside the repo.`,
+      );
+    }
+    if (canon.rel === '') return allow('no-repo');
+    const claimRel = canon.rel;
+    const claimOpts = { caseInsensitive: await checkoutCaseInsensitive(checkout) };
     const rel = toPosix(resolved.rel_path);
     const self = this.deps.store.getSession(input.session);
     // An override the user authorised in chat lifts rules 3 and 4 for this path
@@ -181,7 +202,7 @@ export class EditGuard {
         }
       }
       /* A claim glob is intent, not a lock — warn once, never deny. */
-      const claim = this.claimOf(checkout, rel, input.session, now);
+      const claim = this.claimOf(checkout, claimRel, claimOpts, input.session, now);
       if (claim !== null && this.once(`claim|${input.session}|${checkout}|${rel}`)) {
         if (rule === 'allow') rule = 'claim-note';
         notes.push(
@@ -300,6 +321,7 @@ export class EditGuard {
   private claimOf(
     checkout: string,
     rel: string,
+    matchOpts: { caseInsensitive: boolean },
     self: string,
     now: number,
   ): { lease: LeaseRow; pattern: string } | null {
@@ -307,7 +329,7 @@ export class EditGuard {
       if (lease.session_id === self) continue;
       if (lease.kind !== 'claim') continue;
       if (lease.checkout !== null && lease.checkout !== checkout) continue;
-      const pattern = matchAny(leasePaths(lease), rel);
+      const pattern = matchAny(leasePaths(lease), rel, matchOpts);
       if (pattern === null) continue;
       if (this.liveView(lease.session_id, now) === null) continue;
       return { lease, pattern };

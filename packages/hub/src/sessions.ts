@@ -21,7 +21,7 @@ import type {
   TouchedVia,
   TouchedView,
 } from '@agent-ledger/shared';
-import { isoLocal, sanitizeField, shortSession, slugSchema } from '@agent-ledger/shared';
+import { isOwnedByMe, isoLocal, sanitizeField, shortSession, slugSchema } from '@agent-ledger/shared';
 import {
   ACTIVE_MS,
   IDLE_MS,
@@ -428,17 +428,17 @@ export class Sessions {
       );
       return null;
     }
-    const uid = process.getuid?.();
-    if (uid !== undefined) {
-      try {
-        const st = await stat(layout.checkout);
-        if (st.uid !== uid) {
-          this.ledger.log(`repo auto-registration refused: ${layout.checkout} does not belong to this user`);
-          return null;
-        }
-      } catch {
+    // Fail-closed (I1): the owner decision is platformTrust's. Unknown uid / unreadable
+    // owner / any error = refuse, never "skip the check". Resolve links first: the
+    // check must apply to the directory the hub would actually poll.
+    try {
+      const real = await realpath(layout.checkout);
+      if (!(await isOwnedByMe(real))) {
+        this.ledger.log(`repo auto-registration refused: ${layout.checkout} does not belong to this user`);
         return null;
       }
+    } catch {
+      return null;
     }
     let slug = base;
     for (let n = 2; n < 100 && Object.hasOwn(existing, slug); n += 1) slug = `${base}-${n}`;

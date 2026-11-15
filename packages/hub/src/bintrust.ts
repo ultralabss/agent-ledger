@@ -33,6 +33,8 @@
  * (tests, and the claude opt-in). Nothing in production enumerates groups.
  */
 
+import { posixWriteBitsTrusted } from '@agent-ledger/shared';
+
 /** Production default: a group-writable component is never trusted. */
 export const groupWriteNeverTrusted = async (_gid: number): Promise<boolean> => false;
 
@@ -40,17 +42,14 @@ export const groupWriteNeverTrusted = async (_gid: number): Promise<boolean> => 
 export const groupWriteTrustedByUser = async (_gid: number): Promise<boolean> => true;
 
 /**
- * The single place that decides whether a stat's permission bits are
- * acceptable for a trusted binary or one of its parent directories.
+ * The permission-bit rule for a trusted binary or one of its parent directories. The rule
+ * itself now lives in platformTrust (`posixWriteBitsTrusted`, moved without loosening);
+ * this wrapper only supplies the production default for the group-write decision.
  */
 export async function writeBitsTrusted(
   mode: number,
   gid: number,
   groupWritableOk: (gid: number) => Promise<boolean> = groupWriteNeverTrusted,
 ): Promise<boolean> {
-  // o+w is never acceptable — the sticky bit does not help, because the
-  // attacker only has to create the file, not replace ours.
-  if ((mode & 0o002) !== 0) return false;
-  if ((mode & 0o020) === 0) return true;
-  return groupWritableOk(gid);
+  return posixWriteBitsTrusted(mode, gid, groupWritableOk);
 }

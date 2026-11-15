@@ -2,7 +2,7 @@
 
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { mkdir, mkdtemp, readdir, symlink, writeFile } from 'node:fs/promises';
+import { chmod, mkdir, mkdtemp, readdir, readFile, stat, symlink, writeFile } from 'node:fs/promises';
 import { homedir, tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
@@ -361,4 +361,73 @@ test('retryFailedSpool skips a record no longer on the replay allowlist', async 
   // Skipped records stay visible in failed/, not silently dropped.
   const stillThere = await readFailedSpool(env);
   assert.equal(stillThere[0]?.records.length, 1);
+});
+
+/* ---------------- S2: platformTrust-backed writes (T1/T2) ---------------- */
+
+const posixOnly = process.platform === 'win32' && 'POSIX symlink / mode-bit test';
+
+test('S2/T2: enqueue never appends through a pre-planted symlink at the session file', { skip: posixOnly }, async () => {
+  const dir = await tmp();
+  const env = envFor(dir);
+  const victim = join(await tmp(), 'victim.txt');
+  await writeFile(victim, 'untouched\n', { mode: 0o600 });
+  await ensureSpoolDir(dir);
+  await symlink(victim, join(dir, 's1.jsonl'));
+  await assert.rejects(
+    () =>
+      enqueue(
+        { session: 's1' },
+        { method: 'POST', path: '/v1/items', body: { title: 'x' }, cmd: 'ledger add' },
+        env,
+        'token-A',
+      ),
+    (err: unknown) => err instanceof SpoolError && err.exitCode === 4 && /symlink/.test(err.message),
+  );
+  assert.equal(await readFile(victim, 'utf8'), 'untouched\n', 'the symlink target must stay untouched');
+});
+
+test('S2/T1: a group-writable spool directory is refused with SpoolError(4), never chmod-fixed', { skip: posixOnly }, async () => {
+  const root = await tmp();
+  const dir = join(root, 'spool');
+  await mkdir(dir, { mode: 0o700 });
+  await chmod(dir, 0o770);
+  await assert.rejects(
+    () => ensureSpoolDir(dir),
+    (err: unknown) => err instanceof SpoolError && err.exitCode === 4 && /group\/other/.test(err.message),
+  );
+  const { mode } = await stat(dir);
+  assert.equal(mode & 0o777, 0o770, 'a directory we did not create is never re-permissioned');
+});
+
+test('S2/T2: pruneSpool rewrites through a random exclusive tmp — a planted `${file}.tmp` symlink is not followed', { skip: posixOnly }, async () => {
+  const dir = await tmp();
+  const env = envFor(dir);
+  const victim = join(await tmp(), 'victim.txt');
+  await writeFile(victim, 'untouched\n', { mode: 0o600 });
+  for (const title of ['one', 'two']) {
+    await enqueue(
+      { session: 's1' },
+      { method: 'POST', path: '/v1/items', body: { title }, cmd: 'ledger add' },
+      env,
+      'token-A',
+    );
+  }
+  const file = join(dir, 's1.jsonl');
+  await symlink(victim, `${file}.tmp`); // the predictable name the old code wrote to
+  let n = 0;
+  const client: KeyedRequester = {
+    requestKeyed: () => {
+      n += 1;
+      if (n === 1) return Promise.resolve({ status: 201 });
+      return Promise.reject(Object.assign(new Error('hub down'), { hubDown: true }));
+    },
+  };
+  const res = await replaySpool(client, env, () => Promise.resolve('token-A'));
+  assert.equal(res.sent, 1);
+  assert.equal(await readFile(victim, 'utf8'), 'untouched\n', 'tmp symlink target must not be written');
+  const left = (await readFile(file, 'utf8')).split('\n').filter((l) => l.trim() !== '');
+  assert.equal(left.length, 1, 'one record remains queued (atomic rewrite happened)');
+  const stray = (await readdir(dir)).filter((e) => e.endsWith('.tmp') && e !== 's1.jsonl.tmp');
+  assert.deepEqual(stray, [], 'no random tmp file is left behind');
 });

@@ -4,9 +4,18 @@
 import { spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import type { Stats } from 'node:fs';
-import { lstat, readFile, realpath, stat } from 'node:fs/promises';
-import { dirname, isAbsolute, join, resolve as resolvePath } from 'node:path';
-import { groupWriteTrustedByUser, writeBitsTrusted } from './bintrust.ts';
+import { rmdirSync } from 'node:fs';
+import { lstat, mkdtemp, readFile, readdir, realpath, stat } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { dirname, isAbsolute, join, resolve as resolvePath, win32 as winPath } from 'node:path';
+import {
+  assertPrivateDir,
+  assertTrustedAncestors,
+  ensurePrivateDir,
+  isOwnedByMe,
+  resolveTrustedExecutable,
+  TrustError,
+} from '@agent-ledger/shared';
 
 export interface GitResult {
   code: number;
@@ -16,7 +25,32 @@ export interface GitResult {
 
 /** Absolute-path candidates, preferred first. Resolved once and cached — a
  *  writable-by-group/other or not-owned-by-us/root binary is rejected. */
-const GIT_CANDIDATES = ['/usr/bin/git', '/opt/homebrew/bin/git', '/usr/local/bin/git'];
+const POSIX_GIT_CANDIDATES = ['/usr/bin/git', '/opt/homebrew/bin/git', '/usr/local/bin/git'];
+
+/**
+ * win32: Git for Windows install locations built from env roots. An env var that is not
+ * an absolute drive-rooted path (`C:\...`) is dropped, never resolved against the CWD or
+ * PATH (T7). The binaries are then judged by `resolveTrustedExecutable` (SDDL: only
+ * {me, SYSTEM, Administrators, TrustedInstaller} may write them or their directories).
+ */
+export function gitCandidates(
+  platform: NodeJS.Platform = process.platform,
+  env: Readonly<Record<string, string | undefined>> = process.env,
+): string[] {
+  if (platform !== 'win32') return [...POSIX_GIT_CANDIDATES];
+  const roots: [string | undefined, string[]][] = [
+    [env.ProgramW6432, ['Git', 'cmd', 'git.exe']],
+    [env.ProgramFiles, ['Git', 'cmd', 'git.exe']],
+    [env.LOCALAPPDATA, ['Programs', 'Git', 'cmd', 'git.exe']],
+  ];
+  const out: string[] = [];
+  for (const [base, rest] of roots) {
+    if (typeof base !== 'string' || !/^[A-Za-z]:\\/.test(base) || base.includes('\0')) continue;
+    const candidate = winPath.join(base, ...rest);
+    if (!out.includes(candidate)) out.push(candidate);
+  }
+  return out;
+}
 
 let resolvedGit: Promise<string> | null = null;
 
@@ -52,22 +86,21 @@ export async function dirChainTrusted(
   stopAt = '/',
   deps: TrustDeps = {},
 ): Promise<boolean> {
-  let dir = dirname(file);
-  for (;;) {
-    let st;
-    try {
-      st = await lstat(dir);
-    } catch {
-      return false;
-    }
-    if (st.isSymbolicLink() || !st.isDirectory()) return false;
-    const trustedOwner = st.uid === 0 || (uid !== undefined && st.uid === uid);
-    if (!trustedOwner) return false;
-    if (!(await writeBitsTrusted(st.mode, st.gid, deps.groupWritableOk))) return false;
-    if (dir === stopAt) return true;
-    const parent = dirname(dir);
-    if (parent === dir) return true;
-    dir = parent;
+  // The decision itself lives in platformTrust (POSIX: the exact walk this used to be;
+  // win32: SDDL of every ancestor). Any failure to decide is a "no" (I1).
+  try {
+    await assertTrustedAncestors(
+      file,
+      {
+        stopAt,
+        executable: true,
+        ...(deps.groupWritableOk !== undefined ? { groupWritableOk: deps.groupWritableOk } : {}),
+      },
+      { getuid: () => uid },
+    );
+    return true;
+  } catch {
+    return false;
   }
 }
 
@@ -82,6 +115,8 @@ export interface TrustedBinaryInfo {
   path: string | null;
   /** Candidates that exist on disk but failed the trust rules. */
   rejected: string[];
+  /** Candidates that were not absolute (win32: drive-rooted) and were never looked at. */
+  dropped: string[];
   candidates: readonly string[];
   /** Diagnostic only: `rejected` is non-empty, so a binary IS installed. */
   foundUntrusted: boolean;
@@ -104,65 +139,18 @@ export async function resolveTrustedBinaryInfo(
   stopAt?: string,
   deps: TrustDeps = {},
 ): Promise<TrustedBinaryInfo> {
-  const uid = process.getuid?.();
-  const rejected: string[] = [];
-  let groupWritable = false;
-  for (const candidate of candidates) {
-    const verdict = await checkCandidate(candidate, uid, stopAt, deps);
-    if (verdict.kind === 'absent') continue;
-    if (verdict.kind === 'ok') {
-      return { path: verdict.path, rejected, candidates, foundUntrusted: false, groupWritable };
-    }
-    rejected.push(`${candidate} (${verdict.reason})`);
-    // A8-4 diagnosis only: would this candidate have passed if `g+w` were
-    // tolerated? The answer never changes the verdict above — it only lets the
-    // caller distinguish "group-writable directory" from "owned by someone
-    // else" / "world-writable", which need different fixes.
-    if (deps.groupWritableOk === undefined) {
-      const lenient = await checkCandidate(candidate, uid, stopAt, {
-        groupWritableOk: groupWriteTrustedByUser,
-      });
-      if (lenient.kind === 'ok') groupWritable = true;
-    }
-  }
-  return { path: null, rejected, candidates, foundUntrusted: rejected.length > 0, groupWritable };
-}
-
-type CandidateVerdict =
-  | { kind: 'ok'; path: string }
-  | { kind: 'absent' }
-  | { kind: 'rejected'; reason: string };
-
-async function checkCandidate(
-  candidate: string,
-  uid: number | undefined,
-  stopAt: string | undefined,
-  deps: TrustDeps,
-): Promise<CandidateVerdict> {
-  try {
-    const st = await lstat(candidate);
-    const real = st.isSymbolicLink() ? await realpath(candidate) : candidate;
-    const rst = await stat(real);
-    if (!rst.isFile()) return { kind: 'absent' };
-    const trustedOwner = rst.uid === 0 || (uid !== undefined && rst.uid === uid);
-    if (!trustedOwner || !(await writeBitsTrusted(rst.mode, rst.gid, deps.groupWritableOk))) {
-      return { kind: 'rejected', reason: 'owner/permissions' };
-    }
-    // A5: the symlink itself is an attack surface. `/opt/homebrew/bin`
-    // is group-writable, so whoever can write it can repoint the link at their
-    // own binary while the Cellar target keeps looking perfect. Both the path
-    // we were handed AND the path we end up executing must have a trusted
-    // chain; for a non-symlink candidate the two walks are identical.
-    if (!(await dirChainTrusted(real, uid, stopAt, deps))) {
-      return { kind: 'rejected', reason: 'target directory is writable by someone other than {root, us}' };
-    }
-    if (real !== candidate && !(await dirChainTrusted(candidate, uid, stopAt, deps))) {
-      return { kind: 'rejected', reason: 'symlink directory is writable by someone other than {root, us}' };
-    }
-    return { kind: 'ok', path: real };
-  } catch {
-    return { kind: 'absent' };
-  }
+  const info = await resolveTrustedExecutable(candidates, {
+    ...(stopAt !== undefined ? { stopAt } : {}),
+    ...(deps.groupWritableOk !== undefined ? { groupWritableOk: deps.groupWritableOk } : {}),
+  });
+  return {
+    path: info.path,
+    rejected: info.rejected,
+    dropped: info.dropped,
+    candidates: info.candidates,
+    foundUntrusted: info.foundUntrusted,
+    groupWritable: info.groupWritable,
+  };
 }
 
 export function trustedBinaryError(label: string, info: TrustedBinaryInfo): Error {
@@ -191,7 +179,7 @@ export async function resolveTrustedBinary(
  *  shared helper so git, gitleaks and the headless `claude` binary can never
  *  drift to three different definitions of "trusted". */
 function resolveGitBinary(): Promise<string> {
-  return resolveTrustedBinary(GIT_CANDIDATES, 'git');
+  return resolveTrustedBinary(gitCandidates(), 'git');
 }
 
 function gitBinary(): Promise<string> {
@@ -211,15 +199,81 @@ function gitBinary(): Promise<string> {
  *    runs `gpg.program` (also repo-local) for every signed commit in history —
  *    arbitrary code execution from a checkout we did not create (UL-669 T1).
  */
-const GIT_GLOBAL_ARGS = [
-  '--no-optional-locks',
-  '-c',
-  'core.fsmonitor=false',
-  '-c',
-  'core.hooksPath=/dev/null',
-  '-c',
-  'log.showSignature=false',
-];
+export function buildGitGlobalArgs(hooksDir: string): string[] {
+  return [
+    '--no-optional-locks',
+    '-c',
+    'core.fsmonitor=false',
+    '-c',
+    `core.hooksPath=${hooksDir}`,
+    '-c',
+    'log.showSignature=false',
+    // Ledger files are LF on disk and in git (I7); never let a user's global config
+    // (Git for Windows defaults to autocrlf=true) rewrite them.
+    '-c',
+    'core.autocrlf=false',
+    '-c',
+    'core.eol=lf',
+    '-c',
+    'core.longpaths=true',
+  ];
+}
+
+/* ---- hooks directory (I4) ------------------------------------------------------------
+ * `core.hooksPath=/dev/null` is a POSIX idiom: Git for Windows resolves it to
+ * `<drive>:\dev\null`, a path any user may create and fill with hooks. Instead EVERY OS
+ * gets a verified private, EMPTY directory (platformTrust: real dir, ours, private ACL/mode)
+ * that is re-asserted empty before each spawn. Hooks are looked up by fixed names, so only
+ * our own capability probe file (`.ledger-fsprobe-*`) may ever be present. */
+
+let configuredHooksDir: string | null = null;
+let fallbackHooksDir: Promise<string> | null = null;
+const verifiedHooksDirs = new Set<string>();
+const PROBE_PREFIX = '.ledger-fsprobe-';
+
+/** The hub points git at `<ledger>/.hub/empty-hooks` (called by `LedgerGit`). `null` resets. */
+export function configureGitHooksDir(dir: string | null): void {
+  configuredHooksDir = dir;
+}
+
+/** No ledger configured (CLI helpers, tests): a random private per-process temp dir. */
+function processHooksDir(): Promise<string> {
+  fallbackHooksDir ??= mkdtemp(join(tmpdir(), 'agent-ledger-hooks-')).then((dir) => {
+    process.once('exit', () => {
+      // best effort; a leftover empty private dir is harmless
+      try {
+        rmdirSync(dir);
+      } catch {
+        /* ignore */
+      }
+    });
+    return dir;
+  });
+  return fallbackHooksDir;
+}
+
+/** Verify (and on first use create) the empty hooks dir; returns its path. Fail-closed. */
+async function emptyHooksDir(): Promise<string> {
+  const dir = configuredHooksDir ?? (await processHooksDir());
+  try {
+    const present = (await lstat(dir).catch(() => null)) !== null;
+    if (!present || !verifiedHooksDirs.has(dir)) {
+      await ensurePrivateDir(dir);
+      verifiedHooksDirs.add(dir);
+    } else {
+      await assertPrivateDir(dir);
+    }
+    const entries = (await readdir(dir)).filter((e) => !e.startsWith(PROBE_PREFIX));
+    if (entries.length > 0) {
+      throw new Error(`git hooks directory ${dir} is not empty — refusing to run git`);
+    }
+  } catch (err) {
+    verifiedHooksDirs.delete(dir);
+    if (err instanceof TrustError) throw new Error(`git hooks directory refused: ${err.message}`);
+    throw err;
+  }
+  return dir;
+}
 
 /** G1: a git child (e.g. `log` on a huge/adversarial repo) can produce
  *  unbounded stdout/stderr — accumulating it in JS strings without a cap is
@@ -253,11 +307,14 @@ export async function git(cwd: string, args: string[], timeoutMs = 20_000): Prom
   // started for a directory that cannot answer anything.
   const cwdStat = await stat(cwd).catch(() => null);
   if (cwdStat === null || !cwdStat.isDirectory()) throw new GitCwdMissingError(cwd);
+  const hooksDir = await emptyHooksDir();
   return new Promise((resolvePromise, reject) => {
-    const child = spawn(bin, [...GIT_GLOBAL_ARGS, ...args], {
+    const child = spawn(bin, [...buildGitGlobalArgs(hooksDir), ...args], {
       cwd,
       env: { ...process.env, GIT_TERMINAL_PROMPT: '0', GIT_OPTIONAL_LOCKS: '0' },
       stdio: ['ignore', 'pipe', 'pipe'],
+      shell: false,
+      windowsHide: true,
     });
     let stdout = '';
     let stderr = '';
@@ -355,19 +412,35 @@ export async function resolveCheckout(dir: string): Promise<CheckoutLayout | nul
   } catch {
     return null;
   }
-  const uid = process.getuid?.();
   for (;;) {
     const layout = await readGitEntry(current);
     if (layout) {
       const st = await safeStat(current);
       if (!st?.isDirectory()) return null;
-      if (uid !== undefined && st.uid !== uid) return null;
+      // Fail-closed (I1): unknown uid / unreadable owner = not ours. (`current` is a
+      // realpath, so the lstat inside isOwnedByMe sees the directory itself.)
+      if (!(await checkoutOwnedByMe(current))) return null;
       return layout;
     }
     const parent = dirname(current);
     if (parent === current) return null; // reached the filesystem root
     current = parent;
   }
+}
+
+/** win32 resolves ownership with a PowerShell call: remember positives for a minute. */
+const ownedCache = new Map<string, number>();
+const OWNED_CACHE_MS = 60_000;
+
+async function checkoutOwnedByMe(dir: string): Promise<boolean> {
+  if (process.platform === 'win32') {
+    const at = ownedCache.get(dir);
+    if (at !== undefined && Math.abs(Date.now() - at) < OWNED_CACHE_MS) return true;
+    const ok = await isOwnedByMe(dir);
+    if (ok) ownedCache.set(dir, Date.now());
+    return ok;
+  }
+  return isOwnedByMe(dir);
 }
 
 async function safeStat(p: string): Promise<Stats | null> {
@@ -594,6 +667,8 @@ export class LedgerGit {
 
   constructor(opts: LedgerGitOptions) {
     this.opts = opts;
+    // Every git child of this hub runs with hooks disabled via a verified empty dir (I4).
+    configureGitHooksDir(join(opts.root, '.hub', 'empty-hooks'));
     this.state = {
       enabled: true,
       pendingSummaries: 0,
@@ -1245,7 +1320,7 @@ export class LedgerGit {
     }
     if (scan.scanner === null && scan.note !== null) this.opts.log(scan.note);
 
-    const res = await git(this.opts.root, ['commit', '-m', `ledger: ${summary}`]);
+    const res = await git(this.opts.root, ['commit', '--no-verify', '-m', `ledger: ${summary}`]);
     if (res.code !== 0) {
       this.opts.log(`git commit failed: ${res.stderr.trim()}`);
       return;
@@ -1263,7 +1338,7 @@ export class LedgerGit {
     const now = Date.now();
     if (now - this.lastPush < this.opts.pushIntervalMs) return;
     this.lastPush = now;
-    const res = await git(this.opts.root, ['push', 'origin', 'HEAD'], 60_000);
+    const res = await git(this.opts.root, ['push', '--no-verify', 'origin', 'HEAD'], 60_000);
     if (res.code !== 0) {
       // S-3: `lastPushError` is now the first line of the SessionStart brief.
       // git echoes the remote URL on failure, and an https remote carries

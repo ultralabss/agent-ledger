@@ -21,7 +21,29 @@
  *       with no opt-in available.
  */
 
+import { win32 as winPath } from 'node:path';
 import { resolveTrustedBinaryInfo } from './git.ts';
+
+const WIN_SHIM_EXT = new Set(['.cmd', '.bat', '.ps1', '.com', '.vbs', '.js']);
+
+/**
+ * S6/I3: on win32 the headless `claude` must be a native `*.exe`. A `.cmd` / `.bat` / `.ps1`
+ * shim (npm's `claude.cmd`) can only be started through `cmd.exe` / PowerShell, which re-parses
+ * the arguments (CVE-2024-27980 class) — and we never run a shell. Anything that is not
+ * literally `<name>.exe` (trailing dot/space, `:stream`, no extension) is refused too.
+ * POSIX: always `null` (behaviour unchanged). Returns the refusal text or `null`.
+ */
+export function nativeClaudeExeError(bin: string, platform: NodeJS.Platform = process.platform): string | null {
+  if (platform !== 'win32') return null;
+  const ext = winPath.extname(bin).toLowerCase();
+  if (ext === '.exe') return null;
+  const hint =
+    'install the native Claude Code build (claude.exe) and set LEDGER_CLAUDE_BIN to its full path, then restart the hub';
+  if (WIN_SHIM_EXT.has(ext)) {
+    return `claude shim ${ext} is not run on Windows (it would need a shell) — headless disabled; ${hint}`;
+  }
+  return `LEDGER_CLAUDE_BIN must be a native claude.exe on Windows — headless disabled; ${hint}`;
+}
 
 /**
  * What the opt-in is PINNED to.
@@ -96,9 +118,13 @@ export function claudeBinBlockReason(status: ClaudeBinStatus): string | null {
 
 export async function resolveClaudeBin(
   bin: string | null,
-  opts: { trustGroup?: boolean; pin?: ClaudeGroupPin; stopAt?: string } = {},
+  opts: { trustGroup?: boolean; pin?: ClaudeGroupPin; stopAt?: string; platform?: NodeJS.Platform } = {},
 ): Promise<ClaudeBinStatus> {
   if (bin === null) return { state: 'unknown', path: null, detail: null };
+
+  // S6: refused before any trust walk, no opt-in can override it.
+  const shim = nativeClaudeExeError(bin, opts.platform);
+  if (shim !== null) return { state: 'untrusted', path: null, detail: shim };
 
   // A9-1: the opt-in only exists as a PIN. Without one, the tolerance
   // is not applied at all — it would be broader than the decision the user

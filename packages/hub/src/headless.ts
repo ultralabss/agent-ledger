@@ -36,6 +36,7 @@ import type { HubConfig } from './config.ts';
 import { LedgerError } from './errors.ts';
 import {
   claudeBinBlockReason,
+  nativeClaudeExeError,
   resolveClaudeBin,
   type ClaudeBinStatus,
   type ClaudeBinTrust,
@@ -282,6 +283,9 @@ export class HeadlessRunner {
     system: string,
     kind: 'intake' | 'groom',
   ): Promise<{ code: number | null; stdout: string; stderr: string }> {
+    // Defence in depth behind `binary()`: never hand a .cmd/.bat/.ps1 shim to spawn on win32.
+    const shimRefusal = nativeClaudeExeError(bin);
+    if (shimRefusal !== null) return Promise.resolve({ code: null, stdout: '', stderr: shimRefusal });
     const spawnFn = this.deps.spawnFn ?? spawn;
     const args = buildHeadlessArgs(this.deps.ledger.paths.root, prompt, system);
     const env = childEnv(this.deps.env, {
@@ -296,6 +300,7 @@ export class HeadlessRunner {
         env,
         stdio: ['ignore', 'pipe', 'pipe'],
         shell: false,
+        windowsHide: true,
       });
       let stdout = '';
       let stderr = '';

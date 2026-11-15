@@ -18,6 +18,13 @@ export const RULES = {
   fetch: /\bfetch\s*\(|\bWebSocket\b|\bXMLHttpRequest\b|\bsendBeacon\b|\bEventSource\b/,
   "http-request": /\bhttps?\.(?:request|get)\s*\(|from\s+["'](?:node:)?(?:https?|http2|tls|dgram|dns)(?:\/promises)?["']|require\(\s*["'](?:node:)?(?:https?|http2|tls|dgram|dns)["']\s*\)/,
   net: /\bnet\.(?:connect|createConnection|Socket)\b|from\s+["'](?:node:)?net["']|require\(\s*["'](?:node:)?net["']\s*\)/,
+  // I3: children are spawned with an absolute path, an argv array and NO shell (a shell turns
+  // .cmd/.bat shims and argument text into code; CVE-2024-27980). Any `shell` option that is not the
+  // literal false — true, a computed value, a shell path, `opts.shell = x` — is a hit. ALLOW is empty.
+  "shell-true": /\bshell\s*:\s*(?!false\b)(?:true\b|!|\d|process\b|os\b|(?!(?:boolean|string|number|unknown|any)\b)[A-Za-z_$][\w$.]*\s*(?:[,}?]|[=!]==?|&&|\|\||$))|\.shell\s*=\s*(?!false\b)\S|\[\s*["']shell["']\s*\]\s*=\s*(?!false\b)\S/,
+  // A literal shell path/name (`shell: '/bin/bash'`): same hole, but guard fixtures may run a command
+  // line through a real shell — relaxed in test files only (see TEST_RELAXED), never in shipped code.
+  "shell-path": /\bshell\s*:\s*["'`]/,
   "curl-pipe-sh": /\b(?:curl|wget)\b[^\n|]*\|\s*(?:sudo\s+)?(?:ba|z|da)?sh\b/,
   base64: /[A-Za-z0-9+/]{200,}={0,2}/,
   "long-line": /^.{2001,}$/,
@@ -61,16 +68,21 @@ export const ALLOW = {
     "packages/cli/src/update-check.test.ts", // hostile tag fixture
     "scripts/deps-gate.test.mjs", // hostile postinstall fixture
   ],
+  "shell-true": [], // deliberately empty: no exception exists (I3)
+  "shell-path": [],
   "bidi-invisible": ["packages/shared/src/md.ts", "packages/cli/src/tidy.test.ts"],
 };
 // Network and process rules are relaxed in test files only (hostile fixtures, local servers).
 const TEST_FILE = /\.test\.(?:ts|mjs|js)$|(^|\/)test-helpers\.ts$/;
-const TEST_RELAXED = new Set(["child-process", "fetch", "http-request", "net"]);
+const TEST_RELAXED = new Set(["child-process", "fetch", "http-request", "net", "shell-path"]);
 
 const SKIP_DIRS = new Set(["node_modules", ".git", "dist", ".next", "coverage"]);
 const TEXT_EXT = new Set([".ts", ".tsx", ".mts", ".cts", ".js", ".jsx", ".mjs", ".cjs", ".sh", ".yml", ".yaml", ".json", ".toml", ".md", ".txt", ".css", ".html", ".tmpl", ".plist", ".service", ".snippet", ".cjs"]);
 // Rules that do not apply to docs/data (they legitimately discuss or contain such text).
 const DOC_ONLY_RULES = new Set(["bidi-invisible"]);
+// Rules about JS/TS source: `shell: bash` in a workflow file or CSS is not a spawn option.
+const CODE_ONLY_RULES = new Set(["shell-true", "shell-path"]);
+const NON_CODE_EXT = new Set([".yml", ".yaml", ".json", ".toml", ".css", ".html", ".plist", ".service"]);
 // No comment skipping: `*` lines can be code (`1\n * eval(x)`) or template-literal text,
 // so words like eval in a comment need an exact-file ALLOW entry or a rewording.
 const LOCKFILES = new Set(["pnpm-lock.yaml"]);
@@ -90,6 +102,7 @@ export function scanText(text, rel, opts = {}) {
   lines.forEach((line, i) => {
     for (const [rule, re] of Object.entries(RULES)) {
       if (isDoc && !DOC_ONLY_RULES.has(rule)) continue;
+      if (CODE_ONLY_RULES.has(rule) && NON_CODE_EXT.has(ext)) continue;
       if (rel.endsWith(".json") && (rule === "base64" || rule === "long-line")) continue;
       if (!re.test(line)) continue;
       if (useAllow && allowed(rule, rel)) continue;

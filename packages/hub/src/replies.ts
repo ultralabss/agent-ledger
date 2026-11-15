@@ -38,7 +38,7 @@
 import { spawn } from 'node:child_process';
 import { isoLocal, sanitizeField, sanitizeLine, untrustedSnippet } from '@agent-ledger/shared';
 import type { InboxOrigin, Item, ReplyMode, ReplyModeRequest, ReplyStatus, ReplyView } from '@agent-ledger/shared';
-import { claudeBinBlockReason, resolveClaudeBin, type ClaudeBinStatus } from './claudebin.ts';
+import { claudeBinBlockReason, nativeClaudeExeError, resolveClaudeBin, type ClaudeBinStatus } from './claudebin.ts';
 import type { ReplyRow, RuntimeStore } from './db/store.ts';
 import type { EventBus } from './events.ts';
 import { CLAUDE_HOME_READ_DENYLIST, SHELL_ESCAPE_DENYLIST, childEnv } from './headless.ts';
@@ -531,6 +531,9 @@ export class Replies {
     cwd: string,
     row: ReplyRow,
   ): Promise<{ code: number | null; stdout: string; stderr: string }> {
+    // Defence in depth behind `claudeTrust()`: never hand a .cmd/.bat/.ps1 shim to spawn on win32.
+    const shimRefusal = nativeClaudeExeError(bin);
+    if (shimRefusal !== null) return Promise.resolve({ code: null, stdout: '', stderr: shimRefusal });
     const spawnFn = this.deps.spawnFn ?? spawn;
     const args = buildWorkerArgs(cwd);
     const env = childEnv(this.deps.env, {
@@ -554,6 +557,7 @@ export class Replies {
         env,
         stdio: ['pipe', 'pipe', 'pipe'],
         shell: false,
+        windowsHide: true,
       });
       let stdout = '';
       let stderr = '';

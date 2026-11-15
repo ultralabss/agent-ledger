@@ -22,9 +22,9 @@
  * the hook path.
  */
 
-import { constants as fsConstants } from 'node:fs';
-import { lstat, mkdir, open, rm } from 'node:fs/promises';
+import { rm } from 'node:fs/promises';
 import { join } from 'node:path';
+import { assertPrivateDir, ensurePrivateDir, openPrivate } from '@agent-ledger/shared';
 
 /** Same shape the CLI accepts as a marker name. Anything else is not written,
  *  so a crafted `session_id` can never address a path outside the directory. */
@@ -51,7 +51,7 @@ export class PendingMarks {
   /** Created lazily and at most once per process. `.hub/` is already 0700, and
    *  this inherits the same mode explicitly rather than relying on the umask. */
   private ensure(): Promise<void> {
-    this.ready ??= mkdir(this.dir, { recursive: true, mode: 0o700 }).then(
+    this.ready ??= ensurePrivateDir(this.dir).then(
       () => undefined,
       (err: unknown) => {
         this.logFn(`inbox-pending: ${String(err)}`);
@@ -64,15 +64,14 @@ export class PendingMarks {
    *  write under the ledger root) — a symlink swapped in for it, or for a
    *  session's marker file, would turn a 0-byte marker write/removal into
    *  a write into (or unlink of) whatever the link actually points to.
-   *  `lstat` never follows the final symlink, so this catches the directory
-   *  itself having been replaced; `O_NOFOLLOW` on the `open()` below catches
-   *  the marker filename having been pre-planted as a symlink. */
+   *  platformTrust decides (I1, fail-closed — an unknown uid or ACL is a refusal, not a
+   *  pass): the directory is a real dir (no symlink/reparse), owned by us, and nobody
+   *  else may write or even read it (`secret`: POSIX no group/other bits at all, win32 a
+   *  protected DACL). The marker FILE is opened through `openPrivate` below, which refuses
+   *  a pre-planted symlink. */
   private async dirIsSafe(): Promise<boolean> {
     try {
-      const st = await lstat(this.dir);
-      if (!st.isDirectory()) return false;
-      if (typeof process.getuid === 'function' && st.uid !== process.getuid()) return false;
-      if ((st.mode & 0o777) !== 0o700) return false;
+      await assertPrivateDir(this.dir, { secret: true });
       return true;
     } catch {
       return false;
@@ -91,11 +90,7 @@ export class PendingMarks {
       return;
     }
     try {
-      const fd = await open(
-        join(this.dir, session),
-        fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_TRUNC | fsConstants.O_NOFOLLOW,
-        0o600,
-      );
+      const fd = await openPrivate(join(this.dir, session), 'trunc', 0o600);
       await fd.close();
     } catch (err) {
       // Forget it, so the next message retries instead of trusting a write
