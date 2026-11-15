@@ -74,6 +74,9 @@ const variants: [string, Record<string, string>][] = [
   ['product minimal env', { ...pick(process.env, ['USERPROFILE', 'LOCALAPPDATA', 'APPDATA', 'TEMP', 'TMP', 'ProgramData']), ...mini }],
   ['product minimal + full PATH', { ...pick(process.env, ['USERPROFILE', 'LOCALAPPDATA', 'APPDATA', 'TEMP', 'TMP', 'ProgramData']), ...mini, PATH: process.env.PATH ?? '' }],
   ['product minimal + full PSModulePath', { ...pick(process.env, ['USERPROFILE', 'LOCALAPPDATA', 'APPDATA', 'TEMP', 'TMP', 'ProgramData']), ...mini, PSModulePath: process.env.PSModulePath ?? '' }],
+  ['minimal + sys32 first + ProgramFiles modules', { ...pick(process.env, ['USERPROFILE', 'LOCALAPPDATA', 'APPDATA', 'TEMP', 'TMP', 'ProgramData']), ...mini, PSModulePath: `${mini.PSModulePath};${process.env.ProgramFiles}\\WindowsPowerShell\\Modules` }],
+  ['minimal + user Documents modules', { ...pick(process.env, ['USERPROFILE', 'LOCALAPPDATA', 'APPDATA', 'TEMP', 'TMP', 'ProgramData']), ...mini, PSModulePath: `${process.env.USERPROFILE}\\Documents\\WindowsPowerShell\\Modules;${mini.PSModulePath}` }],
+  ['minimal + PSModulePath set empty-ish (sys32 only, trailing ;)', { ...pick(process.env, ['USERPROFILE', 'LOCALAPPDATA', 'APPDATA', 'TEMP', 'TMP', 'ProgramData']), ...mini, PSModulePath: `${mini.PSModulePath};` }],
   ['full env minus USERPROFILE/LOCALAPPDATA/APPDATA', Object.fromEntries(Object.entries(full).filter(([k]) => !['USERPROFILE', 'LOCALAPPDATA', 'APPDATA'].includes(k)))],
 ];
 for (const [name, env] of variants) {
@@ -96,6 +99,7 @@ await withTimeout('ensurePrivateDir #1 (cold probe)', 60000, ensurePrivateDir(d1
 await withTimeout('assertPrivateDir #1 (cached)', 60000, assertPrivateDir(d1));
 const d2 = join(tmpdir(), `diag-priv2-${Date.now()}`);
 await withTimeout('ensurePrivateDir #2 (new dir)', 60000, ensurePrivateDir(d2));
+console.log(`[diag] PSModulePath=${process.env.PSModulePath}`);
 if (process.env.DIAG_FULL) {
 const { openTestLedger } = await import('../packages/hub/src/test-helpers.ts');
 const fx = await withTimeout('openTestLedger', 90000, openTestLedger());
