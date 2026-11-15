@@ -16,6 +16,11 @@ const withTimeout = async <T>(what: string, ms: number, p: Promise<T>): Promise<
   lap(`${what}: ${r === 'T' ? `STALLED > ${ms}ms` : `${Date.now() - s}ms`}`);
   return r === 'T' ? undefined : (r as T);
 };
+function pick(src: NodeJS.ProcessEnv, keys: string[]): Record<string, string> {
+  const o: Record<string, string> = {};
+  for (const k of keys) if (typeof src[k] === 'string') o[k] = src[k] as string;
+  return o;
+}
 const run = (cmd: string, args: string[], cwd?: string) =>
   new Promise<string>((resolve) => {
     const c = spawn(cmd, args, { cwd, stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true });
@@ -50,6 +55,30 @@ const runEnv = (args: string[], env: Record<string, string>) =>
   });
 await withTimeout('powershell -Command 1 (minimal env, no USERPROFILE/TEMP)', 90000, runEnv([...baseArgs, '-Command', '1'], mini));
 await withTimeout('powershell Get-Acl (minimal env)', 90000, runEnv([...baseArgs, '-Command', '(Get-Acl -LiteralPath $env:SystemRoot).Sddl.Length'], mini));
+// Which env difference makes the product probe slow? Same staged script, four envs, per-stage timings.
+const stageScript = [
+  "$ErrorActionPreference='Stop'; $sw=[Diagnostics.Stopwatch]::StartNew(); $o=@()",
+  "$p=$env:SystemRoot",
+  "$null=ConvertFrom-Json -InputObject '[1]'; $o+='json:'+$sw.ElapsedMilliseconds",
+  "$null=[System.Security.Principal.WindowsIdentity]::GetCurrent(); $o+='identity:'+$sw.ElapsedMilliseconds",
+  "$i=Get-Item -LiteralPath $p -Force; $o+='getitem:'+$sw.ElapsedMilliseconds",
+  "$null=(Get-Acl -LiteralPath $p).Sddl; $o+='getacl:'+$sw.ElapsedMilliseconds",
+  "$null=New-Object System.IO.DriveInfo('C:\\'); $o+='driveinfo:'+$sw.ElapsedMilliseconds",
+  "$null=@{a=1}|ConvertTo-Json -Compress; $o+='tojson:'+$sw.ElapsedMilliseconds",
+  "$o -join ' '",
+].join('\n');
+const stageArgs = [...baseArgs, '-Command', stageScript];
+const full = { ...process.env } as Record<string, string>;
+const variants: [string, Record<string, string>][] = [
+  ['full env', full],
+  ['product minimal env', { ...pick(process.env, ['USERPROFILE', 'LOCALAPPDATA', 'APPDATA', 'TEMP', 'TMP', 'ProgramData']), ...mini }],
+  ['product minimal + full PATH', { ...pick(process.env, ['USERPROFILE', 'LOCALAPPDATA', 'APPDATA', 'TEMP', 'TMP', 'ProgramData']), ...mini, PATH: process.env.PATH ?? '' }],
+  ['product minimal + full PSModulePath', { ...pick(process.env, ['USERPROFILE', 'LOCALAPPDATA', 'APPDATA', 'TEMP', 'TMP', 'ProgramData']), ...mini, PSModulePath: process.env.PSModulePath ?? '' }],
+  ['full env minus USERPROFILE/LOCALAPPDATA/APPDATA', Object.fromEntries(Object.entries(full).filter(([k]) => !['USERPROFILE', 'LOCALAPPDATA', 'APPDATA'].includes(k)))],
+];
+for (const [name, env] of variants) {
+  await withTimeout(`stages [${name}] total`, 150000, runEnv(stageArgs, env).then((r) => { lap(`  ${r}`); return r; }));
+}
 const timedDeps = createTrustDeps({
   spawnFile: async (file, args, opts) => {
     const s = Date.now();
@@ -67,8 +96,10 @@ await withTimeout('ensurePrivateDir #1 (cold probe)', 60000, ensurePrivateDir(d1
 await withTimeout('assertPrivateDir #1 (cached)', 60000, assertPrivateDir(d1));
 const d2 = join(tmpdir(), `diag-priv2-${Date.now()}`);
 await withTimeout('ensurePrivateDir #2 (new dir)', 60000, ensurePrivateDir(d2));
+if (process.env.DIAG_FULL) {
 const { openTestLedger } = await import('../packages/hub/src/test-helpers.ts');
 const fx = await withTimeout('openTestLedger', 90000, openTestLedger());
 if (fx) await withTimeout('ledger.git.flush', 90000, fx.ledger.git.flush());
+}
 lap('done');
 process.exit(0);
