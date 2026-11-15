@@ -930,7 +930,7 @@ test('win32: assertPrivateDir passes on the DACL ensurePrivateDir produces; one 
   ]);
   assert.deepEqual(JSON.parse(call.env.LEDGER_TRUST_PATHS ?? ''), [LEDGER, LA, 'C:\\Users\\me\\AppData', 'C:\\Users\\me', 'C:\\Users', 'C:\\']);
   assert.ok(!call.args.join(' ').includes('agent-ledger'), 'paths must not be interpolated into the command line');
-  assert.equal(call.env.PSModulePath, `${SYSROOT}\\System32\\WindowsPowerShell\\v1.0\\Modules`);
+  assert.equal(call.env.PSModulePath, `${SYSROOT}\\System32\\WindowsPowerShell\\v1.0\\Modules;C:\\Program Files\\WindowsPowerShell\\Modules`);
   assert.equal(call.env.SystemRoot, SYSROOT);
 });
 

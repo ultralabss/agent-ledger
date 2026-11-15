@@ -74,7 +74,7 @@ test('inspectWindowsPaths: batch limits, env is minimal and never carries the ca
   await inspectWindowsPaths(['C:\\Users\\me'], ctx(spawn, env));
   assert.equal(seen?.file, 'C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe');
   assert.equal(seen?.env.PATH, 'C:\\Windows\\System32');
-  assert.equal(seen?.env.PSModulePath, 'C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\Modules');
+  assert.equal(seen?.env.PSModulePath, 'C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\Modules;C:\\Program Files\\WindowsPowerShell\\Modules');
   assert.equal(seen?.env.NODE_OPTIONS, undefined);
   assert.equal(seen?.env.LOCALAPPDATA, 'C:\\Users\\me\\AppData\\Local');
   assert.equal(seen?.cwd, 'C:\\Windows');

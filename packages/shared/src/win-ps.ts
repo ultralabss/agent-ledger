@@ -248,7 +248,11 @@ function minimalEnv(root: string, extra: Record<string, string>, src: WinPsConte
   env.SystemRoot = root;
   env.windir = root;
   env.PATH = `${root}\\System32`;
-  env.PSModulePath = `${root}\\System32\\WindowsPowerShell\\v1.0\\Modules`;
+  // System32 modules first, then the stock machine-wide module dir (admin/TrustedInstaller-writable only),
+  // built from the fixed `<drive of SystemRoot>:\\Program Files` name, never from caller-controlled env.
+  // With System32 alone, Windows PowerShell 5.1 spends ~12 s on the first cmdlet (module discovery) for a
+  // non-elevated user: every probe took 12-18 s (CI 43776805612). Adding this dir brings it to ~0.4 s.
+  env.PSModulePath = `${root}\\System32\\WindowsPowerShell\\v1.0\\Modules;${root.slice(0, 2)}\\Program Files\\WindowsPowerShell\\Modules`;
   return { ...env, ...extra };
 }
 
