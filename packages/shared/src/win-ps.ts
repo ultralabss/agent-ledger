@@ -154,7 +154,9 @@ export function icaclsPath(systemRoot: string): string {
 export const WIN_PS_SCRIPT = [
   "$ErrorActionPreference = 'Stop'",
   '[Console]::OutputEncoding = [System.Text.Encoding]::UTF8',
-  '$paths = @(ConvertFrom-Json -InputObject $env:LEDGER_TRUST_PATHS)',
+  // Windows PowerShell 5.1 emits a parsed JSON array as ONE object; piping to ForEach-Object unrolls it,
+  // so N paths give N entries (CI 43750942946: 'probe returned the wrong number of paths').
+  "$paths = @(ConvertFrom-Json -InputObject $env:LEDGER_TRUST_PATHS | ForEach-Object { $_ })",
   '$id = [System.Security.Principal.WindowsIdentity]::GetCurrent()',
   '$pr = New-Object System.Security.Principal.WindowsPrincipal($id)',
   '$admin = [System.Security.Principal.WindowsBuiltInRole]::Administrator',
