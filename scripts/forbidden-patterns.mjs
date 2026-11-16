@@ -38,6 +38,7 @@ export const RULES = {
 export const ALLOW = {
   "child-process": [
     "scripts/build-hook.mjs",
+    "scripts/ci-win-preload.mjs", // CI-only (win32 test runs): icacls on mkdtemp dirs, never shipped
     "packages/cli/src/index.ts",
     "packages/cli/src/open.ts",
     "packages/cli/src/selfheal.ts",
@@ -60,7 +61,7 @@ export const ALLOW = {
   ],
   "http-request": ["packages/cli/src/hook-send.ts"],
   eval: ["packages/hub/src/guard/worker-guard.ts", "packages/hub/src/guard/worker-guard.test.ts", "packages/hub/src/headless.ts", "packages/hub/src/replies.ts"],
-  "dynamic-code": ["packages/cli/src/hook-bash.test.ts", "packages/cli/src/doctor.ts", "scripts/deps-gate.mjs"], // deps-gate: resolves the yaml parser
+  "dynamic-code": ["packages/cli/src/hook-bash.test.ts", "packages/cli/src/doctor.ts", "scripts/deps-gate.mjs", "scripts/ci-win-preload.mjs"], // preload: syncBuiltinESMExports (CI-only) // deps-gate: resolves the yaml parser
   net: ["packages/hub/src/server.ts"],
   "curl-pipe-sh": [
     "packages/hub/src/guard/worker-guard.ts",
