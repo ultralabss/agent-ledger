@@ -248,13 +248,14 @@ test('SSE: /v1/events sends hello and then item.created', async (t) => {
  * must be refused with 503, not accepted. */
 test('/v1/events caps subscribers, over the cap it returns 503', async (t) => {
   const fx = await startTestHub();
-  t.after(fx.cleanup);
 
   const controllers: AbortController[] = [];
   const responses: Response[] = [];
+  // Abort the open SSE streams BEFORE the hub shuts down (hooks run in registration order).
   t.after(() => {
     for (const c of controllers) c.abort();
   });
+  t.after(fx.cleanup);
 
   for (let i = 0; i < 16; i += 1) {
     const controller = new AbortController();

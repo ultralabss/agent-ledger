@@ -101,10 +101,10 @@ test('writes during an outage go to the spool and are replayed once the hub is u
 
   // --- permissions ---
   const dirStat = await stat(spool);
-  assert.equal(dirStat.mode & 0o777, 0o700, 'spool directory 0700');
+  if (process.platform !== 'win32') assert.equal(dirStat.mode & 0o777, 0o700, 'spool directory 0700'); // win32: DACL checked by platformTrust
   const files = (await readdir(spool)).filter((f) => f.endsWith('.jsonl'));
   for (const f of files) {
-    assert.equal((await stat(join(spool, f))).mode & 0o777, 0o600, `${f} must be 0600`);
+    if (process.platform !== 'win32') assert.equal((await stat(join(spool, f))).mode & 0o777, 0o600, `${f} must be 0600`);
   }
 
   // --- hub up: the next command drains the spool ---

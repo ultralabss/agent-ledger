@@ -121,9 +121,13 @@ export async function parseWhySpec(raw: unknown, checkout: string): Promise<WhyS
   if (CONTROL.test(raw) || raw.includes('\\')) {
     throw invalid('path must not contain control characters or backslashes');
   }
+  // win32: the CLI sends an absolute path as `D:/dir/file` (forward slashes, so
+  // the backslash ban above stays absolute). The drive prefix is the only place
+  // a `:` is allowed, and only on Windows.
+  const drive = process.platform === 'win32' && /^[A-Za-z]:\//.test(raw);
   const wild = /[*?]/.test(raw);
   if (wild) {
-    if (!GLOB_CHARS.test(raw) || /\*{3,}/.test(raw)) {
+    if (!GLOB_CHARS.test(drive ? raw.slice(2) : raw) || /\*{3,}/.test(raw)) {
       throw invalid('glob supports only * ** ? and plain path characters');
     }
     if ((raw.match(/[*?]/g) ?? []).length > 12) throw invalid('glob has too many wildcards');
@@ -135,7 +139,11 @@ export async function parseWhySpec(raw: unknown, checkout: string): Promise<WhyS
   const wildTail = firstWild < 0 ? [] : segs.slice(firstWild);
 
   // Relative input is anchored at the checkout (the CLI sends absolute paths).
-  const base = raw.startsWith('/') ? `/${literal.join('/')}` : join(checkout, ...literal);
+  const base = drive
+    ? join(`${(literal[0] ?? '').slice(0, 2)}/`, ...literal.slice(1))
+    : raw.startsWith('/')
+      ? `/${literal.join('/')}`
+      : join(checkout, ...literal);
   const real = await realpathOrParent(base);
   if (real === null) throw invalid('path cannot be resolved');
   const back = relative(checkout, real);

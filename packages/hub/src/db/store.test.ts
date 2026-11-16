@@ -46,9 +46,9 @@ test('openDb: WAL, user_version and idempotent migrations', async (t) => {
 
 test('FTS5 is available in node:sqlite (otherwise LIKE fallback)', async (t) => {
   const tmp = await tempDb();
-  t.after(tmp.cleanup);
   const store = new RuntimeStore(tmp.file);
   t.after(() => store.close());
+  t.after(tmp.cleanup); // after close: node:test runs hooks in registration order; Windows cannot delete an open DB
   // Both engines are supported; record which one this Node build gives us.
   assert.ok(['fts5', 'like'].includes(store.engine));
 

@@ -20,6 +20,7 @@ import {
   type KeyedRequester,
 } from './spool.ts';
 import { skipOnWin32 } from '@agent-ledger/shared/testing';
+import { ensurePrivateDir } from './platformTrust.ts';
 
 async function tmp(): Promise<string> {
   return mkdtemp(join(tmpdir(), 'spool-test-'));
@@ -338,6 +339,7 @@ test('retryFailedSpool skips a record no longer on the replay allowlist', async 
   const env = envFor(dir);
   const failedDir = join(dir, 'failed');
   await mkdir(failedDir, { recursive: true, mode: 0o700 });
+  await ensurePrivateDir(failedDir); // win32: mkdir mode is ignored, the DACL must be protected explicitly
   const record = {
     key: 'k1',
     ts: Date.now(),

@@ -117,3 +117,16 @@ test('R3-03: isWorkerDeniedEditPath also fences .git/hooks, guard/ and .claude/ 
   ];
   for (const p of denied) assert.equal(isWorkerDeniedEditPath(p), true, p);
 });
+
+test('R2-06: Windows-style paths (backslashes) hit the same fence', () => {
+  const denied = [
+    'C:\\repo\\.env',
+    'C:\\repo\\.env.local',
+    'C:\\Users\\me\\.ssh\\id_ed25519',
+    'D:\\a\\repo\\.github\\workflows\\ci.yml',
+    'C:\\repo\\apps\\server\\auth\\guard.ts',
+    'C:\\repo\\db\\migrations\\001.sql',
+  ];
+  for (const p of denied) assert.equal(isWorkerDeniedEditPath(p), true, p);
+  assert.equal(isWorkerDeniedEditPath('C:\\repo\\src\\app.ts'), false);
+});

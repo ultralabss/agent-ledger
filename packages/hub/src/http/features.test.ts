@@ -175,10 +175,10 @@ test('the weekly groom timer is never armed while headless is off', async (t) =>
   const { tempConfig } = await import('../test-helpers.ts');
   const { startHub } = await import('../server.ts');
   const tmp = await tempConfig({ headless: false, groomWeekly: true });
-  t.after(tmp.cleanup);
   const logs: string[] = [];
   const hub = await startHub({ config: tmp.config, log: (l) => logs.push(l), watch: false, periodic: true });
   t.after(() => hub.close());
+  t.after(tmp.cleanup); // after close: hooks run in registration order; Windows cannot delete an open DB
   assert.ok(logs.some((l) => l.includes('headless: disabled')));
   assert.equal(
     logs.some((l) => l.includes('weekly grooming scheduled')),
@@ -188,10 +188,10 @@ test('the weekly groom timer is never armed while headless is off', async (t) =>
 
   // Positive control: with headless on, the same configuration does arm it.
   const tmpOn = await tempConfig({ headless: true, groomWeekly: true });
-  t.after(tmpOn.cleanup);
   const logsOn: string[] = [];
   const hubOn = await startHub({ config: tmpOn.config, log: (l) => logsOn.push(l), watch: false, periodic: true });
   t.after(() => hubOn.close());
+  t.after(tmpOn.cleanup);
   assert.ok(
     logsOn.some((l) => l.includes('weekly grooming scheduled')),
     logsOn.join(' | '),

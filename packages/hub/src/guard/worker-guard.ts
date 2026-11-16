@@ -185,7 +185,7 @@ function rmTargetsOutside(args: readonly string[], cwdRepo: string | null): bool
 
 function touchesSensitivePath(tokens: readonly string[], head: string): boolean {
   if (head === 'ledger') return false;
-  return tokens.some((t) => SENSITIVE_PATH_RES.some((re) => re.test(t)));
+  return tokens.some((t) => isSensitivePath(t));
 }
 
 export const WORKER_EDIT_DENY_REASON =
@@ -194,5 +194,14 @@ export const WORKER_EDIT_DENY_REASON =
 /** Edit|Write destinations a worker may never touch — same list as the Bash
  *  path fence above (R3-03). */
 export function isWorkerDeniedEditPath(absPath: string): boolean {
-  return SENSITIVE_PATH_RES.some((re) => re.test(absPath));
+  return isSensitivePath(absPath);
+}
+
+/** The fence is written with `/`; a Windows path (`C:\\x\\.env`) is the same
+ *  path, so backslashes count as separators. (On POSIX a backslash is a legal
+ *  filename character, but treating it as a separator here only ever widens the
+ *  deny set — the safe direction for a fence.) */
+function isSensitivePath(p: string): boolean {
+  const norm = p.replaceAll('\\', '/');
+  return SENSITIVE_PATH_RES.some((re) => re.test(norm));
 }

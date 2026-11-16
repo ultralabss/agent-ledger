@@ -1363,7 +1363,10 @@ async function cmdWhy(args: Args, client: HubClient, cfg: CliEnvConfig, io: Io):
   const raw = requireArg(args.positional[1], 'path, directory or glob');
   const repo = flag(args, 'repo') ?? (await resolveRepo(args, client, cfg, io));
   const { resolve } = await import('node:path');
-  const abs = resolve(io.cwd, raw);
+  // The API takes `/`-separated paths only (it rejects backslashes); on Windows
+  // `D:\\x\\y` goes over the wire as `D:/x/y`.
+  const resolved = resolve(io.cwd, raw);
+  const abs = process.platform === 'win32' ? resolved.replaceAll('\\', '/') : resolved;
   const res = await client.get(
     `/v1/repos/${encodeURIComponent(repo as string)}/why?path=${encodeURIComponent(abs)}`,
   );

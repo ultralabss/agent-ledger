@@ -18,7 +18,7 @@
  */
 
 import { appendFile, readFile, realpath, stat } from 'node:fs/promises';
-import { dirname, join } from 'node:path';
+import { dirname, isAbsolute, join } from 'node:path';
 import { defaultLedgerDir, expandHome } from '../../shared/src/paths.ts';
 import { isReadOnlyBash } from './hook-bash.ts';
 import { inboxState, type InboxState } from './hook-inbox.ts';
@@ -423,7 +423,7 @@ async function hubDownFallback(
         : typeof parsed.tool_input?.notebook_path === 'string'
           ? parsed.tool_input.notebook_path
           : null;
-    if (file === null || !file.startsWith('/')) return 0;
+    if (file === null || !isAbsolute(file)) return 0;
 
     const here = await toplevelOf(cwd);
     const there = await toplevelOf(file);
