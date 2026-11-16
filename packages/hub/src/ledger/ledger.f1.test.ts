@@ -2,11 +2,13 @@
  *  prefix aliases, periodic reindex. */
 
 import assert from 'node:assert/strict';
-import { chmod, readFile, rm, writeFile } from 'node:fs/promises';
+import { chmod, mkdir, readFile, rm, stat, symlink, writeFile } from 'node:fs/promises';
+import { join } from 'node:path';
 import test from 'node:test';
+import { isOwnedByMe } from '@agent-ledger/shared';
 import { skipOnWin32 } from '@agent-ledger/shared/testing';
 import { git } from '../git.ts';
-import { openTestLedger, startTestHub, tempConfig } from '../test-helpers.ts';
+import { makeCommittedRepo, openTestLedger, startTestHub, tempConfig } from '../test-helpers.ts';
 import { Ledger } from './ledger.ts';
 
 /* ---------------- R4: repos.yml lookups ---------------- */
@@ -373,4 +375,108 @@ test('sweep ends a dead session (> 24 h without a signal)', async (t) => {
   assert.notEqual(after?.ended_at, null, 'sweep wrote its ended_at');
   const journal = await fx.api('GET', '/v1/timeline?repo=acme&format=line');
   assert.match(journal.text, /session\.end · timeout 24h/);
+});
+
+/* ---------------- F3b B0b: pinned files, repo rm, bind ownership ---------------- */
+
+async function openWith(
+  overrides: { sync: boolean },
+  seed?: (dir: string) => Promise<void>,
+): Promise<{ ledger: Ledger; dir: string; cleanup: () => Promise<void> }> {
+  const tmp = await tempConfig(overrides);
+  if (seed) await seed(tmp.dir);
+  const ledger = new Ledger({ config: tmp.config, log: () => undefined });
+  await ledger.init();
+  await git(tmp.dir, ['config', 'user.email', 'test@agent-ledger.local']);
+  await git(tmp.dir, ['config', 'user.name', 'agent-ledger test']);
+  return {
+    ledger,
+    dir: tmp.dir,
+    cleanup: async () => {
+      await ledger.close();
+      await tmp.cleanup();
+    },
+  };
+}
+
+const HUMAN_IGNORE = 'node_modules/\n*.log\n';
+const HUMAN_ATTRS = '*.png binary\n';
+
+test('F3b: sync ON writes the byte-exact pinned .gitignore/.gitattributes, discarding human extras', async (t) => {
+  const fx = await openWith({ sync: true }, async (dir) => {
+    await mkdir(dir, { recursive: true });
+    await writeFile(join(dir, '.gitignore'), HUMAN_IGNORE, 'utf8');
+    await writeFile(join(dir, '.gitattributes'), HUMAN_ATTRS, 'utf8');
+  });
+  t.after(fx.cleanup);
+  assert.equal(await readFile(join(fx.dir, '.gitignore'), 'utf8'), '.hub/\n*.tmp\n');
+  assert.equal(await readFile(join(fx.dir, '.gitattributes'), 'utf8'), '* text eol=lf\n');
+});
+
+test('F3b: sync ON repairs a tampered/missing pin at every boot; a fresh ledger gets the same bytes', async (t) => {
+  const fresh = await openWith({ sync: true });
+  t.after(fresh.cleanup);
+  assert.equal(await readFile(join(fresh.dir, '.gitignore'), 'utf8'), '.hub/\n*.tmp\n');
+  assert.equal(await readFile(join(fresh.dir, '.gitattributes'), 'utf8'), '* text eol=lf\n');
+  // CRLF / dropped `.hub/` (the token-leak vector) is rewritten on the next boot
+  await writeFile(join(fresh.dir, '.gitignore'), '*.tmp\r\n', 'utf8');
+  await rm(join(fresh.dir, '.gitattributes'));
+  await fresh.ledger.close();
+  const again = new Ledger({ config: fresh.ledger.config, log: () => undefined });
+  await again.init();
+  t.after(() => again.close());
+  assert.equal(await readFile(join(fresh.dir, '.gitignore'), 'utf8'), '.hub/\n*.tmp\n');
+  assert.equal(await readFile(join(fresh.dir, '.gitattributes'), 'utf8'), '* text eol=lf\n');
+});
+
+test('F3b: sync OFF keeps the old behaviour (human lines kept, ours added)', async (t) => {
+  const fx = await openWith({ sync: false }, async (dir) => {
+    await writeFile(join(dir, '.gitignore'), HUMAN_IGNORE, 'utf8');
+    await writeFile(join(dir, '.gitattributes'), HUMAN_ATTRS, 'utf8');
+  });
+  t.after(fx.cleanup);
+  assert.equal(await readFile(join(fx.dir, '.gitignore'), 'utf8'), `${HUMAN_IGNORE}.hub/\n*.tmp\n`);
+  assert.equal(await readFile(join(fx.dir, '.gitattributes'), 'utf8'), `* text eol=lf\n${HUMAN_ATTRS}`);
+});
+
+test('F3b OQ-6: repo rm is refused when sync is on (nothing moved, repos.yml intact); allowed when off', async (t) => {
+  const on = await openWith({ sync: true });
+  t.after(on.cleanup);
+  await on.ledger.registerRepo({ slug: 'acme', prefix: 'ACME', path: null });
+  const before = await readFile(join(on.dir, 'repos.yml'), 'utf8');
+  await assert.rejects(() => on.ledger.removeRepo('acme'), /LEDGER_SYNC=1/);
+  assert.equal(await readFile(join(on.dir, 'repos.yml'), 'utf8'), before);
+  assert.equal(on.ledger.hasRepo('acme'), true);
+  assert.equal(await stat(join(on.dir, 'acme')).then(() => true, () => false), true, 'dir not archived');
+  assert.equal(await stat(join(on.dir, '.archive')).then(() => true, () => false), false);
+
+  const off = await openWith({ sync: false });
+  t.after(off.cleanup);
+  await off.ledger.registerRepo({ slug: 'acme', prefix: 'ACME', path: null });
+  const res = await off.ledger.removeRepo('acme');
+  assert.equal(res.slug, 'acme');
+  assert.equal(off.ledger.hasRepo('acme'), false);
+});
+
+test('A7: bindRepo refuses a checkout the current user does not own, before git runs in it', {
+  skip: skipOnWin32('POSIX-only: uid ownership'),
+}, async (t) => {
+  if (await isOwnedByMe('/usr')) return t.skip('running as the owner of /usr (root)');
+  const fx = await openWith({ sync: false });
+  t.after(fx.cleanup);
+  await fx.ledger.registerRepo({ slug: 'app', prefix: 'APP', path: null });
+  // `/usr` is root-owned: not mine, whether or not it is a git repo
+  await assert.rejects(() => fx.ledger.bindRepo('app', '/usr'), /not owned by the current user/);
+  // a symlink in a dir I own that points at it is resolved first, not trusted
+  const link = join(fx.dir, 'sneaky');
+  await symlink('/usr', link);
+  await assert.rejects(() => fx.ledger.bindRepo('app', link), /not owned by the current user/);
+  assert.equal(fx.ledger.repos().app?.path, null, 'nothing bound');
+  // a missing path keeps the old message; an owned checkout still binds
+  await assert.rejects(() => fx.ledger.bindRepo('app', join(fx.dir, 'nope')), /not a git repository/);
+  const code = await makeCommittedRepo('a7');
+  t.after(code.cleanup);
+  await code.commit('root', { 'a.txt': 'a' });
+  const cfg = await fx.ledger.bindRepo('app', code.path);
+  assert.ok(cfg.path);
 });

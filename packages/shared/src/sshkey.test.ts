@@ -4,13 +4,14 @@
 
 import assert from 'node:assert/strict';
 import { execFile, spawn } from 'node:child_process';
-import { chmod, mkdir, mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises';
+import { chmod, mkdir, mkdtemp, readFile, readdir, rm, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
 import { promisify } from 'node:util';
 import {
   DEVICE_ID_RE,
+  GIT_NAMESPACE,
   SIGN_NAMESPACE,
   SshKeygenError,
   generateKeyPair,
@@ -21,6 +22,7 @@ import {
   sshKeygenCandidates,
   signPayload,
   verifyPayload,
+  withPrivateTmp,
 } from './sshkey.ts';
 import { skipOnWin32 } from './testing.ts';
 
@@ -212,4 +214,58 @@ test('gitSigningArgs: the recipe really produces a commit that git verifies', { 
   await writeFile(allowed, `dev@ledger.invalid namespaces="git" ${stranger}\n`, { mode: 0o600 });
   const bad = await exec(gitBin, ['-C', repo, '-c', 'gpg.format=ssh', '-c', `gpg.ssh.allowedSignersFile=${allowed}`, 'verify-commit', 'HEAD'], { env }).then(() => true, () => false);
   assert.equal(bad, false);
+});
+
+/* ---------------- B0a: F-10 namespace parameter, DK-8 private tmp root ---------------- */
+
+test('F-10: a git-namespace signature verifies only with namespace "git"; ours only with the default', { skip }, async (t) => {
+  const dir = await scratch(t);
+  const tmpRoot = join(dir, 'tmp');
+  const key = await newKey(dir);
+  const pub = await goodPub(key);
+  const payload = Buffer.from('tree 0000\nauthor x\n\nmsg\n');
+  const gitSig = await signWithNamespace('git', key, payload);
+  const ours = await signPayload(payload, { keyFile: key });
+
+  assert.equal(await verifyPayload(payload, gitSig, pub, { tmpRoot }), false, 'default namespace refuses a git signature');
+  assert.equal(await verifyPayload(payload, gitSig, pub, { tmpRoot, namespace: SIGN_NAMESPACE }), false);
+  assert.equal(await verifyPayload(payload, gitSig, pub, { tmpRoot, namespace: GIT_NAMESPACE }), true);
+  assert.equal(await verifyPayload(payload, ours, pub, { tmpRoot, namespace: GIT_NAMESPACE }), false, 'ours is not a git signature');
+  assert.equal(await verifyPayload(payload, ours, pub, { tmpRoot, namespace: SIGN_NAMESPACE }), true);
+  // a third namespace verifies in neither
+  const other = await signWithNamespace('file', key, payload);
+  assert.equal(await verifyPayload(payload, other, pub, { tmpRoot, namespace: GIT_NAMESPACE }), false);
+  assert.equal(await verifyPayload(payload, other, pub, { tmpRoot }), false);
+  // the namespace is allowlisted: an arbitrary string never reaches argv / the signers file
+  await assert.rejects(
+    verifyPayload(payload, gitSig, pub, { tmpRoot, namespace: 'git" cert-authority' as never }),
+    (e: unknown) => e instanceof SshKeygenError && e.code === 'INVALID',
+  );
+  assert.deepEqual(await readdir(tmpRoot), []);
+});
+
+test('DK-8: the verify tmp root must be private — a 0777 root and a symlink root are refused, nothing is created in them', { skip }, async (t) => {
+  const dir = await scratch(t);
+  const key = await newKey(dir);
+  const pub = await goodPub(key);
+  const sig = await signPayload(Buffer.from('x'), { keyFile: key });
+
+  const loose = join(dir, 'loose');
+  await mkdir(loose, { mode: 0o700 });
+  await chmod(loose, 0o777);
+  await assert.rejects(verifyPayload(Buffer.from('x'), sig, pub, { tmpRoot: loose }), /permission|writable|private|PERMS/i);
+  await assert.rejects(withPrivateTmp(loose, async () => 1));
+  assert.deepEqual(await readdir(loose), [], 'no scratch dir created inside a loose root');
+
+  const real = join(dir, 'real');
+  await mkdir(real, { mode: 0o700 });
+  const link = join(dir, 'link');
+  await symlink(real, link);
+  await assert.rejects(withPrivateTmp(link, async () => 1));
+  assert.deepEqual(await readdir(real), []);
+
+  // a fresh root is created 0700 and works
+  const fresh = join(dir, 'fresh');
+  assert.equal(await verifyPayload(Buffer.from('x'), sig, pub, { tmpRoot: fresh }), true);
+  assert.equal((await (await import('node:fs/promises')).stat(fresh)).mode & 0o777, 0o700);
 });

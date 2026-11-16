@@ -326,24 +326,57 @@ export async function readRootSha(checkout: string): Promise<string | null> {
   return best !== null && rootShaSchema.safeParse(best.sha).success ? best.sha : null;
 }
 
+/** Schemes that name a network remote. `file://` (absolute path) and anything exotic is refused. */
+const NETWORK_SCHEMES = new Set(['http', 'https', 'ssh', 'git', 'git+ssh', 'ssh+git']);
+/** Well-known credential prefixes (GitHub, GitLab, Slack, npm, OpenAI-style, AWS). */
+const TOKEN_PREFIX_RE =
+  /^(?:gh[pousr]_|github_pat_|glpat-|glptt-|gldt-|xox[abeprs]-|npm_|sk-|pk_|rk_|AKIA|ASIA|AIza|ya29\.|eyJ)/i;
+
+/** A path segment that looks like a credential rather than an org/repo name. Errs on the side
+ *  of `null`: a missing hint only disables auto-bind, a leaked token reaches every peer. */
+function tokenShapedSegment(seg: string): boolean {
+  if (TOKEN_PREFIX_RE.test(seg)) return true;
+  if (/^[0-9a-f]{32,}$/i.test(seg)) return true; // hex digest/key
+  if (seg.length >= 40 && /^[A-Za-z0-9]+$/.test(seg)) return true; // long opaque run (hyphenated names are words)
+  // 20+ chars mixing upper, lower and digits with no word separators: random, not a name.
+  return (
+    seg.length >= 20 && /^[A-Za-z0-9]+$/.test(seg) && /[a-z]/.test(seg) && /[A-Z]/.test(seg) && /[0-9]/.test(seg)
+  );
+}
+
 /**
  * `origin` URL reduced to `host/org/repo`: scheme, userinfo (credentials!),
- * port-less query/fragment and a trailing `.git` are dropped. Anything that
- * does not come out as a plain `host/path` is rejected, so a token embedded in
- * the URL can never reach the synced `repos.yml`.
+ * port, query/fragment and a trailing `.git` are dropped. Anything that does
+ * not come out as a plain network `host/path` is rejected (`null`): absolute or
+ * home-relative paths (`file://`, `host:/abs`, `C:/x`, `~user`), a host that
+ * smuggles `user:secret`, empty/dot segments and token-shaped segments, so
+ * neither a local path nor a credential can reach the synced `repos.yml`.
  */
 export function originHintFromUrl(raw: string): string | null {
   let rest = raw.trim();
   if (rest === '' || rest.length > 500) return null;
+  let host: string;
+  let path: string;
   const scp = /^(?:[^@/:\s]+@)?([A-Za-z0-9.-]+):(?!\/\/)([^\s]+)$/.exec(rest);
   if (scp && !/^[a-z][a-z0-9+.-]*:\/\//i.test(rest)) {
-    rest = `${scp[1]}/${scp[2]}`;
+    host = scp[1] as string;
+    path = scp[2] as string;
   } else {
-    const m = /^[a-z][a-z0-9+.-]*:\/\/(?:[^@/\s]*@)?([^/\s]+)\/([^?#\s]+)/i.exec(rest);
-    if (!m) return null;
-    rest = `${(m[1] as string).replace(/:\d+$/, '')}/${m[2]}`;
+    const m = /^([a-z][a-z0-9+.-]*):\/\/(?:[^@/\s]*@)?([^/\s]+)\/([^?#\s]+)/i.exec(rest);
+    if (!m || !NETWORK_SCHEMES.has((m[1] as string).toLowerCase())) return null;
+    host = (m[2] as string).replace(/:\d{1,5}$/, '');
+    path = m[3] as string;
   }
-  rest = rest.replace(/\/+$/, '').replace(/\.git$/i, '').replace(/^\/+/, '');
+  // A one-letter "host" is a Windows drive (`C:/Users/..`), not a remote.
+  if (!/^[A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?$/.test(host) || host.length < 2) return null;
+  path = path.replace(/\/+$/, '').replace(/\.git$/i, '');
+  const segments = path.split('/');
+  for (const seg of segments) {
+    // empty = `host//abs` or `host:/abs`; `~x` = home dir; dot segments are traversal.
+    if (seg === '' || seg === '.' || seg === '..' || seg.startsWith('~')) return null;
+    if (tokenShapedSegment(seg)) return null;
+  }
+  rest = `${host}/${segments.join('/')}`;
   const hint = originHintSchema.safeParse(rest);
   return hint.success ? hint.data : null;
 }

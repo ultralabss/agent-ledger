@@ -107,3 +107,34 @@ test('syncVerify: default warn; warn|enforce accepted; anything else is a startu
     assert.throws(() => loadConfig({ ...base, LEDGER_SYNC_VERIFY: bad }), /LEDGER_SYNC_VERIFY/, bad);
   }
 });
+
+/* multi-device F3b: LEDGER_SYNC (default off, only "1" enables) and LEDGER_SYNC_INTERVAL_MS (clamped). */
+test('sync: default off; only "1" turns it on', () => {
+  assert.equal(loadConfig(base).sync, false);
+  assert.equal(loadConfig({ ...base, LEDGER_SYNC: '1' }).sync, true);
+  assert.equal(loadConfig({ ...base, LEDGER_SYNC: ' 1 ' }).sync, true);
+  for (const off of ['', '0', 'true', 'yes', 'on', '2', 'enforce']) {
+    assert.equal(loadConfig({ ...base, LEDGER_SYNC: off }).sync, false, off);
+  }
+});
+
+test('syncIntervalMs: default 60 s, clamped to 15 s..1 h, junk falls back to default', () => {
+  assert.equal(loadConfig(base).syncIntervalMs, 60_000);
+  assert.equal(loadConfig({ ...base, LEDGER_SYNC_INTERVAL_MS: '' }).syncIntervalMs, 60_000);
+  assert.equal(loadConfig({ ...base, LEDGER_SYNC_INTERVAL_MS: '120000' }).syncIntervalMs, 120_000);
+  assert.equal(loadConfig({ ...base, LEDGER_SYNC_INTERVAL_MS: '15000' }).syncIntervalMs, 15_000);
+  assert.equal(loadConfig({ ...base, LEDGER_SYNC_INTERVAL_MS: '3600000' }).syncIntervalMs, 3_600_000);
+  for (const low of ['0', '1', '-5', '14999']) {
+    assert.equal(loadConfig({ ...base, LEDGER_SYNC_INTERVAL_MS: low }).syncIntervalMs, 15_000, low);
+  }
+  for (const high of ['3600001', '999999999999', 'Infinity']) {
+    assert.equal(
+      loadConfig({ ...base, LEDGER_SYNC_INTERVAL_MS: high }).syncIntervalMs,
+      high === 'Infinity' ? 60_000 : 3_600_000,
+      high,
+    );
+  }
+  for (const junk of ['abc', 'NaN', '1e', '0x10x']) {
+    assert.equal(loadConfig({ ...base, LEDGER_SYNC_INTERVAL_MS: junk }).syncIntervalMs, 60_000, junk);
+  }
+});

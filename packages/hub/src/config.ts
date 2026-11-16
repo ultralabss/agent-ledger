@@ -75,7 +75,17 @@ export interface HubConfig {
   /** `LEDGER_SYNC_VERIFY`: `warn` (default) reports unsigned/foreign commits, `enforce`
    *  quarantines them. Read here; acted on by the sync loop (F3). */
   syncVerify: 'warn' | 'enforce';
+  /** `LEDGER_SYNC=1` turns the multi-device sync loop on. Default OFF: with it off the hub
+   *  never contacts a remote for sync (F3b invariant 15). Also switches the ledger to the
+   *  byte-exact pinned `.gitignore` / `.gitattributes` and refuses `repo rm`. */
+  sync: boolean;
+  /** Sync cycle period (ms), clamped to 15 s .. 1 h. */
+  syncIntervalMs: number;
 }
+
+const SYNC_INTERVAL_MIN_MS = 15_000;
+const SYNC_INTERVAL_MAX_MS = 3_600_000;
+const SYNC_INTERVAL_DEFAULT_MS = 60_000;
 
 const MINUTE = 60_000;
 const HOUR = 60 * MINUTE;
@@ -138,7 +148,19 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): HubConfig {
     groomWeekly: env.LEDGER_GROOM_WEEKLY?.trim() === '1',
     headlessTimeoutMs: clampedMs(env.LEDGER_HEADLESS_TIMEOUT_MS, 5 * MINUTE, 1_000, 30 * MINUTE),
     syncVerify: syncVerify(env.LEDGER_SYNC_VERIFY),
+    sync: env.LEDGER_SYNC?.trim() === '1',
+    syncIntervalMs: syncInterval(env.LEDGER_SYNC_INTERVAL_MS),
   };
+}
+
+/** Unlike `clampedMs`, an out-of-range number is CLAMPED (a remote must never be polled faster
+ *  than 15 s, and a multi-day value would silently stall sync); junk falls back to the default. */
+function syncInterval(raw: string | undefined): number {
+  const text = raw?.trim() ?? '';
+  if (text === '') return SYNC_INTERVAL_DEFAULT_MS;
+  const n = Number(text);
+  if (!Number.isFinite(n)) return SYNC_INTERVAL_DEFAULT_MS;
+  return Math.min(SYNC_INTERVAL_MAX_MS, Math.max(SYNC_INTERVAL_MIN_MS, Math.round(n)));
 }
 
 /** A typo (`enforced`) must not silently fall back to the weaker mode: unknown → startup error. */

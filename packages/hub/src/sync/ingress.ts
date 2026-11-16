@@ -20,8 +20,10 @@
 import { parse as parseYaml } from 'yaml';
 import {
   ITEM_ID_RE,
+  RESERVED_SYNC_WORKER,
   isSnowflake,
   parseDevicesYaml,
+  parseSnowflake,
   parseIntake,
   parseItem,
   reposSyncedFileSchema,
@@ -64,6 +66,8 @@ export type IngressRule =
   | 'type'
   | 'layout'
   | 'delete'
+  | 'delete-protected'
+  | 'hub-path'
   | 'size'
   | 'push-size'
   | 'push-count'
@@ -76,7 +80,9 @@ export type IngressRule =
   | 'claim-glob'
   | 'gitattributes'
   | 'gitattributes-driver'
-  | 'format';
+  | 'gitignore'
+  | 'format'
+  | 'reserved-worker';
 
 export interface IngressRejection {
   path: string;
@@ -94,6 +100,9 @@ export interface IngressOpts {
   maxChanges?: number;
   /** Highest `ledger.format` this hub supports. */
   maxFormat?: number;
+  /** `ledger.format` of the local tree. An incoming value below it is a downgrade
+   *  (rule `format`); absent = no monotonic check (only `1..maxFormat`). */
+  baseFormat?: number;
   /** Paths already in the local tree: a change that differs from one only by
    *  case is a collision on case-insensitive filesystems. */
   existingPaths?: Iterable<string>;
@@ -111,6 +120,16 @@ const WIN_BAD_CHARS_RE = /[<>:"|?*\\]/;
 const SHORT_NAME_RE = /~[0-9]/;
 const DRIVE_RE = /^[A-Za-z]:/;
 const RESERVED_SLUGS = new Set(['counters', 'intake']);
+
+/** `.hub/` is the hub's private state (token, device key, sync state): never part of a
+ *  synced tree. Case-insensitive, and tolerant of the trailing dot/space aliases Windows
+ *  and macOS fold onto the same directory, in ANY segment (not only the first). */
+function isHubPath(path: string): boolean {
+  for (const seg of path.split('/')) {
+    if (seg.replace(/[. ]+$/, '').toLowerCase() === '.hub') return true;
+  }
+  return false;
+}
 
 /** `null` = fine. Names the first structural problem of a repo-relative path. */
 function pathProblem(path: string): IngressRule | null {
@@ -222,6 +241,9 @@ function classify(path: string): Classified | null {
 /* ---------------- content rules ---------------- */
 
 const GITATTRIBUTES_EXACT = '* text eol=lf\n';
+/** Pinned (F3b invariant 10): what a fresh ledger writes (`GITIGNORE` in ledger.ts).
+ *  A peer that drops the `.hub/` line would get `.hub/device/key` staged. */
+const GITIGNORE_EXACT = '.hub/\n*.tmp\n';
 const DRIVER_ATTR_RE = /(?:^|\s)[-!]?(?:merge|filter|diff)(?:=|\s|$)/i;
 
 function decode(content: string | Uint8Array): string | null {
@@ -260,6 +282,7 @@ function contentProblem(
   path: string,
   text: string,
   maxFormat: number,
+  baseFormat: number | undefined,
   scan: (text: string) => readonly unknown[],
 ): IngressRule | null {
   // Secrets first: whatever else is wrong, a secret hit is the headline.
@@ -295,8 +318,11 @@ function contentProblem(
       const m = /^([0-9]{1,6})\n$/.exec(text);
       if (!m) return 'format';
       const n = Number(m[1]);
+      if (baseFormat !== undefined && n < baseFormat) return 'format'; // downgrade
       return n >= 1 && n <= maxFormat ? null : 'format';
     }
+    case 'gitignore':
+      return text === GITIGNORE_EXACT ? null : 'gitignore';
     case 'gitattributes':
       if (text === GITATTRIBUTES_EXACT) return null;
       return text.split(/\r?\n/).some((l) => DRIVER_ATTR_RE.test(l)) ? 'gitattributes-driver' : 'gitattributes';
@@ -319,7 +345,7 @@ function contentProblem(
         return 'frontmatter';
       }
     default:
-      // .gitignore, CONTEXT.md, DECISIONS.md, journal: free text, scanned above.
+      // CONTEXT.md, DECISIONS.md, journal: free text, scanned above.
       return null;
   }
 }
@@ -378,6 +404,8 @@ export function validateIncoming(changes: readonly unknown[], opts: IngressOpts 
   const maxPush = opts.maxPushBytes ?? MAX_PUSH_BYTES;
   const maxChanges = opts.maxChanges ?? MAX_PUSH_CHANGES;
   const maxFormat = opts.maxFormat ?? LEDGER_FORMAT;
+  const baseFormat =
+    typeof opts.baseFormat === 'number' && Number.isInteger(opts.baseFormat) ? opts.baseFormat : undefined;
   const scan = opts.scan ?? scanSecrets;
 
   if (!Array.isArray(changes)) return { accepted: [], rejected: [{ path: '(push)', rule: 'malformed' }] };
@@ -407,6 +435,10 @@ export function validateIncoming(changes: readonly unknown[], opts: IngressOpts 
       reject(c.path, 'duplicate');
       continue;
     }
+    if (isHubPath(c.path)) {
+      reject(c.path, 'hub-path'); // before every other rule: the headline for any `.hub/**` change, delete or not
+      continue;
+    }
     const pp = pathProblem(c.path);
     if (pp !== null) {
       reject(c.path, pp);
@@ -415,8 +447,11 @@ export function validateIncoming(changes: readonly unknown[], opts: IngressOpts 
     const cls = classify(c.path);
     if (c.deleted === true) {
       if (cls === null) reject(c.path, 'layout');
-      else if (cls.kind === 'item') reject(c.path, 'delete'); // invariant 4: items are never deleted
-      else live.push({ change: c, cls });
+      else if (cls.kind === 'item') reject(c.path, 'delete'); // invariant 4: soft, caller keeps the item
+      // Every other file is load-bearing: deleting `devices.yml` resets the trust root
+      // (base === null), `ledger.format`/pins/counters/repos/journal/context have no
+      // legitimate delete either. Hard rejection, distinct from the soft item rule.
+      else reject(c.path, 'delete-protected');
       continue;
     }
     const mp = modeProblem(c);
@@ -449,7 +484,11 @@ export function validateIncoming(changes: readonly unknown[], opts: IngressOpts 
       reject(c.path, 'encoding');
       continue;
     }
-    const cp = contentProblem(cls, c.path, text, maxFormat, scan);
+    if (cls.kind === 'intake' && parseSnowflake(cls.id as string).worker === RESERVED_SYNC_WORKER) {
+      reject(c.path, 'reserved-worker'); // worker 1023 = hub-synthesised records only
+      continue;
+    }
+    const cp = contentProblem(cls, c.path, text, maxFormat, baseFormat, scan);
     if (cp !== null) {
       reject(c.path, cp);
       continue;

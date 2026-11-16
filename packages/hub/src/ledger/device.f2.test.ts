@@ -31,19 +31,20 @@ test('fresh install: `device init` first → the hub adopts the key-derived devi
   assert.equal(ledger.device.slot, '');
 });
 
-test('hub booted first (F1 random id) → `device init` keeps that id; device.yml still loads in the hub', { skip }, async (t) => {
+test('hub booted first (F1 random id) → `device init --root` is refused (LEGACY_ID); explicit rekeyLegacy re-keys to the key-derived id', { skip }, async (t) => {
   const tmp = await tempConfig();
   t.after(tmp.cleanup);
   const first = await boot(tmp.dir, tmp.config);
   const f1Id = first.device.device_id;
   await first.close();
 
-  const r = await initDevice(tmp.dir, { root: true });
-  assert.equal(r.deviceId, f1Id, 'F1 id is never replaced');
+  await assert.rejects(() => initDevice(tmp.dir, { root: true }), /LEGACY_ID|legacy random id/);
+  const r = await initDevice(tmp.dir, { root: true, rekeyLegacy: true });
+  assert.notEqual(r.deviceId, f1Id, 're-keyed to the key-derived id');
 
   const again = await boot(tmp.dir, tmp.config);
   t.after(() => again.close());
-  assert.equal(again.device.device_id, f1Id);
+  assert.equal(again.device.device_id, r.deviceId);
   assert.match(await readFile(deviceLayout(tmp.dir).deviceYml, 'utf8'), /key_fp: SHA256:/);
 });
 
@@ -51,8 +52,8 @@ test('key material never reaches git: `.hub/` is ignored, devices.yml (public) i
   const tmp = await tempConfig();
   t.after(tmp.cleanup);
   const ledger = await boot(tmp.dir, tmp.config);
-  t.after(() => ledger.close());
-  await initDevice(tmp.dir, { root: true });
+  await ledger.close();
+  await initDevice(tmp.dir, { root: true, rekeyLegacy: true });
 
   for (const p of ['.hub/device/key', '.hub/device/key.pub', '.hub/device.yml', '.hub/allowed_signers', '.hub/tmp/x']) {
     const res = await git(tmp.dir, ['check-ignore', '-q', p]);

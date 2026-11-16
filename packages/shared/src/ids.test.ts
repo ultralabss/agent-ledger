@@ -10,6 +10,7 @@ import {
   itemIdScanRe,
   originHintSchema,
   parseItemId,
+  RESERVED_SYNC_WORKER,
   relPathSchema,
   repoIdentitySchema,
   reposSyncedFileSchema,
@@ -102,6 +103,30 @@ test('configureSnowflakeWorker re-points the process generator; "" restores the 
     assert.equal(snowflake.workerId, 1, 'single-machine ledger: unchanged worker id');
     assert.equal(parseSnowflake(generate()).worker, 1);
   } finally {
+    snowflake.setWorkerId(before);
+  }
+});
+
+test('F3b: worker 1023 is reserved; env 1023 is rejected, state untouched, no slot maps to it', () => {
+  assert.equal(RESERVED_SYNC_WORKER, 1023);
+  const before = snowflake.workerId;
+  const prevEnv = process.env.SNOWFLAKE_WORKER_ID;
+  try {
+    process.env.SNOWFLAKE_WORKER_ID = '1023';
+    assert.throws(() => configureSnowflakeWorker(''), /reserved for hub-synthesised sync records/);
+    assert.equal(snowflake.workerId, before, 'failed configure leaves the worker id alone');
+    process.env.SNOWFLAKE_WORKER_ID = '1022';
+    configureSnowflakeWorker('');
+    assert.equal(snowflake.workerId, 1022);
+    // a lettered slot ignores the env entirely, and never lands on 1023
+    process.env.SNOWFLAKE_WORKER_ID = '1023';
+    configureSnowflakeWorker('W');
+    assert.equal(snowflake.workerId, slotWorkerId('W'));
+    for (const ch of SLOT_LETTERS) assert.notEqual(slotWorkerId(ch), RESERVED_SYNC_WORKER);
+    assert.notEqual(slotWorkerId(''), RESERVED_SYNC_WORKER);
+  } finally {
+    if (prevEnv === undefined) delete process.env.SNOWFLAKE_WORKER_ID;
+    else process.env.SNOWFLAKE_WORKER_ID = prevEnv;
     snowflake.setWorkerId(before);
   }
 });

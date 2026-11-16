@@ -14,6 +14,7 @@ import {
   initDevice,
   listDevices,
   revokeDevice,
+  safeOutput,
 } from '@agent-ledger/shared';
 import { bool, flag, type Args } from './args.ts';
 
@@ -25,7 +26,7 @@ export interface DeviceIo {
 
 export const DEVICE_USAGE = `  ledger device init [--label <x>] [--root]  create this device's ed25519 key (idempotent; --root = first device)
   ledger device list [--json]               registered devices
-  ledger device approve <id>                trust that device's key on THIS machine
+  ledger device approve <id> --fp <SHA256:…>  trust that device's key on THIS machine (fingerprint as printed on that device)
   ledger device revoke <id> --reason "<why>"  permanent; its key is no longer trusted`;
 
 function ledgerDirOf(env: NodeJS.ProcessEnv): string {
@@ -70,8 +71,9 @@ export async function cmdDevice(args: Args, io: DeviceIo): Promise<number> {
       }
       case 'approve': {
         const id = args.positional[2];
-        if (id === undefined) return fail(io, 'usage: ledger device approve <id>');
-        const r = await approveDevice(dir, id);
+        const fp = flag(args, 'fp');
+        if (id === undefined || fp === undefined) return fail(io, 'usage: ledger device approve <id> --fp <SHA256:…>');
+        const r = await approveDevice(dir, id, fp);
         io.out(r.added ? `approved ${id}: its key is now trusted on this machine` : `${id} was already approved`);
         return 0;
       }
@@ -87,8 +89,10 @@ export async function cmdDevice(args: Args, io: DeviceIo): Promise<number> {
         return fail(io, `usage:\n${DEVICE_USAGE}`);
     }
   } catch (err) {
-    if (err instanceof DevicesError || err instanceof SshKeygenError) return fail(io, err.message);
-    if (err instanceof TrustError) return fail(io, `refused: ${err.message}`);
+    // Error text can derive from files a peer writes (devices.yml) or a tool's stderr: strip
+    // ANSI / bidi / control characters before it reaches the terminal (DK-2).
+    if (err instanceof DevicesError || err instanceof SshKeygenError) return fail(io, safeOutput(err.message));
+    if (err instanceof TrustError) return fail(io, `refused: ${safeOutput(err.message)}`);
     throw err;
   }
 }

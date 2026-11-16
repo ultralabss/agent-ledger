@@ -151,6 +151,8 @@ const GITIGNORE = `${GITIGNORE_LINES.join('\n')}\n`;
 /** Ledger files are LF on every platform (parsers tolerate CRLF, writers emit LF).
  *  Stops Windows `core.autocrlf` from rewriting them and making every file dirty. */
 const GITATTRIBUTES_LINE = '* text eol=lf';
+/** Byte-exact `.gitattributes` a fresh ledger writes; pinned in sync mode (ingress rejects any other text). */
+const GITATTRIBUTES = `${GITATTRIBUTES_LINE}\n`;
 
 export class Ledger {
   readonly paths: LedgerPaths;
@@ -319,6 +321,12 @@ export class Ledger {
    *  that an existing (human-written) `.gitignore` is missing (S1). */
   private async ensureGitignore(): Promise<void> {
     const existing = await readText(this.paths.gitignore);
+    if (this.config.sync) {
+      // F3b invariant 10: synced peers accept exactly this text, nothing else. Extra
+      // lines would make every peer quarantine our push (`sync init` warns before this).
+      if (existing !== GITIGNORE) await writeAtomic(this.paths.gitignore, GITIGNORE, 0o600);
+      return;
+    }
     if (existing === null) {
       await writeAtomic(this.paths.gitignore, GITIGNORE, 0o600);
       return;
@@ -336,6 +344,10 @@ export class Ledger {
    *  (`*.png binary`) keep precedence and nothing of theirs is rewritten. */
   private async ensureGitattributes(): Promise<void> {
     const existing = await readText(this.paths.gitattributes);
+    if (this.config.sync) {
+      if (existing !== GITATTRIBUTES) await writeAtomic(this.paths.gitattributes, GITATTRIBUTES, 0o600);
+      return;
+    }
     if (existing === null) {
       await writeAtomic(this.paths.gitattributes, `${GITATTRIBUTES_LINE}\n`, 0o600);
       return;
@@ -639,6 +651,11 @@ export class Ledger {
     if (slug === 'ops') {
       throw invalid('repo "ops" cannot be removed — it is the hub\'s own bookkeeping repo');
     }
+    // OQ-6: `.archive/` is tracked, so with sync on a removal would replicate the move to every
+    // peer (and ingress rejects deletes of repo files). Refused until an explicit unbind exists.
+    if (this.config.sync) {
+      throw conflict(`repo "${slug}" cannot be removed while LEDGER_SYNC=1 (it would propagate to every device)`);
+    }
     return this.queue.run(async () => {
       await this.loadRepos();
       if (!this.hasRepo(slug)) throw notFound(`repo "${slug}" does not exist`);
@@ -760,10 +777,28 @@ export class Ledger {
    */
   async bindRepo(slug: string, rawPath: string): Promise<RepoConfig> {
     if (!this.hasRepo(slug)) throw notFound(`unknown repo "${slug}" — use \`ledger repo add\``);
-    const top = await gitToplevel(expandHome(rawPath));
-    if (!top) {
-      throw invalid(`"${rawPath}" is not a git repository (git rev-parse --show-toplevel failed)`);
+    // A7: ownership BEFORE any git runs in the directory (its .git/config is attacker-controlled
+    // in a checkout another user owns), and again for the resolved toplevel. Fail closed.
+    const notGit = (): LedgerError =>
+      invalid(`"${rawPath}" is not a git repository (git rev-parse --show-toplevel failed)`);
+    const notMine = (): LedgerError =>
+      conflict(`"${rawPath}" is not owned by the current user — refusing to bind a checkout you do not own`);
+    let realInput: string;
+    try {
+      realInput = await realpath(expandHome(rawPath));
+    } catch {
+      throw notGit();
     }
+    if (!(await isOwnedByMe(realInput))) throw notMine();
+    const top = await gitToplevel(realInput);
+    if (!top) throw notGit();
+    let realTop: string;
+    try {
+      realTop = await realpath(top);
+    } catch {
+      throw notGit();
+    }
+    if (!(await isOwnedByMe(realTop))) throw notMine();
     const path = normalizeGitPath(top);
     const identity = await this.identityFor(path);
     return this.queue.run(async () => {

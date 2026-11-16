@@ -23,6 +23,10 @@ import { assertPrivateFile, ensurePrivateDir, resolveTrustedExecutable, TrustErr
 
 /** Signature namespace: a signature made for another purpose never verifies here. */
 export const SIGN_NAMESPACE = 'agent-ledger-v1';
+/** Namespace git uses for SSH commit signatures (`gpg.format=ssh`). */
+export const GIT_NAMESPACE = 'git';
+export type SignNamespace = typeof SIGN_NAMESPACE | typeof GIT_NAMESPACE;
+const KNOWN_NAMESPACES: readonly string[] = [SIGN_NAMESPACE, GIT_NAMESPACE];
 /** `d_` + 10 base32 chars. The only shape allowed into a file name or a principal. */
 export const DEVICE_ID_RE = /^d_[a-z2-7]{10}$/;
 
@@ -287,13 +291,18 @@ export interface VerifyOpts {
   tmpRoot: string;
   bin?: string;
   timeoutMs?: number;
+  /** Signature namespace the signature must have been made for (default `agent-ledger-v1`).
+   *  A signature for another namespace never verifies: the allowed-signers entry and `-n`
+   *  both carry exactly this value. Allowlisted — never taken from input as-is. */
+  namespace?: SignNamespace;
 }
 
-/** Private scratch dir (0700 / owner-only ACL) that is removed even when `fn` throws. */
+/** Private scratch dir (0700 / owner-only ACL) that is removed even when `fn` throws.
+ *  The root is created-or-VERIFIED private on every platform (`ensurePrivateDir`: a root
+ *  that exists with loose permissions, a foreign owner or a symlink is refused, never reused). */
 export async function withPrivateTmp<T>(root: string, fn: (dir: string) => Promise<T>): Promise<T> {
   requireAbsolute(root, 'tmp root');
-  if (process.platform === 'win32') await ensurePrivateDir(root);
-  else await mkdir(root, { recursive: true, mode: 0o700 });
+  await ensurePrivateDir(root);
   const dir = nodePath.join(root, randomBytes(8).toString('hex'));
   if (process.platform === 'win32') await ensurePrivateDir(dir);
   else await mkdir(dir, { mode: 0o700 });
@@ -316,17 +325,19 @@ export async function verifyPayload(
 ): Promise<boolean> {
   const pub = parseEd25519Pub(pubkey);
   if (pub === null) throw new SshKeygenError('INVALID', 'pubkey is not a canonical ssh-ed25519 line');
+  const ns = opts.namespace ?? SIGN_NAMESPACE;
+  if (!KNOWN_NAMESPACES.includes(ns)) throw new SshKeygenError('INVALID', 'unknown signature namespace');
   if (bytes.length > MAX_PAYLOAD_BYTES) return false;
   if (!isArmoredSignature(sig)) return false;
   const exe = opts.bin ?? (await resolveSshKeygen());
   return withPrivateTmp(opts.tmpRoot, async (dir) => {
     const allowed = nodePath.join(dir, 'allowed');
     const sigFile = nodePath.join(dir, 'sig');
-    await writeFile(allowed, `signer namespaces="${SIGN_NAMESPACE}" ${pub.line}\n`, { mode: 0o600, flag: 'wx' });
+    await writeFile(allowed, `signer namespaces="${ns}" ${pub.line}\n`, { mode: 0o600, flag: 'wx' });
     await writeFile(sigFile, sig.endsWith('\n') ? sig : `${sig}\n`, { mode: 0o600, flag: 'wx' });
     const r = await run(
       exe,
-      ['-Y', 'verify', '-f', allowed, '-I', 'signer', '-n', SIGN_NAMESPACE, '-s', sigFile],
+      ['-Y', 'verify', '-f', allowed, '-I', 'signer', '-n', ns, '-s', sigFile],
       bytes,
       opts.timeoutMs ?? SIGN_TIMEOUT_MS,
     );

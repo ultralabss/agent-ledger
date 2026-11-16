@@ -156,7 +156,7 @@ test('T14: other .git* names are rejected, root .gitignore/.gitattributes are al
   const bad = ['.git/config', '.gitmodules', 'acme/.gitignore', 'acme/.gitattributes', '.GIT/hooks/pre-commit', 'acme/items/.gitkeep'];
   const rules = rulesOf(bad.map((p) => blob(p, 'x\n')));
   for (const p of bad) assert.equal(rules.get(p), 'git-name', p);
-  assert.equal(validateIncoming([blob('.gitignore', '.hub/\n')]).rejected.length, 0);
+  assert.equal(validateIncoming([blob('.gitignore', '.hub/\n*.tmp\n')]).rejected.length, 0);
 });
 
 test('T14: layout allowlist — anything not named is rejected (fail-closed)', () => {
@@ -390,13 +390,104 @@ test('items: frontmatter schema, id/repo must match the path, claim globs valida
   assert.equal(rules.has('acme/items/ACME-13.md'), false, '32 globs is the limit');
 });
 
-test('items are never deleted; other deletions follow the layout allowlist', () => {
-  const del = (path: string): IncomingChange => ({ path, mode: '000000', type: '', size: 0, deleted: true });
-  const rules = rulesOf([del('acme/items/ACME-1.md'), del('../x'), del('README.md'), del('intake/2026-11/1789130426000123.md')]);
+const del = (path: string): IncomingChange => ({ path, mode: '000000', type: '', size: 0, deleted: true });
+
+test('items are never deleted (soft `delete`); unknown paths follow the layout allowlist', () => {
+  const rules = rulesOf([del('acme/items/ACME-1.md'), del('../x'), del('README.md')]);
   assert.equal(rules.get('acme/items/ACME-1.md'), 'delete');
   assert.equal(rules.get('../x'), 'path-invalid');
   assert.equal(rules.get('README.md'), 'layout');
-  assert.equal(rules.has('intake/2026-11/1789130426000123.md'), false);
+});
+
+test('F-3: deleting ANY non-item file is a hard `delete-protected` rejection (devices.yml = trust-root reset)', () => {
+  const paths = [
+    'devices.yml',
+    'ledger.format',
+    '.gitattributes',
+    '.gitignore',
+    'repos.yml',
+    `counters/d_${GOOD_DEV}.yml`,
+    'acme/CONTEXT.md',
+    'acme/DECISIONS.md',
+    'acme/journal/2026-11.md',
+    'intake/2026-11/1789130426000123.md',
+  ];
+  const res = validateIncoming(paths.map(del));
+  assert.deepEqual(res.accepted, []);
+  assert.equal(res.rejected.length, paths.length);
+  for (const r of res.rejected) assert.equal(r.rule, 'delete-protected', r.path);
+  // mixed with an item delete: each keeps its own rule so the caller can tell soft from hard
+  const mixed = rulesOf([del('devices.yml'), del('acme/items/ACME-1.md')]);
+  assert.equal(mixed.get('devices.yml'), 'delete-protected');
+  assert.equal(mixed.get('acme/items/ACME-1.md'), 'delete');
+});
+
+test('F-2: `.hub/**` is rejected (rule hub-path) in every spelling, for writes and deletes', () => {
+  const bad = [
+    '.hub/token',
+    '.hub/device/key',
+    '.HUB/device/key',
+    '.Hub/x.md',
+    '.hub',
+    '.hub./token', // trailing dot alias (Windows)
+    '.hub /token', // trailing space alias
+    'acme/.hub/x',
+    'acme/items/.HUB/ACME-1.md',
+  ];
+  const changes = bad.map((p) => blob(p, 'x\n'));
+  const rules = rulesOf(changes);
+  for (const p of bad) assert.equal(rules.get(p), 'hub-path', p);
+  const res = validateIncoming([...bad.map(del), ...goodPush()]);
+  assert.deepEqual(new Set(res.rejected.map((r) => r.rule)), new Set(['hub-path']));
+  assert.equal(res.accepted.length, goodPush().length, 'rest of a valid push unaffected');
+  // look-alikes are not `.hub`
+  for (const p of ['.hubx/a', 'hub/a', 'acme/hub.md']) {
+    assert.notEqual(rulesOf([blob(p, 'x\n')]).get(p), 'hub-path', p);
+  }
+});
+
+test('F-2: `.gitignore` is pinned byte-exact (a missing `.hub/` line is the token-leak vector)', () => {
+  assert.deepEqual(validateIncoming([blob('.gitignore', '.hub/\n*.tmp\n')]).rejected, []);
+  for (const text of [
+    '',
+    '*.tmp\n',
+    '.hub/\n',
+    '*.tmp\n.hub/\n',
+    '.hub/\n*.tmp',
+    '.hub/\r\n*.tmp\r\n',
+    '.hub/\n*.tmp\n\n',
+    '.hub/\n*.tmp\n!.hub/token\n',
+    '# .hub/\n*.tmp\n',
+    '.hub/\n*.tmp\nnode_modules/\n',
+  ]) {
+    assert.equal(rulesOf([blob('.gitignore', text)]).get('.gitignore'), 'gitignore', JSON.stringify(text));
+  }
+});
+
+test('F-4: ledger.format is monotonic against baseFormat', () => {
+  assert.deepEqual(validateIncoming([blob('ledger.format', '2\n')], { baseFormat: 2 }).rejected, []);
+  assert.deepEqual(validateIncoming([blob('ledger.format', '3\n')], { baseFormat: 2, maxFormat: 3 }).rejected, []);
+  assert.equal(rulesOf([blob('ledger.format', '1\n')], { baseFormat: 2 }).get('ledger.format'), 'format', 'downgrade');
+  // no baseFormat: only the 1..maxFormat window applies (unchanged behaviour)
+  assert.deepEqual(validateIncoming([blob('ledger.format', '1\n')]).rejected, []);
+  // junk baseFormat is ignored, not trusted
+  assert.deepEqual(validateIncoming([blob('ledger.format', '1\n')], { baseFormat: Number.NaN }).rejected, []);
+});
+
+test('1.6: intake names whose snowflake worker is 1023 are rejected; other workers pass', () => {
+  const good = goodPush().find((c) => c.path.startsWith('intake/')) as IncomingChange;
+  const text = good.content as string;
+  const idFor = (worker: number): string => String((1789130426000n << 22n) | (BigInt(worker) << 12n) | 5n);
+  const mk = (worker: number): IncomingChange => {
+    const id = idFor(worker);
+    return blob(`intake/2026-11/${id}.md`, text.replace('1789130426000123', id));
+  };
+  const reserved = mk(1023);
+  assert.equal(rulesOf([reserved]).get(reserved.path), 'reserved-worker');
+  for (const w of [0, 1, 2, 25, 1022]) {
+    const c = mk(w);
+    assert.equal(rulesOf([c]).has(c.path), false, `worker ${w}`);
+  }
 });
 
 test('intake: schema and id/file-name match', () => {

@@ -79,11 +79,23 @@ test('F2.3 device list / approve / revoke through the CLI; revoke is permanent',
   assert.match(list.out.join('\n'), new RegExp(`${otherId} slot W win active NOT-APPROVED SHA256:`));
   assert.match(list.out.join('\n'), new RegExp(`${selfId} slot - mac active \\(this device\\) trusted`));
 
-  const approve = await ledgerCli(dir, ['device', 'approve', otherId]);
+  const fp = (await ledgerCli(dir2, ['device', 'init'])).out[1]?.match(/SHA256:\S{43}/)?.[0] ?? '';
+  assert.match(fp, /^SHA256:/);
+  // DK-1: no fingerprint / wrong fingerprint → exit 4, nothing trusted
+  const noFp = await ledgerCli(dir, ['device', 'approve', otherId]);
+  assert.equal(noFp.code, 4);
+  assert.match(noFp.err.join('\n'), /usage: ledger device approve <id> --fp/);
+  const wrongFp = await ledgerCli(dir, ['device', 'approve', otherId, '--fp', `SHA256:${'A'.repeat(43)}`]);
+  assert.equal(wrongFp.code, 4);
+  assert.match(wrongFp.err.join('\n'), /does not match/);
+  assert.match((await ledgerCli(dir, ['device', 'list'])).out.join('\n'), new RegExp(`${otherId} slot W win active NOT-APPROVED`));
+  assert.equal((await ledgerCli(dir, ['device', 'approve', otherId, '--fp', `${fp} `])).code, 4, 'trailing space');
+
+  const approve = await ledgerCli(dir, ['device', 'approve', otherId, '--fp', fp]);
   assert.equal(approve.code, 0, approve.err.join('\n'));
   assert.match(approve.out[0] ?? '', /now trusted/);
-  assert.match((await ledgerCli(dir, ['device', 'approve', otherId])).out[0] ?? '', /already approved/);
-  assert.equal((await ledgerCli(dir, ['device', 'approve', '../../etc/passwd'])).code, 4);
+  assert.match((await ledgerCli(dir, ['device', 'approve', otherId, `--fp=${fp}`])).out[0] ?? '', /already approved/);
+  assert.equal((await ledgerCli(dir, ['device', 'approve', '../../etc/passwd', '--fp', fp])).code, 4);
   assert.equal((await ledgerCli(dir, ['device', 'approve'])).code, 4);
 
   const noReason = await ledgerCli(dir, ['device', 'revoke', otherId]);
@@ -95,7 +107,7 @@ test('F2.3 device list / approve / revoke through the CLI; revoke is permanent',
   assert.match(rev.out[0] ?? '', /no longer trusted/);
 
   assert.equal((await ledgerCli(dir, ['device', 'revoke', otherId, '--reason', 'again'])).code, 4);
-  const back = await ledgerCli(dir, ['device', 'approve', otherId]);
+  const back = await ledgerCli(dir, ['device', 'approve', otherId, '--fp', fp]);
   assert.equal(back.code, 4);
   assert.match(back.err.join('\n'), /revoked/);
   list = await ledgerCli(dir, ['device', 'list', '--json']);
@@ -106,7 +118,7 @@ test('F2.3 device list / approve / revoke through the CLI; revoke is permanent',
 test('F2.3 approve/revoke on a machine that is not a registered member → exit 4', { skip }, async (t) => {
   const dir = await ledger(t);
   await ledgerCli(dir, ['device', 'init']);
-  const r = await ledgerCli(dir, ['device', 'approve', 'd_aaaaaaaaaa']);
+  const r = await ledgerCli(dir, ['device', 'approve', 'd_aaaaaaaaaa', '--fp', `SHA256:${'A'.repeat(43)}`]);
   assert.equal(r.code, 4);
   assert.match(r.err.join('\n'), /not registered/);
 });
@@ -136,4 +148,27 @@ test('F2.5 ledger doctor: device checks appear only after init, and a loose key 
   const bad = await doctor();
   assert.equal(bad.checks.find((c) => c.id === 'device_key')?.status, 'fail');
   assert.equal(bad.code, 1);
+});
+
+test('DK-2: hostile devices.yml → clean one-line CLI error (no ANSI / bidi / echo of the input)', { skip }, async (t) => {
+  const dir = await ledger(t);
+  await ledgerCli(dir, ['device', 'init', '--root']);
+  const l = deviceLayout(dir);
+  const ESC = '\u001b';
+  const hostile = `${ESC}[2J${ESC}]0;pwned\u0007\u202eevil`;
+  const good = await readFile(l.devicesYml, 'utf8');
+  for (const text of [
+    good.replace('label: mac', `label: ${JSON.stringify(hostile)}`),
+    good.replace('role: owner', `role: owner\n  ${JSON.stringify(hostile)}: 1`),
+    good.replace(/pubkey: \S+ \S+/, `pubkey: ${JSON.stringify(`${hostile}`)}`),
+  ]) {
+    await writeFile(l.devicesYml, text);
+    for (const argv of [['device', 'list'], ['device', 'approve', 'd_aaaaaaaaaa', '--fp', `SHA256:${'A'.repeat(43)}`], ['device', 'revoke', 'd_aaaaaaaaaa', '--reason', 'x']]) {
+      const r = await ledgerCli(dir, argv);
+      assert.equal(r.code, 4);
+      const all = [...r.out, ...r.err].join('\n');
+      assert.ok(!all.includes(ESC) && !/[\u0007\u202a-\u202e]/.test(all) && !all.includes('pwned') && !all.includes('evil'), all);
+      assert.equal(r.err.length, 1, 'one line');
+    }
+  }
 });

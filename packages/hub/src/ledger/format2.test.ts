@@ -463,11 +463,14 @@ test('A8: SNOWFLAKE_WORKER_ID 2..25 is rejected on the primary at startup; other
     );
     assert.equal(snowflake.workerId, prevWorker, 'worker id untouched by the failed start');
   }
-  for (const okValue of ['0', '1', '26', '1023']) {
+  for (const okValue of ['0', '1', '26', '1022']) {
     process.env.SNOWFLAKE_WORKER_ID = okValue;
     configureSnowflakeWorker('');
     assert.equal(snowflake.workerId, Number(okValue));
   }
+  // 1023 is reserved for hub-synthesised sync records (F3b plan 1.6)
+  process.env.SNOWFLAKE_WORKER_ID = '1023';
+  assert.throws(() => configureSnowflakeWorker(''), /reserved for hub-synthesised sync records/);
   process.env.SNOWFLAKE_WORKER_ID = '7';
   configureSnowflakeWorker('W'); // a lettered device ignores the env entirely
   assert.equal(snowflake.workerId, slotWorkerId('W'));

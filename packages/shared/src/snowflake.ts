@@ -27,6 +27,11 @@ const MAX_SEQUENCE = (1n << SEQUENCE_BITS) - 1n; // 4095
 const MAX_TIMESTAMP = (1n << TIMESTAMP_BITS) - 1n;
 const MAX_ID = (1n << 63n) - 1n;
 
+/** Worker id of hub-synthesised sync records (sync-comment ids, engine ids).
+ *  Never a device slot and never selectable via `SNOWFLAKE_WORKER_ID` on a
+ *  process that mints ids with `generate()` (F3b invariant 17). */
+export const RESERVED_SYNC_WORKER = 1023;
+
 export const SNOWFLAKE_RE = /^\d{1,20}$/;
 
 export interface ParsedSnowflake {
@@ -174,6 +179,11 @@ export function configureSnowflakeWorker(slot: string): void {
   if (worker >= 2 && worker < 2 + SLOT_LETTERS.length) {
     throw new Error(
       `SNOWFLAKE_WORKER_ID ${worker} is reserved for device slots (2..${1 + SLOT_LETTERS.length}); unset it or use another value on the primary`,
+    );
+  }
+  if (worker === RESERVED_SYNC_WORKER) {
+    throw new Error(
+      `SNOWFLAKE_WORKER_ID ${worker} is reserved for hub-synthesised sync records; use another value on the primary`,
     );
   }
   snowflake.setWorkerId(worker);

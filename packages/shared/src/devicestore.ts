@@ -8,12 +8,16 @@
  *   - init never regenerates an existing key and never changes an existing device_id;
  *   - revocation is monotonic, the revoked key leaves allowed_signers FIRST (fail safe),
  *     a slot is never handed out again;
- *   - every file we parse from disk is size-capped, symlink-refused and schema-validated.
+ *   - every file we parse from disk is size-capped, symlink-refused and schema-validated;
+ *     `allowed_signers` (the local trust anchor) is also owner/mode-checked before every read;
+ *   - every mutating operation (init / approve / revoke / add / adopt / re-key) runs under ONE
+ *     lock (`.hub/device.lock`) and re-reads its inputs inside it, so approve racing revoke can
+ *     never resurrect a revoked key.
  */
 
-import { randomBytes } from 'node:crypto';
+import { randomBytes, timingSafeEqual } from 'node:crypto';
 import { constants } from 'node:fs';
-import { copyFile, link, lstat, mkdir, open, rm, writeFile } from 'node:fs/promises';
+import { copyFile, link, lstat, mkdir, open, readdir, rm, writeFile } from 'node:fs/promises';
 import nodePath from 'node:path';
 import { parse as parseYaml, stringify as stringifyYaml } from 'yaml';
 import {
@@ -24,6 +28,7 @@ import {
   labelSchema,
   parseAllowedSigners,
   parseDevicesYaml,
+  safeOutput,
   renderAllowedSigners,
   renderDevicesYaml,
   type DeviceEntry,
@@ -32,8 +37,9 @@ import {
   type Signer,
 } from './devices.ts';
 import { renameRetry } from './fsretry.ts';
-import { assertPrivateFile, ensurePrivateDir, TrustError } from './platformTrust.ts';
+import { assertPrivateFile, ensurePrivateDir, isOwnedByMe, isStatOwnedByMe, TrustError } from './platformTrust.ts';
 import { isSingleLine } from './sanitize.ts';
+import { SLOT_LETTERS } from './snowflake.ts';
 import {
   DEVICE_ID_RE,
   SshKeygenError,
@@ -119,14 +125,78 @@ async function writeAtomic(path: string, data: string): Promise<void> {
   }
 }
 
-async function ensureDirs(l: DeviceLayout): Promise<void> {
+async function ensureHubDir(l: DeviceLayout): Promise<void> {
   if (process.platform === 'win32') {
     await ensurePrivateDir(l.hubDir);
   } else {
     await mkdir(l.root, { recursive: true, mode: 0o700 });
     await mkdir(l.hubDir, { recursive: true, mode: 0o700 });
   }
+}
+
+async function ensureDirs(l: DeviceLayout): Promise<void> {
+  await ensureHubDir(l);
   await ensurePrivateDir(l.deviceDir);
+}
+
+/* ---------------- one lock for every mutating device operation (DK-5) ---------------- */
+
+const LOCK_WAIT_MS = 10_000;
+/** A lock whose holder process is gone is taken over after this; any lock older than
+ *  `LOCK_ABANDONED_MS` is abandoned (operations take milliseconds; a recycled pid must not wedge us). */
+const LOCK_DEAD_HOLDER_MS = 2_000;
+const LOCK_ABANDONED_MS = 5 * 60_000;
+
+function pidAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (err) {
+    return (err as NodeJS.ErrnoException).code !== 'ESRCH';
+  }
+}
+
+/** `true` when a stale lock was removed. Symlink / non-regular lock files throw (refused). */
+async function clearStaleLock(lockPath: string): Promise<boolean> {
+  const first = await readSmall(lockPath, 256);
+  if (first === null) return true; // vanished meanwhile: just retry the create
+  const st = await lstat(lockPath).catch(() => null);
+  if (st === null) return true;
+  const age = Math.abs(Date.now() - st.mtimeMs); // clock jumps: distance, not difference
+  const pid = /^(\d{1,10}) /.exec(first)?.[1];
+  const dead = pid === undefined || !pidAlive(Number(pid));
+  if (!((dead && age > LOCK_DEAD_HOLDER_MS) || age > LOCK_ABANDONED_MS)) return false;
+  if ((await readSmall(lockPath, 256)) !== first) return false; // the holder changed: not stale
+  await rm(lockPath, { force: true });
+  return true;
+}
+
+/** Exclusive (`wx`, 0600) lock file next to the device identity. Re-entrancy is NOT supported:
+ *  inner helpers take no lock; only the public operations do. */
+async function withDeviceLock<T>(l: DeviceLayout, fn: () => Promise<T>): Promise<T> {
+  await ensureHubDir(l);
+  const lockPath = nodePath.join(l.hubDir, 'device.lock');
+  const token = `${String(process.pid)} ${String(Date.now())} ${randomBytes(8).toString('hex')}\n`;
+  const t0 = process.hrtime.bigint(); // monotonic: the wait budget must not follow the wall clock
+  for (;;) {
+    try {
+      await writeFile(lockPath, token, { encoding: 'utf8', mode: 0o600, flag: 'wx' });
+      break;
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== 'EEXIST') throw err;
+    }
+    if (await clearStaleLock(lockPath)) continue;
+    if (Number(process.hrtime.bigint() - t0) / 1e6 > LOCK_WAIT_MS) {
+      throw new DevicesError('LOCKED', 'another ledger device operation is running — retry in a moment');
+    }
+    await new Promise((r) => setTimeout(r, 15 + Math.floor(Math.random() * 25)));
+  }
+  try {
+    return await fn();
+  } finally {
+    // Remove only OUR lock (a takeover after a very long stall must not delete the new holder's).
+    if ((await readSmall(lockPath, 256).catch(() => null)) === token) await rm(lockPath, { force: true }).catch(() => undefined);
+  }
 }
 
 /* ---------------- readers ---------------- */
@@ -156,7 +226,11 @@ export async function readDevices(l: DeviceLayout): Promise<DevicesFile | null> 
   return text === null ? null : parseDevicesYaml(text);
 }
 
+/** `.hub/allowed_signers` is the local trust anchor: owner / mode / link-count are verified
+ *  BEFORE every read (a group-writable or foreign-owned file is refused, never parsed). */
 export async function readSigners(l: DeviceLayout): Promise<Signer[]> {
+  if (!(await exists(l.allowedSigners))) return [];
+  await assertPrivateFile(l.allowedSigners, { secret: true });
   const text = await readSmall(l.allowedSigners);
   return text === null ? [] : parseAllowedSigners(text);
 }
@@ -175,6 +249,10 @@ export interface InitOptions {
   label?: string;
   /** Register this device as the TOFU root in devices.yml (refused if one exists). */
   root?: boolean;
+  /** One-time migration of an F1 random device id to the key-derived one, only together with
+   *  `root` and only while no devices.yml exists (DK-7). `ledger sync init` passes it; the plain
+   *  `device init --root` does not. */
+  rekeyLegacy?: boolean;
   /** Test seam. */
   bin?: string;
   now?: Date;
@@ -224,15 +302,48 @@ async function exists(path: string): Promise<boolean> {
   }
 }
 
-/** Idempotent. Never regenerates a key, never rewrites an existing device_id. */
+/** `.gen-*` scratch dirs older than this are leftovers of a crashed init (DK-6). */
+const GEN_STALE_MS = 10 * 60_000;
+
+async function sweepStaleGen(l: DeviceLayout, nowMs: number): Promise<void> {
+  let names: string[];
+  try {
+    names = await readdir(l.deviceDir);
+  } catch {
+    return;
+  }
+  for (const name of names) {
+    if (!/^\.gen-[0-9a-f]{12}$/.test(name)) continue;
+    const p = nodePath.join(l.deviceDir, name);
+    const st = await lstat(p).catch(() => null);
+    // Only real directories we own; a symlink or foreign entry is left alone (never followed).
+    if (st === null || st.isSymbolicLink() || !st.isDirectory()) continue;
+    // win32: the owner is an SID, so ask the path (isStatOwnedByMe is fail-closed false there).
+    if (!(process.platform === 'win32' ? await isOwnedByMe(p) : isStatOwnedByMe(st))) continue;
+    if (Math.abs(nowMs - st.mtimeMs) <= GEN_STALE_MS) continue; // fresh: a live init may own it
+    await rm(p, { recursive: true, force: true }).catch(() => undefined);
+  }
+}
+
+/** Idempotent. Never regenerates a key, never rewrites an existing device_id (except the
+ *  explicit one-time `rekeyLegacy` migration). */
 export async function initDevice(ledgerDir: string, opts: InitOptions = {}): Promise<InitResult> {
   if (opts.label !== undefined && !labelSchema.safeParse(opts.label).success) {
     throw new DevicesError('LABEL_INVALID', 'label: lowercase letters, digits, - (max 32)');
   }
+  if (opts.rekeyLegacy === true && opts.root !== true) {
+    throw new DevicesError('REKEY_REFUSED', 'rekeyLegacy is only valid together with root');
+  }
   const bin = opts.bin ?? (await resolveSshKeygen()); // fail closed before anything is created
   const l = deviceLayout(ledgerDir);
-  const existing = await readDeviceFile(l); // a broken identity is refused before anything is created
+  await readDeviceFile(l); // a broken identity is refused before anything is created
   await ensureDirs(l);
+  return withDeviceLock(l, () => initLocked(l, opts, bin));
+}
+
+async function initLocked(l: DeviceLayout, opts: InitOptions, bin: string): Promise<InitResult> {
+  const existing = await readDeviceFile(l); // re-read under the lock
+  await sweepStaleGen(l, (opts.now ?? new Date()).getTime());
 
   /* ---- key ---- */
   let keyCreated = false;
@@ -300,11 +411,24 @@ export async function initDevice(ledgerDir: string, opts: InitOptions = {}): Pro
   let devices = await readDevices(l);
   if (opts.root === true) {
     const mine = devices?.devices.find((d) => d.id === identity.device_id);
-    if (devices !== null && (mine === undefined || mine.pubkey !== pub.line || mine.slot !== '')) {
-      throw new DevicesError('ROOT_EXISTS', 'devices.yml already exists and is not this device\'s root entry — refusing');
-    }
-    if (devices === null) {
+    if (devices !== null) {
+      if (mine === undefined || mine.pubkey !== pub.line || mine.slot !== '') {
+        throw new DevicesError('ROOT_EXISTS', 'devices.yml already exists and is not this device\'s root entry — refusing');
+      }
+      // DK-7: a revoked root is never re-trusted by re-running init (that would undo the revocation locally).
+      if (mine.revoked !== null) {
+        throw new DevicesError('ROOT_REVOKED', 'this device\'s root entry in devices.yml is revoked — a revoked key is never trusted again');
+      }
+      await mergeSigner(l, { id: identity.device_id, pubkey: pub.line }); // idempotent
+    } else {
       if (identity.slot !== '') throw new DevicesError('ROOT_SLOT', 'only the primary (slot "") can be the TOFU root');
+      if (identity.device_id !== pub.deviceId) {
+        // DK-7: the root id must be sha256(pubkey). A legacy random id is migrated only on request.
+        if (opts.rekeyLegacy !== true) {
+          throw new DevicesError('LEGACY_ID', 'this device still has a legacy random id — it must be re-keyed before it can be the root (ledger sync init does that)');
+        }
+        identity = await rekeyLocked(l, pub);
+      }
       const entry: DeviceEntry = {
         id: identity.device_id,
         label: identity.label,
@@ -323,8 +447,6 @@ export async function initDevice(ledgerDir: string, opts: InitOptions = {}): Pro
       await writeAtomic(l.devicesYml, renderDevicesYaml(file));
       devices = file;
       registeredRoot = true;
-    } else {
-      await mergeSigner(l, { id: identity.device_id, pubkey: pub.line }); // idempotent
     }
   }
 
@@ -338,6 +460,68 @@ export async function initDevice(ledgerDir: string, opts: InitOptions = {}): Pro
     registeredRoot,
     inDevicesYml: devices?.devices.some((d) => d.id === identity.device_id && d.pubkey === pub.line) ?? false,
   };
+}
+
+/* ---------------- legacy id re-key (DK-7) ---------------- */
+
+/** Re-key `identity.device_id` (F1 random id) to the key-derived id. Caller holds the lock and
+ *  has verified `pub` belongs to the private key. Crash-safe order: counters copied under the new
+ *  name (exclusive), then device.yml, then the old counters file removed — ids can never move
+ *  backwards because readers take the per-key max over every counters file. The hub caches the
+ *  device identity in memory: run this only while no hub is writing to this ledger. */
+async function rekeyLocked(l: DeviceLayout, pub: Ed25519Pub): Promise<DeviceFile> {
+  const self = await readDeviceFile(l);
+  if (self === null) throw new DevicesError('NOT_INITIALISED', 'no device identity to re-key (ledger device init)');
+  if (self.device_id === pub.deviceId) return self;
+  if (self.slot !== '') throw new DevicesError('REKEY_REFUSED', 'only the primary (slot "") has a legacy id');
+  if ((await readDevices(l)) !== null) {
+    throw new DevicesError('REKEY_REFUSED', 'devices.yml exists — an id that may be registered is never changed');
+  }
+  const oldFile = nodePath.join(l.root, 'counters', `${self.device_id}.yml`);
+  const newFile = nodePath.join(l.root, 'counters', `${pub.deviceId}.yml`);
+  const oldText = await readSmall(oldFile);
+  if (oldText !== null) {
+    const tmp = nodePath.join(nodePath.dirname(newFile), `.${randomBytes(6).toString('hex')}.tmp`);
+    await writeFile(tmp, oldText, { encoding: 'utf8', mode: 0o600, flag: 'wx' });
+    try {
+      const published = await publishKey(tmp, newFile); // exclusive: false = a file already exists
+      if (!published && (await readSmall(newFile)) !== oldText) {
+        throw new DevicesError('REKEY_CONFLICT', `counters/${pub.deviceId}.yml already exists with different content — refusing`);
+      }
+    } finally {
+      await rm(tmp, { force: true }).catch(() => undefined);
+    }
+  }
+  const identity: DeviceFile = { ...self, device_id: pub.deviceId, key_fp: pub.fingerprint };
+  await writeDeviceFile(l, identity);
+  if (oldText !== null) await rm(oldFile, { force: true }).catch(() => undefined);
+  return identity;
+}
+
+/** Public form for `ledger sync init`: validates the key like `device init`, then re-keys.
+ *  Returns `null` when the id is already key-derived. Never touches a registered device. */
+export async function rekeyLegacyDeviceId(
+  ledgerDir: string,
+  opts: { bin?: string } = {},
+): Promise<{ from: string; to: string } | null> {
+  const bin = opts.bin ?? (await resolveSshKeygen());
+  const l = deviceLayout(ledgerDir);
+  return withDeviceLock(l, async () => {
+    const self = await readDeviceFile(l);
+    if (self === null) throw new DevicesError('NOT_INITIALISED', 'no device identity to re-key (ledger device init)');
+    await assertPrivateFile(l.keyFile, { secret: true });
+    const onDisk = await readLocalPub(l);
+    const pub = await publicKeyOf(l.keyFile, bin);
+    if (onDisk === null || onDisk.line !== pub.line) {
+      throw new DevicesError('KEY_MISMATCH', 'key.pub does not belong to the private key — refusing');
+    }
+    if (self.key_fp !== undefined && self.key_fp !== pub.fingerprint) {
+      throw new DevicesError('KEY_MISMATCH', 'device.yml records a different key fingerprint — refusing to touch it');
+    }
+    if (self.device_id === pub.deviceId) return null;
+    const after = await rekeyLocked(l, pub);
+    return { from: self.device_id, to: after.device_id };
+  });
 }
 
 /** Add one signer; the same principal with a DIFFERENT key is a conflict, never a silent replace. */
@@ -388,7 +572,7 @@ function requireId(id: string): void {
 }
 
 /** The acting device must itself be a registered, non-revoked member whose local key matches. */
-async function requireMember(l: DeviceLayout): Promise<{ self: DeviceFile; devices: DevicesFile }> {
+async function requireMember(l: DeviceLayout): Promise<{ self: DeviceFile; devices: DevicesFile; pub: Ed25519Pub }> {
   const self = await readDeviceFile(l);
   const devices = await readDevices(l);
   const pub = await readLocalPub(l);
@@ -397,18 +581,38 @@ async function requireMember(l: DeviceLayout): Promise<{ self: DeviceFile; devic
     throw new DevicesError('NOT_MEMBER', 'this device is not registered in devices.yml (ledger device init --root on the first device)');
   }
   if (mine.revoked !== null) throw new DevicesError('NOT_MEMBER', 'this device is revoked');
-  return { self, devices };
+  return { self, devices, pub };
 }
 
-/** Approve = trust that device's key locally (`.hub/allowed_signers`). */
-export async function approveDevice(ledgerDir: string, id: string): Promise<{ added: boolean }> {
+const FP_RE = /^SHA256:[A-Za-z0-9+/]{43}$/;
+
+/** The human-verified fingerprint (what the other device printed) must equal the key's. */
+function requireFingerprint(given: unknown, actual: string): void {
+  if (typeof given !== 'string' || given === '') {
+    throw new DevicesError('FP_REQUIRED', 'the key fingerprint is required (SHA256:…) — compare it with what the other device prints');
+  }
+  const a = Buffer.from(given);
+  const b = Buffer.from(actual);
+  if (!FP_RE.test(given) || a.length !== b.length || !timingSafeEqual(a, b)) {
+    throw new DevicesError('FP_MISMATCH', 'fingerprint does not match that device\'s key — refusing');
+  }
+}
+
+/** Approve = trust that device's key locally (`.hub/allowed_signers`). `fingerprint` is the
+ *  `SHA256:…` the human read off the other device; it must match the registered key (DK-1). */
+export async function approveDevice(ledgerDir: string, id: string, fingerprint: string): Promise<{ added: boolean }> {
   requireId(id);
   const l = deviceLayout(ledgerDir);
-  const { devices } = await requireMember(l);
-  const target = devices.devices.find((d) => d.id === id);
-  if (target === undefined) throw new DevicesError('NOT_FOUND', `${id} is not in devices.yml`);
-  if (target.revoked !== null) throw new DevicesError('REVOKED', `${id} is revoked — a revoked key is never trusted again`);
-  return { added: await mergeSigner(l, { id, pubkey: target.pubkey }) };
+  return withDeviceLock(l, async () => {
+    const { devices } = await requireMember(l);
+    const target = devices.devices.find((d) => d.id === id);
+    if (target === undefined) throw new DevicesError('NOT_FOUND', `${id} is not in devices.yml`);
+    if (target.revoked !== null) throw new DevicesError('REVOKED', `${id} is revoked — a revoked key is never trusted again`);
+    const pub = parseEd25519Pub(target.pubkey);
+    if (pub === null) throw new DevicesError('KEY_INVALID', `${id}: registered key is invalid`);
+    requireFingerprint(fingerprint, pub.fingerprint);
+    return { added: await mergeSigner(l, { id, pubkey: pub.line }) };
+  });
 }
 
 /** Monotonic. The key leaves allowed_signers first (fail safe), then the record is written. */
@@ -424,19 +628,121 @@ export async function revokeDevice(
     throw new DevicesError('REASON_INVALID', `--reason is required: one line, max ${REVOKE_REASON_MAX} chars`);
   }
   const l = deviceLayout(ledgerDir);
-  const { self, devices } = await requireMember(l);
-  if (id === self.device_id) throw new DevicesError('SELF_REVOKE', 'refusing to revoke this device itself — revoke it from another device');
-  const target = devices.devices.find((d) => d.id === id);
-  if (target === undefined) throw new DevicesError('NOT_FOUND', `${id} is not in devices.yml`);
-  if (target.revoked !== null) throw new DevicesError('REVOKED', `${id} is already revoked (revocation is permanent)`);
-  const signers = await readSigners(l);
-  await writeAtomic(l.allowedSigners, renderAllowedSigners(signers.filter((s) => s.id !== id)));
-  const next: DevicesFile = {
-    devices: devices.devices.map((d) =>
-      d.id === id ? { ...d, revoked: { at: now.toISOString(), by: self.device_id, reason: why } } : d,
-    ),
-  };
-  await writeAtomic(l.devicesYml, renderDevicesYaml(next));
+  await withDeviceLock(l, async () => {
+    const { self, devices } = await requireMember(l);
+    if (id === self.device_id) throw new DevicesError('SELF_REVOKE', 'refusing to revoke this device itself — revoke it from another device');
+    const target = devices.devices.find((d) => d.id === id);
+    if (target === undefined) throw new DevicesError('NOT_FOUND', `${id} is not in devices.yml`);
+    if (target.revoked !== null) throw new DevicesError('REVOKED', `${id} is already revoked (revocation is permanent)`);
+    const signers = await readSigners(l);
+    await writeAtomic(l.allowedSigners, renderAllowedSigners(signers.filter((s) => s.id !== id)));
+    const next: DevicesFile = {
+      devices: devices.devices.map((d) =>
+        d.id === id ? { ...d, revoked: { at: now.toISOString(), by: self.device_id, reason: why } } : d,
+      ),
+    };
+    await writeAtomic(l.devicesYml, renderDevicesYaml(next));
+  });
+}
+
+/* ---------------- enrolment primitives (OQ-1 = A) ---------------- */
+
+export interface AddResult {
+  id: string;
+  label: string;
+  slot: string;
+  fingerprint: string;
+}
+
+/** TRUSTED side of enrolment: register a joining device. The joiner printed its canonical public
+ *  key line and fingerprint; the human compares the fingerprint and passes it as `fp` (the
+ *  key is rejected unless they match). Entry: id derived from the key, lowest never-used slot
+ *  (revoked slots stay retired), `added_by` = this device. Does NOT approve the key locally —
+ *  approval is a separate, equally fingerprint-confirmed step (`approveDevice`). The result is
+ *  self-checked with `acceptDevicesChange` exactly as a peer would check it. */
+export async function addDevice(
+  ledgerDir: string,
+  pubkeyLine: string,
+  label: string,
+  fp: string,
+  now: Date = new Date(),
+): Promise<AddResult> {
+  const pub = parseEd25519Pub(pubkeyLine);
+  if (pub === null || pub.line !== pubkeyLine) {
+    throw new DevicesError('KEY_INVALID', 'public key must be exactly `ssh-ed25519 <base64>` (no comment, no options)');
+  }
+  if (!labelSchema.safeParse(label).success) {
+    throw new DevicesError('LABEL_INVALID', 'label: lowercase letters, digits, - (max 32)');
+  }
+  requireFingerprint(fp, pub.fingerprint);
+  const l = deviceLayout(ledgerDir);
+  return withDeviceLock(l, async () => {
+    const { self, devices, pub: mine } = await requireMember(l);
+    if (devices.devices.some((d) => d.id === pub.deviceId || d.pubkey === pub.line)) {
+      throw new DevicesError('DEVICE_EXISTS', 'that key is already registered in devices.yml');
+    }
+    const used = new Set(devices.devices.map((d) => d.slot));
+    const slot = [...SLOT_LETTERS].find((c) => !used.has(c));
+    if (slot === undefined) throw new DevicesError('SLOTS_EXHAUSTED', 'all device slots are in use (a revoked device keeps its slot forever)');
+    const entry: DeviceEntry = {
+      id: pub.deviceId,
+      label,
+      slot,
+      pubkey: pub.line,
+      added: now.toISOString(),
+      added_by: self.device_id,
+      revoked: null,
+      role: 'owner',
+    };
+    const next: DevicesFile = { devices: [...devices.devices, entry] };
+    const trusted = new Set((await readSigners(l)).map((s) => s.pubkey));
+    const verdict = acceptDevicesChange(devices, next, mine.line, trusted, { commitTimeMs: now.getTime() });
+    if (!verdict.ok) throw new DevicesError('ADD_REFUSED', `device add refused: ${verdict.reason}`);
+    await writeAtomic(l.devicesYml, renderDevicesYaml(next));
+    return { id: entry.id, label, slot, fingerprint: pub.fingerprint };
+  });
+}
+
+/** JOINER side: after a trusted device registered this device's key (and devices.yml arrived),
+ *  take over the registered label and slot in `.hub/device.yml`. Refused unless the registry
+ *  entry is this device's own key AND id, is not revoked, and this device has not minted ids
+ *  yet (a counters file would mean ids under the old slot that may collide). Idempotent. */
+export async function adoptSlot(
+  ledgerDir: string,
+  opts: { bin?: string } = {},
+): Promise<{ id: string; label: string; slot: string; changed: boolean }> {
+  const bin = opts.bin ?? (await resolveSshKeygen());
+  const l = deviceLayout(ledgerDir);
+  return withDeviceLock(l, async () => {
+    const self = await readDeviceFile(l);
+    const pub = await readLocalPub(l);
+    if (self === null || pub === null) throw new DevicesError('NOT_INITIALISED', 'no device identity yet (ledger device init)');
+    await assertPrivateFile(l.keyFile, { secret: true });
+    if ((await publicKeyOf(l.keyFile, bin)).line !== pub.line) {
+      throw new DevicesError('KEY_MISMATCH', 'key.pub does not belong to the private key — refusing');
+    }
+    const devices = await readDevices(l);
+    if (devices === null) throw new DevicesError('NOT_FOUND', 'devices.yml is not here yet — sync first');
+    const entry = devices.devices.find((d) => d.pubkey === pub.line);
+    if (entry === undefined) {
+      throw new DevicesError('NOT_REGISTERED', 'this device\'s key is not in devices.yml — a trusted device must run `ledger device add` first');
+    }
+    if (entry.id !== self.device_id) {
+      throw new DevicesError('ID_MISMATCH', 'device.yml id is not the id registered for this key (legacy random id) — re-key it first');
+    }
+    if (entry.revoked !== null) throw new DevicesError('REVOKED', 'this device is revoked');
+    if (self.slot === entry.slot && self.label === entry.label && self.key_fp === pub.fingerprint) {
+      return { id: entry.id, label: entry.label, slot: entry.slot, changed: false };
+    }
+    if (self.slot !== '' && self.slot !== entry.slot) {
+      throw new DevicesError('SLOT_CONFLICT', 'device.yml already holds a different slot — refusing to change it');
+    }
+    if (self.slot !== entry.slot && (await exists(nodePath.join(l.root, 'counters', `${self.device_id}.yml`)))) {
+      throw new DevicesError('ADOPT_USED', 'this device already minted ids under its old slot — refusing to switch slot');
+    }
+    await writeDeviceFile(l, { ...self, label: entry.label, slot: entry.slot, key_fp: pub.fingerprint });
+    return { id: entry.id, label: entry.label, slot: entry.slot, changed: true };
+  });
 }
 
 /* ---------------- doctor ---------------- */
@@ -447,8 +753,15 @@ export interface DeviceCheck {
   detail: string;
 }
 
-/** Checks only appear once device identity exists (a plain local ledger prints nothing new). */
+/** Checks only appear once device identity exists (a plain local ledger prints nothing new).
+ *  Every detail line is passed through `safeOutput` (DK-2): some of it derives from files a peer
+ *  can write, and it ends up on a terminal. */
 export async function deviceHealth(ledgerDir: string, nowMs: number = Date.now()): Promise<DeviceCheck[]> {
+  const checks = await deviceHealthRaw(ledgerDir, nowMs);
+  return checks.map((c) => ({ ...c, detail: safeOutput(c.detail, 400) }));
+}
+
+async function deviceHealthRaw(ledgerDir: string, nowMs: number): Promise<DeviceCheck[]> {
   const l = deviceLayout(ledgerDir);
   const out: DeviceCheck[] = [];
   const keyExists = await exists(l.keyFile).catch(() => false);
@@ -523,7 +836,8 @@ export async function deviceHealth(ledgerDir: string, nowMs: number = Date.now()
       );
     }
   } catch (err) {
-    out.push({ id: 'device_signers', status: 'fail', detail: `allowed_signers: ${err instanceof DevicesError ? err.message : 'unreadable'}` });
+    const why = err instanceof DevicesError ? err.message : err instanceof TrustError ? `not private (${err.code})` : 'unreadable';
+    out.push({ id: 'device_signers', status: 'fail', detail: `allowed_signers: ${why}` });
   }
 
   /* ---- devices_stale (only when last_seen is recorded) ---- */
