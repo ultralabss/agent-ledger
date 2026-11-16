@@ -1,10 +1,13 @@
 /** Intake md ⇄ object — SPEC §4.7. */
 
 import { escapeStructuralLines, parseMd, serializeMd, type MdDoc } from './md.ts';
-import { intakeFrontmatterSchema } from './schema.ts';
+import { intakeFrontmatterSchema, ITEM_ID_PATTERN } from './schema.ts';
 import type { IntakeDropped, IntakeRecord } from './types.ts';
 
 export const SECTION_TRIAGE = 'Triage';
+
+/** `- ACME-12 ← excerpt` (slot ids `ACME-W3` included). */
+const TRIAGE_LINE = new RegExp(`^\\s*-\\s*(${ITEM_ID_PATTERN})\\s*←\\s*(.*)$`);
 
 const OPEN_Q = '\u201c'; // “
 const CLOSE_Q = '\u201d'; // ”
@@ -45,7 +48,7 @@ export function parseIntake(text: string, file?: string): { rec: IntakeRecord; d
       dropped.push({ text: unquote(drop[1] ?? ''), reason: (drop[2] ?? '').trim() });
       continue;
     }
-    const m = /^\s*-\s*([A-Z]{2,4}-\d+)\s*←\s*(.*)$/.exec(line);
+    const m = TRIAGE_LINE.exec(line);
     if (m) triage.push({ item: m[1] ?? '', excerpt: unquote(m[2] ?? '') });
   }
   return {

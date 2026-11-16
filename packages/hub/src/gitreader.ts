@@ -3,7 +3,8 @@
  *
  * Hard rules, enforced here and nowhere else:
  *  - only `status`, `worktree list`, `for-each-ref`, `log`, `diff --name-only`,
- *    `rev-list --count`, `rev-parse`, `check-ignore -q`. Nothing that mutates, ever.
+ *    `rev-list --count`, `rev-parse`, `check-ignore -q`, `config --get remote.origin.url`
+ *    (repo identity, credentials stripped). Nothing that mutates, ever.
  *  - every invocation goes through `git()` in `git.ts`, which supplies the
  *    absolute binary, `--no-optional-locks` and `-c core.fsmonitor=false`.
  *  - a git failure is never fatal: the caller gets `null`/empty and the UI
@@ -17,7 +18,7 @@ import type {
   ReleaseView,
   TouchedVia,
 } from '@agent-ledger/shared';
-import { sanitizeField } from '@agent-ledger/shared';
+import { itemIdScanRe, originHintSchema, rootShaSchema, sanitizeField } from '@agent-ledger/shared';
 import { git } from './git.ts';
 import { normalizeGitPath } from './gitpath.ts';
 
@@ -44,7 +45,6 @@ export interface CommitInfo {
   refs: string[];
 }
 
-const ITEM_ID = /\b([A-Z]{2,4}-\d+)\b/g;
 
 /**
  * `git status --porcelain=v2 -b`. Chosen over v1 because the `# branch.ab`
@@ -302,6 +302,58 @@ export async function revParse(checkout: string, rev: string): Promise<string | 
   return /^[0-9a-f]{40}$/.test(sha) ? sha : null;
 }
 
+/**
+ * Portable repo identity (ledger format 2): the OLDEST root commit of the
+ * default branch (committer time, ties → lowest sha, so every machine picks the
+ * same one). `origin/HEAD` when present, else `HEAD`. `null` for an empty repo
+ * or any git failure — identity is best effort, never fatal.
+ */
+export async function readRootSha(checkout: string): Promise<string | null> {
+  const base = (await revParse(checkout, 'refs/remotes/origin/HEAD')) !== null ? 'refs/remotes/origin/HEAD' : 'HEAD';
+  const res = await git(checkout, ['log', '--max-parents=0', '--format=%H %ct', base, '--'], 10_000).catch(
+    () => null,
+  );
+  if (res === null || res.code !== 0) return null;
+  let best: { sha: string; at: number } | null = null;
+  for (const line of res.stdout.split('\n')) {
+    const m = /^([0-9a-f]{40}|[0-9a-f]{64}) (\d{1,12})$/.exec(line.trim());
+    if (!m) continue;
+    const at = Number(m[2]);
+    if (best === null || at < best.at || (at === best.at && (m[1] as string) < best.sha)) {
+      best = { sha: m[1] as string, at };
+    }
+  }
+  return best !== null && rootShaSchema.safeParse(best.sha).success ? best.sha : null;
+}
+
+/**
+ * `origin` URL reduced to `host/org/repo`: scheme, userinfo (credentials!),
+ * port-less query/fragment and a trailing `.git` are dropped. Anything that
+ * does not come out as a plain `host/path` is rejected, so a token embedded in
+ * the URL can never reach the synced `repos.yml`.
+ */
+export function originHintFromUrl(raw: string): string | null {
+  let rest = raw.trim();
+  if (rest === '' || rest.length > 500) return null;
+  const scp = /^(?:[^@/:\s]+@)?([A-Za-z0-9.-]+):(?!\/\/)([^\s]+)$/.exec(rest);
+  if (scp && !/^[a-z][a-z0-9+.-]*:\/\//i.test(rest)) {
+    rest = `${scp[1]}/${scp[2]}`;
+  } else {
+    const m = /^[a-z][a-z0-9+.-]*:\/\/(?:[^@/\s]*@)?([^/\s]+)\/([^?#\s]+)/i.exec(rest);
+    if (!m) return null;
+    rest = `${(m[1] as string).replace(/:\d+$/, '')}/${m[2]}`;
+  }
+  rest = rest.replace(/\/+$/, '').replace(/\.git$/i, '').replace(/^\/+/, '');
+  const hint = originHintSchema.safeParse(rest);
+  return hint.success ? hint.data : null;
+}
+
+export async function readOriginHint(checkout: string): Promise<string | null> {
+  const res = await git(checkout, ['config', '--get', 'remote.origin.url'], 5_000).catch(() => null);
+  if (res === null || res.code !== 0) return null;
+  return originHintFromUrl(res.stdout.split('\n')[0] ?? '');
+}
+
 /** Output separators. `spawn` refuses an argv entry containing a NUL byte, so
  *  the format string asks git to emit them via `%x00` / `%x01` instead. */
 const NUL = '\u0000';
@@ -504,8 +556,9 @@ export function trailerIds(body: string, key: 'Closes' | 'Refs'): string[] {
   const out = new Set<string>();
   const re = new RegExp(`^\\s*${key}\\s*:\\s*(.+)$`, 'gim');
   for (const m of body.matchAll(re)) {
-    for (const id of (m[1] ?? '').toUpperCase().matchAll(ITEM_ID)) {
-      if (id[1]) out.add(id[1]);
+    // Fresh global regex per call (a shared /g regex carries `lastIndex`).
+    for (const id of (m[1] ?? '').toUpperCase().matchAll(itemIdScanRe())) {
+      out.add(id[0]);
     }
   }
   return [...out];

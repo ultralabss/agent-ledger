@@ -10,7 +10,7 @@
  * no spaces) because they become argv entries for `git log`.
  */
 
-import type { ReleaseNotesResponse } from '@agent-ledger/shared';
+import { parseItemId, type ReleaseNotesResponse } from '@agent-ledger/shared';
 import { readCommits, readTags, revParse } from './gitreader.ts';
 import type { Ledger } from './ledger/ledger.ts';
 
@@ -65,10 +65,15 @@ export async function buildReleaseNotes(
   return { repo: input.repo, from, to, items, markdown };
 }
 
-/** `ACME-9` before `ACME-10`: numeric part compared as a number. */
-function compareIds(a: string, b: string): number {
-  const pa = /^([A-Z]+)-(\d+)$/.exec(a);
-  const pb = /^([A-Z]+)-(\d+)$/.exec(b);
-  if (pa && pb && pa[1] === pb[1]) return Number(pa[2]) - Number(pb[2]);
+/** `ACME-9` before `ACME-10`: numeric part compared as a number. Within one
+ *  prefix the primary slot (`""`, plain `ACME-5`) sorts before slot letters
+ *  (`ACME-W1`), then by number. */
+export function compareIds(a: string, b: string): number {
+  const pa = parseItemId(a);
+  const pb = parseItemId(b);
+  if (pa && pb && pa.prefix === pb.prefix) {
+    if (pa.slot !== pb.slot) return pa.slot < pb.slot ? -1 : 1;
+    return pa.n - pb.n;
+  }
   return a.localeCompare(b);
 }

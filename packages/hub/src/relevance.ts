@@ -11,6 +11,8 @@
  * No LLM, no network, no model of any kind: tokenise, intersect, compare.
  */
 
+import { itemIdScanRe } from '@agent-ledger/shared';
+
 /** Words that match everything and therefore mean nothing for ranking. */
 const STOPWORDS = new Set([
   'and', 'are', 'but', 'can', 'for', 'from', 'have', 'his', 'how', 'into', 'its', 'just',
@@ -58,9 +60,7 @@ export function contentTokens(raw: string, limit = 24): string[] {
  *  are *excluded* from the reminder rather than promoted. */
 export function mentionedIds(raw: string): Set<string> {
   const out = new Set<string>();
-  for (const m of raw.toUpperCase().matchAll(/\b([A-Z]{2,6}-\d{1,6})\b/g)) {
-    if (m[1]) out.add(m[1]);
-  }
+  for (const m of raw.toUpperCase().matchAll(itemIdScanRe())) out.add(m[0]);
   return out;
 }
 

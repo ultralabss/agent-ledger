@@ -64,7 +64,7 @@ export function buildTagRe(tags: readonly string[] = DEFAULT_RECAP_TAGS): RegExp
 }
 
 const TAG_RE = buildTagRe();
-const ID_RE = /\b[A-Z]{2,5}-\d+\b/;
+const ID_RE = /\b[A-Z]{2,5}-[A-HJ-NP-Z]?\d+\b/;
 const MAX_TAIL = 256 * 1024;
 
 export interface RecapCheck {

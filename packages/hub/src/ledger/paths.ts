@@ -1,4 +1,8 @@
 import { join } from 'node:path';
+import { ITEM_ID_RE } from '@agent-ledger/shared';
+
+/** `d_` + 10 base32 chars. The only shape allowed into a counter file name. */
+export const DEVICE_ID_RE = /^d_[a-z2-7]{10}$/;
 
 export class LedgerPaths {
   readonly root: string;
@@ -31,6 +35,31 @@ export class LedgerPaths {
     return join(this.root, '.gitattributes');
   }
 
+  /** Format marker (`2\n`), committed with the ledger. */
+  get formatFile(): string {
+    return join(this.root, 'ledger.format');
+  }
+
+  /** This machine's identity — local, gitignored (`.hub/`). */
+  get deviceYml(): string {
+    return join(this.hubDir, 'device.yml');
+  }
+
+  /** This machine's checkout paths — local, gitignored (`.hub/`). */
+  get localYml(): string {
+    return join(this.hubDir, 'local.yml');
+  }
+
+  /** Synced. One file per device; a device writes only its own. */
+  get countersDir(): string {
+    return join(this.root, 'counters');
+  }
+
+  counterFile(deviceId: string): string {
+    if (!DEVICE_ID_RE.test(deviceId)) throw new Error('invalid device id');
+    return join(this.countersDir, `${deviceId}.yml`);
+  }
+
   get intakeRoot(): string {
     return join(this.root, 'intake');
   }
@@ -52,6 +81,7 @@ export class LedgerPaths {
   }
 
   itemFile(slug: string, id: string): string {
+    if (!ITEM_ID_RE.test(id)) throw new Error('invalid item id');
     return join(this.itemsDir(slug), `${id}.md`);
   }
 

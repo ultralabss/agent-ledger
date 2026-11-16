@@ -5,7 +5,7 @@
  */
 
 import { spawn } from 'node:child_process';
-import { DONE_REF_HINT, isDoneRef, TITLE_MAX, TITLE_WARN } from '@agent-ledger/shared';
+import { DONE_REF_HINT, isDoneRef, isItemId, TITLE_MAX, TITLE_WARN } from '@agent-ledger/shared';
 import { bool, csv, flag, flagList, parseArgs, type Args } from './args.ts';
 import { CliError, HubClient, readEnvConfig, type CliEnvConfig, type HubTimeouts } from './client.ts';
 import { hubServesLedger } from './identity.ts';
@@ -41,6 +41,7 @@ const USAGE = `ledger — shared ledger and intake for parallel AI agent session
   ledger brief [repo] [--full]              briefing (§9)
   ledger repo add <slug> --path <p> [--prefix XX] [--graphify <p>] [--docs a,b]
   ledger repo add <slug> --kind system|vps [--host <h>] [--prefix XX]   (no --path, no git)
+  ledger repo bind <slug> <path>            point an existing repo at a checkout on THIS machine (verifies the root commit)
   ledger repo ls
   ledger intake "<text>" | - [--action triage|send_to_session|triage_and_run] [--to <session>]
                                           verbatim text into the intake bin
@@ -837,6 +838,17 @@ async function cmdRepo(args: Args, client: HubClient, cfg: CliEnvConfig, io: Io)
     );
     return 0;
   }
+  if (sub === 'bind') {
+    const slug = requireArg(args.positional[2], 'repo slug');
+    const target = requireArg(args.positional[3], 'checkout path');
+    const { resolve } = await import('node:path');
+    const res = await client.post(`/v1/repos/${encodeURIComponent(slug)}/bind`, {
+      path: resolve(io.cwd, target),
+    });
+    const out = res.json as { slug: string; repo: { path: string | null } };
+    io.out(`${out.slug} bound → ${out.repo.path ?? '—'}`);
+    return 0;
+  }
   if (sub === 'rm') {
     const slug = requireArg(args.positional[2], 'repo slug');
     // `--archive` is accepted and is the ONLY behaviour — the flag
@@ -1593,9 +1605,9 @@ async function cmdAdopt(args: Args, client: HubClient, cfg: CliEnvConfig, io: Io
   const me = session(cfg);
   if (!me) throw new CliError(4, 'LEDGER_SESSION is not set — adopt takes files over for a session');
   const target = requireArg(args.positional[1], 'path or item ID');
-  const isItemId = /^[A-Za-z]{2,4}-\d+$/.test(target);
+  const looksLikeId = isItemId(target.toUpperCase());
   const payload: Record<string, unknown> = { session: me };
-  if (isItemId) {
+  if (looksLikeId) {
     payload.item = target.toUpperCase();
   } else {
     const { resolve } = await import('node:path');

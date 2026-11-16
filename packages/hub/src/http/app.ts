@@ -39,6 +39,7 @@ import {
   parseSince,
   releaseSchema,
   reopenSchema,
+  repoBindSchema,
   repoCreateSchema,
   repoContractSchema,
   searchQuerySchema,
@@ -604,6 +605,21 @@ export function createApp(deps: AppDeps) {
       docs: input.docs,
     });
     return c.json({ slug: res.slug, repo: res.cfg }, 201);
+  });
+
+  /**
+   * `POST /v1/repos/:slug/bind` — point an existing slug at a checkout on this
+   * machine (`ledger repo bind`). Token-authenticated like every /v1 route. The
+   * checkout's root commit must equal the repo's recorded `identity.root_sha`
+   * (see `Ledger.bindRepo`), so a wrong directory cannot hijack a slug.
+   */
+  v1.post('/repos/:slug/bind', async (c) => {
+    const slug = c.req.param('slug');
+    ledger.repo(slug); // 404 before parsing the body
+    const input = await body(c, repoBindSchema);
+    assertNoSecretsDeep(input);
+    const cfg = await ledger.bindRepo(slug, input.path);
+    return c.json({ slug, repo: cfg });
   });
 
   /**

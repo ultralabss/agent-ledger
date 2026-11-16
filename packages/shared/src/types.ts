@@ -98,6 +98,18 @@ export interface Item {
  *  whole infra (no path, no git), `vps` = one production machine (no path). */
 export type RepoKind = 'repo' | 'system' | 'vps';
 
+/** Portable identity of a repo (synced `repos.yml`, ledger format 2): lets another
+ *  machine bind its own checkout without any path in the synced file. */
+export interface RepoIdentity {
+  /** Oldest root commit of the default branch. */
+  root_sha: string;
+  /** `host/org/repo` of `origin`, credentials stripped; a hint, never trusted. */
+  origin_hint: string | null;
+}
+
+/** In-memory MERGED view of a repo: synced `repos.yml` + this machine's
+ *  `.hub/local.yml` (`path`, `graphify`) + own counter (`next`). On disk `path`,
+ *  `next` and `graphify` never appear in the synced file (format 2). */
 export interface RepoConfig {
   /** Absent in old `repos.yml` — read it through `repoKindOf()`. */
   kind?: RepoKind;
@@ -107,6 +119,10 @@ export interface RepoConfig {
   path: string | null;
   next: number;
   graphify?: string | null;
+  /** Repo-relative graphify location (synced); the absolute one is local. */
+  graphify_rel?: string;
+  /** Format 2: set when the checkout's root commit could be read. */
+  identity?: RepoIdentity;
   docs?: string[];
   /** Old prefixes kept so `ACME-3` still resolves after a prefix rename (SPEC §4.2). */
   prefix_aliases?: string[];

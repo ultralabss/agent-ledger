@@ -16,9 +16,49 @@ export const slugSchema = z
 export const prefixSchema = z
   .string()
   .regex(/^[A-Z]{2,4}$/, 'prefix must be 2–4 uppercase letters A–Z');
+/** Device slot letter inside an item id (`ACME-W7`). `""` = the primary
+ *  (existing) ledger, whose ids stay `ACME-142`. No I and O. */
+export const slotSchema = z
+  .string()
+  .regex(/^[A-HJ-NP-Z]?$/, 'slot must be empty or one letter A-H J-N P-Z');
+
+/** `PREFIX-<slot?><n>`; the `[A-HJ-NP-Z]` class must match `SLOT_LETTERS`. */
+export const ITEM_ID_PATTERN = '[A-Z]{2,4}-[A-HJ-NP-Z]?[1-9][0-9]*';
+export const ITEM_ID_RE = new RegExp(`^${ITEM_ID_PATTERN}$`);
+/** Fresh global regex for scanning free text (`\b`-delimited). */
+export function itemIdScanRe(): RegExp {
+  return new RegExp(`\\b${ITEM_ID_PATTERN}\\b`, 'g');
+}
+export function isItemId(s: unknown): s is string {
+  return typeof s === 'string' && ITEM_ID_RE.test(s);
+}
+
+export interface ParsedItemId {
+  prefix: string;
+  /** `""` = primary ledger. */
+  slot: string;
+  n: number;
+}
+
+/** Strict parse of one id; `null` for anything that is not exactly an id. */
+export function parseItemId(id: string): ParsedItemId | null {
+  const m = /^([A-Z]{2,4})-([A-HJ-NP-Z]?)([1-9][0-9]*)$/.exec(id);
+  if (!m) return null;
+  const n = Number(m[3]);
+  if (!Number.isSafeInteger(n)) return null;
+  return { prefix: m[1] as string, slot: m[2] as string, n };
+}
+
+export function formatItemId(prefix: string, slot: string, n: number): string {
+  if (!Number.isSafeInteger(n) || n < 1) throw new Error(`item number must be a positive integer, got ${n}`);
+  const id = `${prefix}-${slot}${n}`;
+  if (!ITEM_ID_RE.test(id)) throw new Error(`not a valid item id: "${id}"`);
+  return id;
+}
+
 export const itemIdSchema = z
   .string()
-  .regex(/^[A-Z]{2,4}-\d+$/, 'item id has the form PREFIX-n');
+  .regex(ITEM_ID_RE, 'item id has the form PREFIX-n or PREFIX-<slot>n');
 export const snowflakeIdSchema = z.string().regex(/^[1-9]\d{0,19}$/, 'not a snowflake id');
 
 export const statusSchema = z.enum(ITEM_STATUSES as unknown as [string, ...string[]]);
@@ -140,6 +180,33 @@ export const intakeFrontmatterSchema = z.object({
   items: z.array(itemIdSchema).default([]),
 });
 
+/** `root_sha` = oldest root commit of the default branch (git object id). */
+export const rootShaSchema = z
+  .string()
+  .regex(/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/, 'root_sha must be a 40 or 64 char lowercase hex git object id');
+/** `host/org/repo`, never credentials, scheme or query. */
+export const originHintSchema = z
+  .string()
+  .min(1)
+  .max(200)
+  .regex(/^[A-Za-z0-9][A-Za-z0-9._:/-]*$/, 'origin_hint: only letters, digits and . _ : / -')
+  .refine((v) => !v.split('/').includes('..'), 'origin_hint: no ".." segment');
+export const repoIdentitySchema = z.object({
+  root_sha: rootShaSchema,
+  origin_hint: originHintSchema.nullable().default(null),
+});
+
+/** Repo-relative path: no absolute form, no drive, no `..`, no backslash. */
+export const relPathSchema = z
+  .string()
+  .min(1)
+  .max(300)
+  .refine(
+    (v) =>
+      !/^(?:[\\/~]|[A-Za-z]:)/.test(v) && !v.includes('\\') && !v.split('/').includes('..'),
+    'must be a relative path without ".."',
+  );
+
 /** What a ledger "repo" actually is. Absent in old `repos.yml` =
  *  `repo` (a git checkout, or a virtual repo with `path: null`). */
 const hostSchema = z
@@ -161,6 +228,9 @@ export const repoConfigSchema = z.object({
   docs: z.array(z.string()).optional(),
   prefix_aliases: z.array(prefixSchema).max(10).optional(),
   onboarded: z.boolean().optional(),
+  /** Added in ledger format 2 (see `repoSyncedSchema`). */
+  graphify_rel: relPathSchema.optional(),
+  identity: repoIdentitySchema.optional(),
   /** Repo-relative globs whose change is a public contract change.
    *  Bounded so a hand-edited `repos.yml` cannot turn every commit into a
    *  glob-matching sweep over hundreds of patterns. */
@@ -170,6 +240,37 @@ export const repoConfigSchema = z.object({
 });
 
 export const reposFileSchema = z.record(slugSchema, repoConfigSchema);
+
+/* ---------- ledger format 2: synced repos.yml vs local .hub/local.yml ---------- */
+
+/** One entry of the SYNCED `repos.yml` (format 2). No `path`, no `next`, no
+ *  absolute path of any kind. `path` / `next` / `graphify` are accepted ONLY so a
+ *  format-1 file can be read and migrated; the writer never emits them. */
+export const repoSyncedSchema = z.object({
+  kind: repoKindSchema.optional(),
+  host: hostSchema.optional(),
+  prefix: prefixSchema,
+  docs: z.array(z.string()).optional(),
+  graphify_rel: relPathSchema.optional(),
+  identity: repoIdentitySchema.optional(),
+  prefix_aliases: z.array(prefixSchema).max(10).optional(),
+  onboarded: z.boolean().optional(),
+  contracts: z.array(singleLine(z.string().min(1).max(200))).max(40).optional(),
+  consumers: z.array(slugSchema).max(40).optional(),
+  /* legacy (format 1), read-only */
+  path: z.string().nullable().optional(),
+  next: z.number().int().positive().optional(),
+  graphify: z.string().nullable().optional(),
+});
+export const reposSyncedFileSchema = z.record(slugSchema, repoSyncedSchema);
+
+/** `.hub/local.yml` (gitignored, never synced): this machine's checkout paths. */
+export const repoLocalSchema = z.object({
+  path: z.string().min(1).nullable().optional(),
+  graphify: z.string().min(1).nullable().optional(),
+  docs: z.array(z.string()).optional(),
+});
+export const reposLocalFileSchema = z.record(slugSchema, repoLocalSchema);
 
 /* ---------- API request bodies ---------- */
 
@@ -181,6 +282,11 @@ export const repoCreateSchema = z.object({
   host: hostSchema.optional(),
   graphify: z.string().min(1).nullable().optional(),
   docs: z.array(z.string().min(1)).optional(),
+});
+
+/** `POST /v1/repos/:slug/bind` — absolute path of a checkout on the hub's machine. */
+export const repoBindSchema = z.object({
+  path: z.string().min(1).max(4096),
 });
 
 /** `POST /v1/repos/:slug/contract`. Additive by default; `rm` /

@@ -764,4 +764,4 @@ An old backlog markdown file can be imported by `ledger-keeper`: map its section
 - **Agent-managed config directories:** the ledger intentionally lives in `~/.ledger`, not in a directory an agent tool manages and may clean up. The ledger is a git repo; a remote backup is opt-in.
 - **Quality of the semantic check** rests on `intent` at claim time — without it `who` shows only files.
 - **Hook latency** — measure from phase 1, target ≤ 50 ms p95.
-- One machine. Multiple machines (ledger sync, remote sessions) are out of scope.
+- One machine today. Multiple machines (ledger sync, remote sessions) are specified in [multi-device-spec.md](multi-device-spec.md); until its sync phases ship, a ledger is still used from one machine.

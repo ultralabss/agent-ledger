@@ -3,8 +3,17 @@
 
 import { hubLog } from './log.ts';
 import { startHub } from './server.ts';
+import { LedgerFormatError } from './ledger/device.ts';
 
-const hub = await startHub();
+const hub = await startHub().catch((err: unknown) => {
+  // A ledger written by a newer hub: say so in one line (exit 78 = EX_CONFIG),
+  // not as a stack trace that looks like a crash.
+  if (err instanceof LedgerFormatError) {
+    hubLog(`agent-ledger: ${err.message}`);
+    process.exit(78);
+  }
+  throw err;
+});
 
 let closing = false;
 const shutdown = (signal: string): void => {

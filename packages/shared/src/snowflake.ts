@@ -64,9 +64,26 @@ export function parseWorkerId(raw: string | undefined): number {
   return n;
 }
 
+/**
+ * Device slot letters (multi-device ids `ACME-W7`): 24 letters, no I and O (look
+ * like 1 and 0). Slot `""` is the primary (existing) ledger and keeps worker 1,
+ * the value every single-machine ledger has always used. A letter maps to
+ * worker 2 + index (2..25), so two devices can never mint the same id.
+ * (`SNOWFLAKE_WORKER_ID` only applies to slot `""`; do not set it to 2..25 on a
+ * primary that syncs with lettered devices.)
+ */
+export const SLOT_LETTERS = 'ABCDEFGHJKLMNPQRSTUVWXYZ';
+
+export function slotWorkerId(slot: string): number {
+  if (slot === '') return 1;
+  const idx = slot.length === 1 ? SLOT_LETTERS.indexOf(slot) : -1;
+  if (idx < 0) throw new Error(`invalid device slot "${slot}" (one letter A-H J-N P-Z, or empty)`);
+  return 2 + idx;
+}
+
 export class Snowflake {
-  readonly workerId: number;
-  private readonly workerBits: bigint;
+  private id: number;
+  private workerBits: bigint;
   private readonly now: () => number;
   private lastMs = -1;
   private seq = 0n;
@@ -76,9 +93,23 @@ export class Snowflake {
     if (!Number.isInteger(workerId) || workerId < 0 || workerId > Number(MAX_WORKER)) {
       throw new Error(`snowflake worker id must be 0–1023, got ${workerId}`);
     }
-    this.workerId = workerId;
+    this.id = workerId;
     this.workerBits = BigInt(workerId) << WORKER_SHIFT;
     this.now = opts.now ?? Date.now;
+  }
+
+  get workerId(): number {
+    return this.id;
+  }
+
+  /** Re-point the worker field (device slot is only known after the ledger
+   *  opened). Clock state is kept, so ids stay monotonic across the switch. */
+  setWorkerId(workerId: number): void {
+    if (!Number.isInteger(workerId) || workerId < 0 || workerId > Number(MAX_WORKER)) {
+      throw new Error(`snowflake worker id must be 0–1023, got ${workerId}`);
+    }
+    this.id = workerId;
+    this.workerBits = BigInt(workerId) << WORKER_SHIFT;
   }
 
   /** Decimal string. Monotonic per worker; throws on clock rollback. */
@@ -129,6 +160,13 @@ export function parseSnowflake(id: string): ParsedSnowflake {
 export const snowflake = new Snowflake({
   workerId: parseWorkerId(process.env.SNOWFLAKE_WORKER_ID),
 });
+
+/** Derive the process-wide worker id from the device slot. Slot `""` = the
+ *  value from `SNOWFLAKE_WORKER_ID` (default 1), i.e. no change for a
+ *  single-machine ledger. Called by `Ledger.init()`. */
+export function configureSnowflakeWorker(slot: string): void {
+  snowflake.setWorkerId(slot === '' ? parseWorkerId(process.env.SNOWFLAKE_WORKER_ID) : slotWorkerId(slot));
+}
 
 /** Convenience: `id = generate()`. */
 export function generate(): string {

@@ -257,7 +257,7 @@ Read [SECURITY.md](SECURITY.md) to report a vulnerability.
 
 ## Limits
 
-- Single user, single machine. No multi-user auth, no remote access, no TLS.
+- Single user, single machine for now. No multi-user auth, no remote access, no TLS. Multi-device sync is designed (see [docs/multi-device-spec.md](docs/multi-device-spec.md)); only its local groundwork (ledger format 2, device identity, id slots) ships today.
 - macOS and Linux only for now. The Claude Code adapter is the only agent adapter shipped.
 - Guards only see what agents report through hooks; a process that ignores them can still
   edit files. Claims are cooperation, not a security boundary.

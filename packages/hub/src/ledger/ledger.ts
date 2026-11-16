@@ -1,12 +1,17 @@
 /** The ledger service: md files in, md files out, one serial writer.
  *
  *  Every mutation runs inside `queue.run(...)` — that includes id allocation,
- *  so `next` in `repos.yml` can never hand the same id to two concurrent
- *  `POST /v1/items`. Writes are tmp+rename (SPEC §6.2).
+ *  so the device counter (`counters/<device_id>.yml`) can never hand the same id
+ *  to two concurrent `POST /v1/items`. Writes are tmp+rename (SPEC §6.2).
+ *
+ *  Ledger format 2 (docs/multi-device-spec.md §2): `repos.yml` is portable (no
+ *  `path`, no `next`), checkout paths live in `.hub/local.yml`, counters in
+ *  `counters/`, this machine's identity in `.hub/device.yml`. `repos()` still
+ *  returns the MERGED view (`path`, `next`, `graphify`) so callers did not change.
  */
 
 import { createHash } from 'node:crypto';
-import { mkdir, readdir, stat } from 'node:fs/promises';
+import { mkdir, readdir, realpath, stat } from 'node:fs/promises';
 import { basename, join } from 'node:path';
 import { parse as parseYaml, stringify as stringifyYaml } from 'yaml';
 import {
@@ -25,11 +30,14 @@ import {
   newItemDoc,
   nextDecisionNumber,
   parseDecisions,
+  parseItemId,
+  formatItemId,
   isIntakeUnprocessed,
   parseIntake,
   parseItem,
   parseJournal,
-  reposFileSchema,
+  repoKindOf,
+  reposSyncedFileSchema,
   SEP,
   serializeDecision,
   serializeIntake,
@@ -45,16 +53,43 @@ import {
   type JournalEvent,
   type PlanStep,
   type RepoConfig,
+  type RepoIdentity,
   type RepoKind,
   type ReposFile,
   type Transition,
 } from '@agent-ledger/shared';
-import { day, ensurePrivateDir, isoLocal, month, renameRetry, shortSession, stamp } from '@agent-ledger/shared';
+import {
+  configureSnowflakeWorker,
+  day,
+  ensurePrivateDir,
+  isOwnedByMe,
+  isoLocal,
+  month,
+  renameRetry,
+  sanitizeLine,
+  shortSession,
+  stamp,
+} from '@agent-ledger/shared';
 import { expandHome, type HubConfig } from '../config.ts';
 import { conflict, invalid, notFound, LedgerError } from '../errors.ts';
 import { gitToplevel, LedgerGit } from '../git.ts';
 import { normalizeGitPath, samePathGit } from '../gitpath.ts';
+import { readOriginHint, readRootSha } from '../gitreader.ts';
 import { MemoryIndex, type ItemFilter, type LedgerIndex, type StoredItem } from '../index-store.ts';
+import {
+  isAbsoluteLike,
+  LEDGER_FORMAT,
+  loadOrCreateDevice,
+  readAllCounters,
+  readCounterFile,
+  readLedgerFormat,
+  readLocalFile,
+  writeCounterFile,
+  writeLedgerFormat,
+  writeLocalFile,
+  type DeviceIdentity,
+  type RepoLocal,
+} from './device.ts';
 import { appendLine, ensureDir, ensureFile, readText, tighten, writeAtomic } from './fsops.ts';
 import { LedgerPaths } from './paths.ts';
 import { SerialQueue } from './queue.ts';
@@ -137,6 +172,21 @@ export class Ledger {
   private readonly parsedHash = new Map<string, string>();
 
   private reposRaw: ReposFile = {};
+  /** `.hub/local.yml` as last read OK. */
+  private localRaw = new Map<string, RepoLocal>();
+  /** False while `.hub/local.yml` is unreadable: never overwrite it then. */
+  private localOk = true;
+  /** This device's counter file, `{slug: last allocated}`. */
+  private counters = new Map<string, number>();
+  /** True once an own counter state is known; allocation refuses without it. */
+  private countersLoaded = false;
+  /** Format-1 `next - 1` still present in `repos.yml`; folded into the counter
+   *  file before the key is ever dropped (counter must never go down). */
+  private legacyFloor = new Map<string, number>();
+  /** `repos.yml` still carries `path`/`next`/`graphify`/absolute docs. */
+  private legacyPresent = false;
+  private deviceIdentity: DeviceIdentity | null = null;
+
   private readonly logFn: (line: string) => void;
 
   constructor(deps: LedgerDeps) {
@@ -166,11 +216,20 @@ export class Ledger {
     this.logFn(line);
   }
 
+  /** This machine's identity (`.hub/device.yml`); only valid after `init()`. */
+  get device(): DeviceIdentity {
+    if (this.deviceIdentity === null) throw new Error('ledger is not initialised');
+    return this.deviceIdentity;
+  }
+
   /* ---------------- boot ---------------- */
 
   async init(): Promise<void> {
     await ensureDir(this.paths.root, 0o700);
     await tighten(this.paths.root, 0o700);
+    // Before ANY other write: a ledger written by a newer hub (higher
+    // `ledger.format`) has a layout this code does not understand. Fail closed.
+    const format = await readLedgerFormat(this.paths.formatFile);
     // win32: a plain mkdir inherits the parent's ACL (e.g. BUILTIN\\Users write under a shared
     // temp/data root), which the token/hooks trust checks rightly refuse. Create `.hub` private
     // (DACL {me, SYSTEM}, inheritance removed). POSIX keeps the mode-based path unchanged.
@@ -179,15 +238,68 @@ export class Ledger {
     await this.git.init();
     await this.ensureGitignore();
     await this.ensureGitattributes();
+    // Device identity decides the id slot and the snowflake worker: load it
+    // before anything can mint an id. Process-wide on purpose: `generate()` is
+    // called from the DB layer too.
+    this.deviceIdentity = await loadOrCreateDevice(this.paths.deviceYml);
+    configureSnowflakeWorker(this.device.slot);
     const created = await ensureFile(
       this.paths.reposYml,
-      stringifyYaml({ ops: { kind: 'system', prefix: 'OPS', path: null, next: 1 } }, { lineWidth: 0 }),
+      stringifyYaml({ ops: { kind: 'system', prefix: 'OPS' } }, { lineWidth: 0 }),
       0o600,
     );
     await this.loadRepos();
+    const migrated = await this.migrateToV2(format);
     if (created) await this.ensureRepoFiles('ops');
     await this.reindex();
     if (created) this.git.touch('initialized ledger');
+    else if (migrated) this.git.touch('ledger format 2 migration');
+  }
+
+  /**
+   * Format 1 → 2, idempotent. Order is crash-safe: counters (`next` folded in)
+   * and `.hub/local.yml` are written BEFORE `repos.yml` loses `path`/`next`, and
+   * the `ledger.format` marker goes last, so an interrupted run simply repeats.
+   * A `repos.yml` that does not parse is left untouched (no marker either).
+   */
+  private async migrateToV2(format: number): Promise<boolean> {
+    if (format >= LEDGER_FORMAT && !this.legacyPresent) return false;
+    if (this.warnings.has(this.paths.reposYml)) {
+      this.logFn('ledger format 2 migration skipped: repos.yml is not valid');
+      return false;
+    }
+    if (this.legacyPresent) {
+      if (!this.localOk) {
+        // Moving paths out of repos.yml while local.yml cannot be written would lose them.
+        this.logFn('ledger format 2 migration skipped: .hub/local.yml is not valid');
+        return false;
+      }
+      for (const [slug, cfg] of Object.entries(this.reposRaw)) {
+        if (cfg.identity !== undefined || cfg.path === null || repoKindOf(cfg) !== 'repo') continue;
+        const identity = await this.identityFor(cfg.path);
+        if (identity !== undefined) this.reposRaw[slug] = { ...cfg, identity };
+      }
+      await this.saveRepos();
+    }
+    if (format < LEDGER_FORMAT) await writeLedgerFormat(this.paths.formatFile);
+    this.logFn(`ledger migrated to format ${LEDGER_FORMAT}`);
+    return true;
+  }
+
+  /** Portable identity of a checkout; best effort, never throws (empty repo,
+   *  missing directory, git failure → no identity). */
+  private async identityFor(path: string): Promise<RepoIdentity | undefined> {
+    try {
+      const dir = expandHome(path);
+      // Fail closed: never run git in a checkout this user does not own (its
+      // .git/config is attacker-controlled there). Unknown owner = no identity.
+      if (!(await isOwnedByMe(await realpath(dir)))) return undefined;
+      const root = await readRootSha(dir);
+      if (root === null) return undefined;
+      return { root_sha: root, origin_hint: await readOriginHint(dir) };
+    } catch {
+      return undefined;
+    }
   }
 
   /** Create `.gitignore` when missing, or append any of `GITIGNORE_LINES`
@@ -228,6 +340,8 @@ export class Ledger {
     const text = await readText(this.paths.reposYml);
     if (text === null) {
       this.reposRaw = {};
+      this.legacyFloor = new Map();
+      this.legacyPresent = false;
       return;
     }
     let parsed: unknown;
@@ -237,7 +351,7 @@ export class Ledger {
       this.warnings.set(this.paths.reposYml, `invalid YAML: ${String(err)}`);
       return; // keep the last good version
     }
-    const res = reposFileSchema.safeParse(parsed ?? {});
+    const res = reposSyncedFileSchema.safeParse(parsed ?? {});
     if (!res.success) {
       const first = res.error.issues[0];
       this.warnings.set(
@@ -247,7 +361,87 @@ export class Ledger {
       return;
     }
     this.warnings.delete(this.paths.reposYml);
-    this.reposRaw = res.data as ReposFile;
+    await this.loadLocal();
+    await this.loadCounters();
+
+    const merged: ReposFile = {};
+    const floor = new Map<string, number>();
+    let legacy = false;
+    for (const [slug, s] of Object.entries(res.data)) {
+      const loc = this.localRaw.get(slug);
+      const own = this.counters.get(slug) ?? 0;
+      const legacyNext = s.next === undefined ? 0 : s.next - 1;
+      if (s.next !== undefined) floor.set(slug, legacyNext);
+      if (
+        s.path !== undefined ||
+        s.next !== undefined ||
+        s.graphify !== undefined ||
+        (s.docs ?? []).some(isAbsoluteLike)
+      ) {
+        legacy = true;
+      }
+      const cfg: RepoConfig = {
+        ...(s.kind === undefined ? {} : { kind: s.kind }),
+        ...(s.host === undefined ? {} : { host: s.host }),
+        prefix: s.prefix,
+        path: loc?.path !== undefined ? loc.path : (s.path ?? null),
+        next: Math.max(own, legacyNext) + 1,
+      };
+      const graphify = loc?.graphify !== undefined ? loc.graphify : s.graphify;
+      if (graphify !== undefined) cfg.graphify = graphify;
+      if (s.graphify_rel !== undefined) cfg.graphify_rel = s.graphify_rel;
+      if (s.identity !== undefined) cfg.identity = s.identity;
+      const docs = [...new Set([...(s.docs ?? []), ...(loc?.docs ?? [])])];
+      if (s.docs !== undefined || docs.length > 0) cfg.docs = docs;
+      if (s.prefix_aliases !== undefined) cfg.prefix_aliases = s.prefix_aliases;
+      if (s.onboarded !== undefined) cfg.onboarded = s.onboarded;
+      if (s.contracts !== undefined) cfg.contracts = s.contracts;
+      if (s.consumers !== undefined) cfg.consumers = s.consumers;
+      merged[slug] = cfg;
+    }
+    this.reposRaw = merged;
+    this.legacyFloor = floor;
+    this.legacyPresent = legacy;
+  }
+
+  /** `.hub/local.yml`. Unreadable → keep the last good view and never overwrite it. */
+  private async loadLocal(): Promise<void> {
+    const local = await readLocalFile(this.paths.localYml);
+    if (local === null) {
+      this.localOk = false;
+      this.warnings.set(this.paths.localYml, 'invalid .hub/local.yml — checkout paths unavailable, file left as is');
+      return;
+    }
+    this.localOk = true;
+    this.warnings.delete(this.paths.localYml);
+    this.localRaw = local;
+  }
+
+  /** This device's counter file. First boot of the PRIMARY slot (`""`) seeds from
+   *  the per-key max over every counter file, so a lost `.hub/device.yml`
+   *  (new device id) can never restart numbering below existing ids. An
+   *  unreadable file keeps the last good in-memory counters; with none, id
+   *  allocation refuses (`countersLoaded` false) instead of guessing. */
+  private async loadCounters(): Promise<void> {
+    const file = this.paths.counterFile(this.device.device_id);
+    try {
+      const own = await readCounterFile(file);
+      this.counters =
+        own ??
+        (this.device.slot === ''
+          ? await readAllCounters(this.paths.countersDir, (name) =>
+              this.logFn(`counters/${name} is not valid and was ignored`),
+            )
+          : new Map());
+      this.countersLoaded = true;
+      this.warnings.delete(file);
+    } catch {
+      this.warnings.set(file, 'invalid counter file — id allocation refused until it is fixed');
+    }
+  }
+
+  private async saveCounters(): Promise<void> {
+    await writeCounterFile(this.paths.counterFile(this.device.device_id), this.counters);
   }
 
   repos(): ReposFile {
@@ -284,7 +478,7 @@ export class Ledger {
 
   /** Slug that owns an item id, honouring `prefix_aliases` (SPEC §4.2). */
   repoForItemId(id: string): string | null {
-    const prefix = /^([A-Z]{2,4})-\d+$/.exec(id.trim().toUpperCase())?.[1];
+    const prefix = parseItemId(id.trim().toUpperCase())?.prefix;
     if (!prefix) return null;
     for (const [slug, cfg] of Object.entries(this.reposRaw)) {
       if (cfg.prefix === prefix) return slug;
@@ -293,12 +487,60 @@ export class Ledger {
     return null;
   }
 
+  /**
+   * Write the PORTABLE `repos.yml` (no `path`, `next`, `graphify`, absolute docs)
+   * and `.hub/local.yml`. Any format-1 `next` is folded into the counter file
+   * first, so dropping the key can never lower a counter.
+   */
   private async saveRepos(): Promise<void> {
-    await writeAtomic(
-      this.paths.reposYml,
-      stringifyYaml(this.reposRaw, { lineWidth: 0 }),
-      0o600,
-    );
+    await this.flushLegacyFloor();
+    const synced: Record<string, Record<string, unknown>> = {};
+    const local = new Map<string, RepoLocal>();
+    for (const [slug, cfg] of Object.entries(this.reposRaw)) {
+      const e: Record<string, unknown> = {};
+      if (cfg.kind !== undefined) e.kind = cfg.kind;
+      if (cfg.host !== undefined) e.host = cfg.host;
+      e.prefix = cfg.prefix;
+      const docsRel = (cfg.docs ?? []).filter((d) => !isAbsoluteLike(d));
+      const docsAbs = (cfg.docs ?? []).filter(isAbsoluteLike);
+      if (docsRel.length > 0) e.docs = docsRel;
+      if (cfg.graphify_rel !== undefined) e.graphify_rel = cfg.graphify_rel;
+      if (cfg.identity !== undefined) e.identity = cfg.identity;
+      if (cfg.prefix_aliases !== undefined) e.prefix_aliases = cfg.prefix_aliases;
+      if (cfg.onboarded !== undefined) e.onboarded = cfg.onboarded;
+      if (cfg.contracts !== undefined) e.contracts = cfg.contracts;
+      if (cfg.consumers !== undefined) e.consumers = cfg.consumers;
+      synced[slug] = e;
+      const loc: RepoLocal = {};
+      if (cfg.path !== null) loc.path = cfg.path;
+      if (cfg.graphify) loc.graphify = cfg.graphify;
+      if (docsAbs.length > 0) loc.docs = docsAbs;
+      if (Object.keys(loc).length > 0) local.set(slug, loc);
+    }
+    // Local first: if we die in between, a path is still known locally and the
+    // stale synced entry is merely redundant — never the reverse.
+    if (this.localOk) {
+      await writeLocalFile(this.paths.localYml, local);
+      this.localRaw = local;
+    }
+    const text = stringifyYaml(synced, { lineWidth: 0 });
+    if ((await readText(this.paths.reposYml)) !== text) {
+      await writeAtomic(this.paths.reposYml, text, 0o600);
+    }
+  }
+
+  /** Persist `max(counter, legacy next - 1)` for every slug that still has a
+   *  format-1 `next` in `repos.yml`, then forget the floor. */
+  private async flushLegacyFloor(): Promise<void> {
+    if (this.legacyFloor.size === 0) return;
+    if (!this.countersLoaded) {
+      throw new LedgerError(500, 'COUNTERS_INVALID', 'counter file is unreadable — refusing to rewrite repos.yml');
+    }
+    for (const [slug, n] of this.legacyFloor) {
+      if (n > (this.counters.get(slug) ?? 0)) this.counters.set(slug, n);
+    }
+    await this.saveCounters(); // also repairs an unreadable file from the last good state
+    this.legacyFloor = new Map();
   }
 
   private async ensureRepoFiles(slug: string): Promise<void> {
@@ -408,6 +650,10 @@ export class Ledger {
   }
 
   async registerRepo(input: RepoRegisterInput): Promise<{ slug: string; cfg: RepoConfig }> {
+    // `counters` and `intake` are top-level directories of the ledger itself.
+    if (input.slug === 'counters' || input.slug === 'intake') {
+      throw invalid(`"${input.slug}" is reserved — pick another slug`);
+    }
     let path: string | null = null;
     const kind: RepoKind = input.kind ?? 'repo';
     const hasPath = input.path !== null && input.path !== undefined && input.path !== '';
@@ -426,6 +672,7 @@ export class Ledger {
       }
       path = normalizeGitPath(top);
     }
+    const identity = path === null ? undefined : await this.identityFor(path);
     return this.queue.run(async () => {
       await this.loadRepos();
       if (this.hasRepo(input.slug)) throw conflict(`repo "${input.slug}" already exists`);
@@ -443,7 +690,14 @@ export class Ledger {
       // A freshly registered repo has an empty ledger: the next session must be
       // told to fill CONTEXT.md and import existing TODO files before it treats
       // the ledger as authoritative (onboarding, SPEC §4.6 + F1 addendum).
-      const cfg: RepoConfig = { prefix, path, next: 1, onboarded: input.onboarded ?? false };
+      // A re-registered slug continues after its old counter (ids are never reused).
+      const cfg: RepoConfig = {
+        prefix,
+        path,
+        next: (this.counters.get(input.slug) ?? 0) + 1,
+        onboarded: input.onboarded ?? false,
+      };
+      if (identity !== undefined) cfg.identity = identity;
       if (kind !== 'repo') cfg.kind = kind;
       if (kind === 'vps' && input.host) cfg.host = input.host;
       if (input.graphify) cfg.graphify = input.graphify;
@@ -467,13 +721,92 @@ export class Ledger {
     return null;
   }
 
+  /**
+   * `ledger repo bind <slug> <path>`: point an existing slug at a checkout on
+   * THIS machine. Only `.hub/local.yml` changes (plus `identity` when the repo
+   * had none). A checkout whose root commit differs from the recorded
+   * `identity.root_sha` is refused — binding the wrong repo would route every
+   * session in it into another project's ledger.
+   */
+  async bindRepo(slug: string, rawPath: string): Promise<RepoConfig> {
+    if (!this.hasRepo(slug)) throw notFound(`unknown repo "${slug}" — use \`ledger repo add\``);
+    const top = await gitToplevel(expandHome(rawPath));
+    if (!top) {
+      throw invalid(`"${rawPath}" is not a git repository (git rev-parse --show-toplevel failed)`);
+    }
+    const path = normalizeGitPath(top);
+    const identity = await this.identityFor(path);
+    return this.queue.run(async () => {
+      await this.loadRepos();
+      const cfg = this.repo(slug);
+      if (repoKindOf(cfg) !== 'repo') throw invalid(`repo kind "${repoKindOf(cfg)}" has no checkout to bind`);
+      const dup = Object.entries(this.reposRaw).find(
+        ([other, c]) => other !== slug && c.path && samePathGit(expandHome(c.path), path),
+      );
+      if (dup) throw conflict(`path "${path}" is already held by repo "${dup[0]}"`);
+      if (cfg.identity !== undefined) {
+        if (identity === undefined) {
+          throw conflict(`cannot read the root commit of "${path}" — cannot verify it is repo "${slug}"`);
+        }
+        if (identity.root_sha !== cfg.identity.root_sha) {
+          throw conflict(`"${path}" has a different root commit than repo "${slug}" — refusing to bind`);
+        }
+      }
+      cfg.path = path;
+      const learned = cfg.identity === undefined && identity !== undefined;
+      if (learned) cfg.identity = identity;
+      await this.saveRepos();
+      if (learned) this.git.touch(`${slug} identity`);
+      return cfg;
+    });
+  }
+
+  /**
+   * SessionStart in a checkout no slug points at: if exactly ONE registered repo
+   * has this checkout's `root_sha` and no local path yet, bind it (local only).
+   * Never creates a slug. Zero or several matches → `null` (the caller may
+   * auto-register, or a human uses `ledger repo bind`). The caller must already
+   * have established that the checkout belongs to this user.
+   */
+  async bindByRootSha(checkout: string): Promise<string | null> {
+    const identity = await this.identityFor(checkout);
+    if (identity === undefined) return null;
+    return this.queue.run(async () => {
+      await this.loadRepos();
+      const path = normalizeGitPath(checkout);
+      const held = Object.values(this.reposRaw).some(
+        (c) => c.path && samePathGit(expandHome(c.path), path),
+      );
+      if (held) return null;
+      // A template clone shares its root commit with the original, so root_sha alone
+      // is a hint: when both sides know an origin and they differ, do not guess.
+      const hintClash = (c: RepoConfig): boolean =>
+        c.identity?.origin_hint != null &&
+        identity.origin_hint !== null &&
+        c.identity.origin_hint !== identity.origin_hint;
+      const matches = Object.entries(this.reposRaw).filter(
+        ([, c]) =>
+          repoKindOf(c) === 'repo' &&
+          c.path === null &&
+          c.identity?.root_sha === identity.root_sha &&
+          !hintClash(c),
+      );
+      if (matches.length !== 1) return null;
+      const [slug, cfg] = matches[0] as [string, RepoConfig];
+      cfg.path = path;
+      await this.saveRepos();
+      this.logFn(`repo bound by root commit: ${slug}`);
+      return slug;
+    });
+  }
+
   /* ---------------- reindex ---------------- */
 
   async reindex(): Promise<void> {
     await this.loadRepos();
     const slugs = new Set(Object.keys(this.reposRaw));
     for (const entry of await safeReaddir(this.paths.root)) {
-      if (entry.startsWith('.') || entry === 'intake' || entry === 'repos.yml') continue;
+      if (entry.startsWith('.') || entry === 'intake' || entry === 'counters' || entry === 'repos.yml') continue;
       const st = await safeStat(join(this.paths.root, entry));
       if (st?.isDirectory()) slugs.add(entry);
     }
@@ -622,7 +955,7 @@ export class Ledger {
       const text = await readText(file);
       if (text === null) continue;
       if (this.alreadyParsed(file, text)) continue;
-      this.index.setJournal(slug, name.replace(/\.md$/, ''), parseJournal(text, slug));
+      this.index.setJournal(slug, name.replace(/\.md$/, ''), collapseRolling(parseJournal(text, slug)));
     }
   }
 
@@ -686,7 +1019,7 @@ export class Ledger {
     }
     const line = journalLine({ at: stamp(at), session: shortSession(session), type, fields });
     await appendLine(file, line, 0o600);
-    const events = parseJournal((await readText(file)) ?? '', repo);
+    const events = collapseRolling(parseJournal((await readText(file)) ?? '', repo));
     this.index.setJournal(repo, month(at), events);
   }
 
@@ -696,24 +1029,56 @@ export class Ledger {
     return this.queue.run(async () => {
       await this.loadRepos();
       const cfg = this.repo(input.repo);
-      const id = `${cfg.prefix}-${cfg.next}`;
-      const allocated = cfg.next;
-      cfg.next += 1;
-      await this.saveRepos();
+      if (!this.countersLoaded) {
+        throw new LedgerError(
+          500,
+          'COUNTERS_INVALID',
+          'this device\'s counter file is unreadable — refusing to allocate ids (fix counters/ or restore it)',
+        );
+      }
+      const slug = input.repo;
+      let allocated = Math.max(this.counters.get(slug) ?? 0, this.legacyFloor.get(slug) ?? 0) + 1;
+      // Never overwrite an existing item file, whatever the counter says (lost or
+      // reset counter, hand-copied item): skip forward to the first free number.
+      for (let tries = 0; ; tries += 1) {
+        const taken = await stat(
+          this.paths.itemFile(slug, formatItemId(cfg.prefix, this.device.slot, allocated)),
+        ).then(() => true, () => false);
+        if (!taken) break;
+        if (tries >= 10_000) throw conflict(`no free item number found for repo "${slug}"`);
+        allocated += 1;
+      }
+      const id = formatItemId(cfg.prefix, this.device.slot, allocated);
+      // The counter moves BEFORE the item is written, so two concurrent creates can
+      // never share an id; every failure path below puts it back.
+      const before = this.counters.get(slug);
+      this.counters.set(slug, allocated);
+      cfg.next = allocated + 1;
+      const restore = (): void => {
+        if (this.counters.get(slug) !== allocated) return; // somebody allocated past us
+        if (before === undefined) this.counters.delete(slug);
+        else this.counters.set(slug, allocated - 1);
+        cfg.next = allocated;
+      };
+      try {
+        await this.saveCounters();
+      } catch (err) {
+        restore();
+        throw err;
+      }
       let created: Item;
       try {
         created = await this.writeNewItem(id, input);
       } catch (err) {
-        // Backlog fix: `next` is bumped before the item is written so two
-        // concurrent creates can never share an id. If the write then fails
-        // (ENOSPC, EACCES, a bad schema), keep the id reusable instead of
+        // The counter is bumped before the item is written. If the write then
+        // fails (ENOSPC, EACCES, a bad schema), keep the id reusable instead of
         // leaving a permanent hole in the sequence — but only when nobody has
         // allocated past us in the meantime.
-        const current = this.reposRaw[input.repo];
-        if (current && current.next === allocated + 1) {
-          current.next = allocated;
-          await this.saveRepos().catch(() => undefined);
-          this.logFn(`${id}: write failed, id returned to next=${allocated}`);
+        const wasCurrent = this.counters.get(slug) === allocated;
+        restore();
+        if (wasCurrent) {
+          await this.saveCounters().catch(() => undefined);
+          this.logFn(`${id}: write failed, id returned to counter=${allocated - 1}`);
         }
         throw err;
       }
@@ -1407,15 +1772,14 @@ export class Ledger {
   }
 
   /**
-   * Append, or REPLACE this session's previous line of the same type in
-   * the current month's file.
+   * Append this session's rolling summary line to the current month's file.
    *
-   * The journal is append-only for *facts* — an item status, a commit, a
-   * release. A rolling session summary is not a fact, it is the same fact
-   * restated more completely, and appending one per commit would bury the
-   * journal (and every brief that reads it) under near-duplicates. So the line
-   * is rewritten in place and the file keeps exactly one summary per session
-   * per month-file.
+   * The journal is APPEND-ONLY (ledger format 2: two devices merge journals as a
+   * line union, and a rewrite would resurrect or lose lines). A rolling session
+   * summary is the same fact restated more completely, so readers collapse
+   * `session.summary` to the latest line per session (`collapseRolling`) —
+   * the brief and `listJournal` still show one per session. A line identical to
+   * the session's latest one is not appended again.
    *
    * Only ever used for `session.summary`; the signature takes the type so the
    * rule is visible at the call site rather than hidden in here.
@@ -1429,30 +1793,33 @@ export class Ledger {
     await this.queue.run(async () => {
       const at = new Date();
       const file = this.paths.journalFile(repo, month(at));
-      const existing = await readText(file);
       const short = shortSession(session) || '—';
-      const line = journalLine({ at: stamp(at), session: short, type, fields });
+      const line = sanitizeLine(journalLine({ at: stamp(at), session: short, type, fields }));
+      let existing = await readText(file);
       if (existing === null) {
-        await writeAtomic(file, `# ${repo} — journal ${month(at)}\n${line}\n`, 0o600);
-      } else {
-        const lines = existing.split(/\r?\n/);
-        // Match on the session and type columns of the rendered line, which is
-        // the same shape `journalLine` just produced — no re-parsing needed.
-        const marker = `${SEP}${short}${SEP}${type}${SEP}`;
-        let replaced = false;
-        for (let i = lines.length - 1; i >= 0; i -= 1) {
-          if (!(lines[i] ?? '').includes(marker)) continue;
-          lines[i] = line;
-          replaced = true;
+        await writeAtomic(file, `# ${repo} — journal ${month(at)}\n`, 0o600); // create only
+        existing = '';
+      }
+      // Match on the session and type columns of the rendered line.
+      const marker = `${SEP}${short}${SEP}${type}${SEP}`;
+      const lines = existing.split(/\r?\n/);
+      let latest: string | undefined;
+      for (let i = lines.length - 1; i >= 0; i -= 1) {
+        if ((lines[i] ?? '').includes(marker)) {
+          latest = lines[i];
           break;
         }
-        if (!replaced) {
-          while (lines.length > 0 && (lines[lines.length - 1] ?? '') === '') lines.pop();
-          lines.push(line);
-        }
-        await writeAtomic(file, `${lines.join('\n').replace(/\n+$/, '')}\n`, 0o600);
       }
-      this.index.setJournal(repo, month(at), parseJournal((await readText(file)) ?? '', repo));
+      // Identical apart from the minute stamp = nothing new to say.
+      const stripAt = (l: string): string => l.replace(/^(\s*-\s*)\d{4}-\d{2}-\d{2} \d{2}:\d{2}/, '$1');
+      if (latest === undefined || stripAt(latest.trim()) !== stripAt(line)) {
+        await appendLine(file, line, 0o600);
+      }
+      this.index.setJournal(
+        repo,
+        month(at),
+        collapseRolling(parseJournal((await readText(file)) ?? '', repo)),
+      );
       this.git.touch(`${repo} ${type}`);
     });
   }
@@ -1754,6 +2121,16 @@ export function parseEventTime(at: string): number | null {
     Number(m[4]),
     Number(m[5]),
   ).getTime();
+}
+
+/** `session.summary` is a rolling fact appended again and again (the journal
+ *  file is append-only); the index keeps only the LATEST line per session. */
+export function collapseRolling(events: JournalEvent[]): JournalEvent[] {
+  const last = new Map<string, number>();
+  events.forEach((ev, i) => {
+    if (ev.type === 'session.summary') last.set(ev.session, i);
+  });
+  return events.filter((ev, i) => ev.type !== 'session.summary' || last.get(ev.session) === i);
 }
 
 async function safeReaddir(dir: string): Promise<string[]> {

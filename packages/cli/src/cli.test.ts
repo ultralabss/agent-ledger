@@ -314,3 +314,41 @@ test('status: a foreign process or a hub of another ledger on the port is NOT re
   assert.match(foreign.stderr, /refusing to send the hub token/);
   assert.equal(foreign.stdout, '');
 });
+
+test('repo bind: points a slug at a checkout, verifies the root commit', async (t) => {
+  const fx = await startTestHub();
+  const { git } = await import('@agent-ledger/hub/git');
+  const mk = async (label: string) => {
+    const repo = await makeCodeRepo(label);
+    const res = await git(repo.path, ['-c', 'user.name=t', '-c', 'user.email=t@t', 'commit', '--allow-empty', '-q', '-m', `root of ${label}`]);
+    assert.equal(res.code, 0, res.stderr);
+    const root = (await git(repo.path, ['rev-list', '--max-parents=0', 'HEAD'])).stdout.trim();
+    return { ...repo, root };
+  };
+  const mine = await mk('bindcli-a');
+  const other = await mk('bindcli-b');
+  t.after(async () => {
+    await fx.cleanup();
+    await mine.cleanup();
+    await other.cleanup();
+  });
+  await writeFile(
+    fx.hub.ledger.paths.reposYml,
+    `ops:\n  kind: system\n  prefix: OPS\napp:\n  prefix: APP\n  identity:\n    root_sha: ${mine.root}\n`,
+    'utf8',
+  );
+  await fx.hub.ledger.queue.run(() => fx.hub.ledger.reindex());
+  const env = { LEDGER_HUB_URL: fx.url, LEDGER_DIR: fx.dir, LEDGER_SESSION: '61e0b33d' };
+
+  const bad = await ledger(['repo', 'bind', 'app', other.path], env);
+  assert.notEqual(bad.code, 0);
+  assert.match(bad.stderr, /different root commit/);
+  assert.equal((await ledger(['repo', 'bind', 'app'], env)).code, 4, 'path is required');
+
+  // relative path resolves against cwd
+  const good = await ledger(['repo', 'bind', 'app', '.'], env, mine.path);
+  assert.equal(good.code, 0, good.stderr);
+  assert.match(good.lines[0] ?? '', /^app bound → .+/);
+  const ls = await ledger(['repo', 'ls'], env);
+  assert.ok(ls.lines.some((l) => l.startsWith('app APP ') && !l.endsWith(' —')), ls.stdout);
+});

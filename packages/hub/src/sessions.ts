@@ -440,6 +440,19 @@ export class Sessions {
     } catch {
       return null;
     }
+    // Another machine's registration of this very repo (same root commit, no local
+    // path yet) is bound to THIS checkout instead of minting a second slug. Local
+    // only; the owner check above has already passed. Ambiguous/none → fall through.
+    try {
+      const bound = await this.ledger.bindByRootSha(canonicalCheckout(layout));
+      if (bound !== null) {
+        this.repoIndexKey = ''; // force a rebuild
+        this.ledger.log(`repo bound ${bound} → ${canonicalCheckout(layout)}`);
+        return bound;
+      }
+    } catch (err) {
+      this.ledger.log(`repo binding failed: ${String(err)}`);
+    }
     let slug = base;
     for (let n = 2; n < 100 && Object.hasOwn(existing, slug); n += 1) slug = `${base}-${n}`;
     if (Object.hasOwn(existing, slug)) return null;

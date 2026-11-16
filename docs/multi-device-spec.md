@@ -129,7 +129,7 @@ Remote host can read everything. Doctor adds: remote differs from all code remot
 git-crypt = smudge/clean filters (code exec) and opaque to merge; age whole-file breaks field merge. **Default none in v0.3**: private host + full-disk encryption + secret scanning. Escape hatch later: age-encrypted `git bundle` to dumb storage.
 ### 7.3 Ingress validation (each new commit, before merge)
 1. Enforce mode: signer trusted + non-revoked; unsigned quarantined (brief says so).
-2. Path allowlist: `repos.yml`, `devices.yml`, `counters/*.yml`, `<slug>/{CONTEXT.md,DECISIONS.md,items/<ID>.md,journal/YYYY-MM.md}`, `intake/YYYY-MM/<snowflake>.md`, `.gitignore`, hub-owned `.gitattributes` with exact pinned content. Reject symlinks, submodules, exec bits, other `.git*`, Windows-invalid names (`CON`, trailing dot/space, `:`).
+2. Path allowlist: `repos.yml`, `devices.yml`, `counters/*.yml`, `<slug>/{CONTEXT.md,DECISIONS.md,items/<ID>.md,journal/YYYY-MM.md}`, `intake/YYYY-MM/<snowflake>.md`, `ledger.format` (content `<n>\n`, n <= supported format), `.gitignore`, hub-owned `.gitattributes` with exact pinned content `* text eol=lf` (decision AL-7: LF normalisation, not `-text`; the hub already writes this line). Reject symlinks, submodules, exec bits, other `.git*`, Windows-invalid names (`CON`, trailing dot/space, `:`).
 3. Size: 256 KB/file, 5 MB/push.
 4. Frontmatter schema validation.
 5. Secret scan of incoming diff (hub scanner + gitleaks); hit -> content kept out of brief, alert, journal `sync.secret`.
@@ -181,7 +181,7 @@ Prerequisites in v0.3 code: journal rewrites -> appends; Snowflake worker bits f
 10. Team: one remote with roles vs one per audience. *one per audience.*
 
 ## 11. Review notes (orchestrator)
-- **Conflict with current code:** `ledger.ts:117` writes `.gitattributes` as `* text eol=lf`; §7.3 pins `* -text`. Pick one content before ingress rule is built (`text eol=lf` normalizes CRLF on Windows and is probably what we want; pin that instead).
+- **Resolved (AL-7):** `.gitattributes` stays `* text eol=lf` and is the value pinned in §7.3.
 - Not yet checked in code: which paths rewrite journal files (`ledger.ts:1436,1453` per scout), layout of guard module, available 3-way YAML merge lib.
 - Hidden prerequisite found: Snowflake worker bits not derived from a per-machine id today.
 - Existing README claim "Single user, single machine ... no remote access" and SPEC §18 must be updated when v0.3 lands.
