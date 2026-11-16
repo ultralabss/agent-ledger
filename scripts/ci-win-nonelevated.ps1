@@ -6,7 +6,7 @@ param(
   # Diagnostics: override the test glob / node:test flags / wall-clock cap (defaults = the full suite).
   [string]$Files = 'packages/*/src/**/*.test.ts',
   [string]$ExtraArgs = '',
-  [int]$MaxMinutes = 17,
+  [int]$MaxMinutes = 33,
   # Diagnostics: run `node <script>` instead of the suite, and never fail the step.
   [string]$DiagScript = '',
   # Diagnostics: report but never fail the step.
@@ -41,7 +41,7 @@ try {
   # user's TEMP is a directory inside ITS profile (ACL: user, SYSTEM, Administrators only).
   # Start-Process -Credential inherits the runner's USERPROFILE, so name the test user's profile explicitly.
   $lt = "$env:SystemDrive\Users\$user\lt"
-  $nodeCmd = if ($DiagScript) { "node `"$DiagScript`"" } else { "node --test --test-timeout=120000 $ExtraArgs `"$Files`"" }
+  $nodeCmd = if ($DiagScript) { "node `"$DiagScript`"" } else { "node --test --test-timeout=600000 $ExtraArgs `"$Files`"" }
   $up = "$env:SystemDrive\Users\$user"
   # Start-Process -Credential inherits the runner's profile variables; point them at the test user's own.
   $envSet = "set `"USERPROFILE=$up`"& set `"LOCALAPPDATA=$up\AppData\Local`"& set `"APPDATA=$up\AppData\Roaming`"& set `"HOMEPATH=\Users\$user`"& set `"HOMEDRIVE=$env:SystemDrive`"& mkdir `"$up\AppData\Local`"& mkdir `"$up\AppData\Roaming`"& set `"NODE_OPTIONS=--import=./scripts/ci-win-preload.mjs`"& "

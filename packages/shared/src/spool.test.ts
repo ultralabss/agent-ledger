@@ -19,6 +19,7 @@ import {
   spoolDir,
   type KeyedRequester,
 } from './spool.ts';
+import { skipOnWin32 } from '@agent-ledger/shared/testing';
 
 async function tmp(): Promise<string> {
   return mkdtemp(join(tmpdir(), 'spool-test-'));
@@ -30,7 +31,7 @@ function envFor(dir: string): NodeJS.ProcessEnv {
 
 /* ---------------- Default location ---------------- */
 
-test('spoolDir: LEDGER_SPOOL_DIR wins, then XDG_STATE_HOME, then ~/.local/state', () => {
+test('spoolDir: LEDGER_SPOOL_DIR wins, then XDG_STATE_HOME, then ~/.local/state', { skip: skipOnWin32("expects POSIX XDG/~/.local layout; win32 uses LOCALAPPDATA (covered by a platform-injected test)") }, () => {
   assert.equal(spoolDir({ LEDGER_SPOOL_DIR: '/tmp/x-spool', XDG_STATE_HOME: '/tmp/state' }), '/tmp/x-spool');
   assert.equal(spoolDir({ XDG_STATE_HOME: '/tmp/state' }), join('/tmp/state', 'agent-ledger', 'spool'));
   // A relative XDG_STATE_HOME is ignored (the XDG spec requires absolute paths).

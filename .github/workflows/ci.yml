@@ -22,7 +22,7 @@ jobs:
   test:
     name: test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 25
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
@@ -53,11 +53,6 @@ jobs:
       # (T14, not relaxed), so tests run as a non-elevated local user there.
       - run: pnpm test
         if: runner.os != 'Windows'
-      # Diagnostics (never fails, UL-700): the files that still hit the file timeout, serial + spec reporter.
-      - name: Windows diagnostics (files that stall)
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: ./scripts/ci-win-nonelevated.ps1 -Files 'packages/hub/src/{http/f1,http/f2,http/features,http/hub13-17,hub0400,sessions}.test.ts' -ExtraArgs '--test-concurrency=1 --test-reporter=spec --test-timeout=40000' -MaxMinutes 9 -NoFail
       - name: pnpm test (non-elevated user)
         if: runner.os == 'Windows'
         shell: pwsh

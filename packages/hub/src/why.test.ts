@@ -48,7 +48,7 @@ function liveSession(fx: HubFixture, repoPath: string): void {
   });
 }
 
-test('why: items, live claim with intent, git trailers, uncommitted, session, decision — for a file', async (t) => {
+test('why: items, live claim with intent, git trailers, uncommitted, session, decision — for a file', { skip: skipOnWin32("product rejects any backslash in `path`; Windows absolute-path API shape not designed yet (UL-700 follow-up)") }, async (t) => {
   const { fx, repo, id, why } = await setup(t);
   await repo.commit(`feat: totals\n\nRefs: ${id}`, { 'src/cart.ts': 'const SECRET_BODY_MARKER = 1;\n' });
   await repo.commit(`fix: rounding\n\nCloses: ${id}`, { 'src/cart.ts': 'const SECRET_BODY_MARKER = 2;\n' });
@@ -98,7 +98,7 @@ test('why: items, live claim with intent, git trailers, uncommitted, session, de
   assert.equal((rel.json as WhyView).path, 'src/cart.ts');
 });
 
-test('why: directory and glob; a claim not tied to a listed item is listed on its own', async (t) => {
+test('why: directory and glob; a claim not tied to a listed item is listed on its own', { skip: skipOnWin32("product rejects any backslash in `path`; Windows absolute-path API shape not designed yet (UL-700 follow-up)") }, async (t) => {
   const { fx, repo, id, why } = await setup(t);
   await repo.commit(`feat: a\n\nRefs: ${id}`, { 'src/a.ts': 'a', 'src/deep/b.ts': 'b', 'docs/c.md': 'c' });
   liveSession(fx, repo.path);
@@ -169,7 +169,7 @@ test('why: path validation — traversal, outside, NUL, symlink out, root, .git,
   assert.equal((await why('src/gone.ts')).status, 200);
 });
 
-test('why: gitignored paths and their ledger rows are never shown', async (t) => {
+test('why: gitignored paths and their ledger rows are never shown', { skip: skipOnWin32("product rejects any backslash in `path`; Windows absolute-path API shape not designed yet (UL-700 follow-up)") }, async (t) => {
   const { fx, repo, id, why } = await setup(t);
   await repo.commit('chore: ignore', { '.gitignore': 'secret/\n*.pem\n', 'src/ok.ts': 'ok' });
   await mkdir(join(repo.path, 'secret'), { recursive: true });

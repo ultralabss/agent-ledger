@@ -5,6 +5,7 @@
 import { execFileSync } from 'node:child_process';
 import fs from 'node:fs';
 import fsp from 'node:fs/promises';
+import { syncBuiltinESMExports } from 'node:module';
 
 if (process.platform === 'win32') {
   const sys = process.env.SystemRoot ?? 'C:\\Windows';
@@ -32,4 +33,6 @@ if (process.platform === 'win32') {
       try { cb(null, protect(dir)); } catch (e) { cb(e); }
     }]);
   };
+  // `import { mkdtemp } from 'node:fs/promises'` / `import * as fs` bind to the original without this.
+  syncBuiltinESMExports();
 }

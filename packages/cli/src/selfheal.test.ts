@@ -192,7 +192,7 @@ test('validatePlist: a real file on disk', { skip: skipOnWin32('POSIX-only: syml
   );
 });
 
-test('checked mode: loaded job → kickstart only; not loaded → bootstrap', async (t) => {
+test('checked mode: loaded job → kickstart only; not loaded → bootstrap', { skip: skipOnWin32("launchd plist path assertion is POSIX-shaped (macOS feature)") }, async (t) => {
   const dir = await tmp(t);
   const h = harness(dir);
   h.setLoaded(true);
