@@ -17,6 +17,14 @@ $user = 'ledgertest'
 $bytes = New-Object byte[] 24
 [System.Security.Cryptography.RandomNumberGenerator]::Create().GetBytes($bytes)
 $pw = [Convert]::ToBase64String($bytes) + 'aA1!'
+# A previous run in the same job leaves C:\Users\ledgertest behind (Remove-LocalUser keeps the profile
+# directory) with ACLs naming the OLD account's SID; the recreated account cannot use it (EPERM mkdtemp).
+function Remove-TestProfile {
+  Get-CimInstance Win32_UserProfile -ErrorAction SilentlyContinue | Where-Object { $_.LocalPath -like "*\Users\$user" } | Remove-CimInstance -ErrorAction SilentlyContinue
+  $d = "$env:SystemDrive\Users\$user"
+  if (Test-Path $d) { & cmd.exe /d /c "rd /s /q `"$d`"" 2>&1 | Out-Null }
+}
+Remove-TestProfile
 $sec = ConvertTo-SecureString $pw -AsPlainText -Force
 New-LocalUser -Name $user -Password $sec -AccountNeverExpires -PasswordNeverExpires | Out-Null
 try {
@@ -57,4 +65,5 @@ try {
   if ($proc.ExitCode -ne 0 -and -not $NoFail) { throw "tests failed as non-elevated user (exit $($proc.ExitCode))" }
 } finally {
   Remove-LocalUser -Name $user -ErrorAction SilentlyContinue
+  Remove-TestProfile
 }

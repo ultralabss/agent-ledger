@@ -53,14 +53,6 @@ jobs:
       # (T14, not relaxed), so tests run as a non-elevated local user there.
       - run: pnpm test
         if: runner.os != 'Windows'
-      # Diagnostics only (never fails): one hub file, strictly serial, spec reporter, so the log shows
-      # per-test timings and the first test that stalls (UL-700).
-      - name: Windows diagnostics (primitive timings, then one serial test file)
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          ./scripts/ci-win-nonelevated.ps1 -DiagScript scripts/ci-win-diag.ts -MaxMinutes 6 -NoFail
-          ./scripts/ci-win-nonelevated.ps1 -Files 'packages/hub/src/git.test.ts' -ExtraArgs '--test-concurrency=1 --test-reporter=spec' -MaxMinutes 4 -NoFail
       - name: pnpm test (non-elevated user)
         if: runner.os == 'Windows'
         shell: pwsh
