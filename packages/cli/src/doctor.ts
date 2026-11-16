@@ -26,6 +26,7 @@ import {
   TrustError,
   createTrustDeps,
   detectMachinePlatform,
+  deviceHealth,
   probeFs,
   probeFsStatOnly,
   spoolDir,
@@ -473,6 +474,12 @@ export async function cmdDoctor(
       fetchFn: deps.fetchFn,
     }),
   );
+
+  /* ---- device key / signers / stale devices (only once device identity exists) ---- */
+  for (const c of await deviceHealth(cfg.ledgerDir)) {
+    checks.push(c);
+    if (c.status === 'fail') problems.push(c.detail.slice(0, 120));
+  }
 
   /* ---- hub.log ---- */
   // A running hub reports `startedAt`: only its own lines matter then. A hub

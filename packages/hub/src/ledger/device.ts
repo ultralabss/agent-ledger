@@ -11,7 +11,7 @@ import { readdir } from 'node:fs/promises';
 import { join } from 'node:path';
 import { parse as parseYaml, stringify as stringifyYaml } from 'yaml';
 import { z } from 'zod';
-import { reposLocalFileSchema, slotSchema, slugSchema } from '@agent-ledger/shared';
+import { deviceFileSchema, reposLocalFileSchema, slugSchema } from '@agent-ledger/shared';
 import { LedgerError } from '../errors.ts';
 import { DEVICE_ID_RE } from './paths.ts';
 import { readText, writeAtomic } from './fsops.ts';
@@ -59,18 +59,15 @@ export interface DeviceIdentity {
   slot: string;
 }
 
-const labelSchema = z.string().regex(/^[a-z0-9][a-z0-9-]{0,31}$/, 'label: lowercase letters, digits, -');
-export const deviceFileSchema = z.object({
-  device_id: z.string().regex(DEVICE_ID_RE, 'device_id: d_ + 10 base32 chars'),
-  label: labelSchema,
-  // `slot:` left empty in hand-written YAML parses to null — same as primary.
-  slot: slotSchema.nullable().transform((v) => v ?? ''),
-});
+/** Schema lives in shared (`devices.ts`): the CLI's `device init` writes the same file
+ *  (adds `key_fp`). Kept re-exported for existing importers. */
+export { deviceFileSchema };
 
 const B32 = 'abcdefghijklmnopqrstuvwxyz234567';
 
 /** CSPRNG. 256 % 32 === 0, so the byte→char map is unbiased.
- *  (Phase F2 replaces the source with sha256(pubkey); the shape is the same.) */
+ *  Used only when the hub boots before `ledger device init`; `device init` on a fresh
+ *  install derives the id from the key (sha256(pubkey)) and an existing id is never changed. */
 export function newDeviceId(): string {
   const bytes = randomBytes(10);
   let out = 'd_';

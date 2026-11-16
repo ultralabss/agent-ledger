@@ -89,6 +89,8 @@ const USAGE = `ledger — shared ledger and intake for parallel AI agent session
   ledger reply <ID> "<text>" [--mode auto|session|worker]
   ledger wait [--timeout 600]               wait for the hub to come up and flush the queue
   ledger doctor [--fix] [--json] [--online] hub diagnostics (service, healthz, identity, ledger remote)
+  ledger device init|list|approve|revoke    this machine's device key and the device registry (local, no hub needed)
+                                          init [--label <x>] [--root] · approve <id> · revoke <id> --reason "<why>"
   ledger spool failed                       failed spool records (method, path, time, body)
   ledger spool retry <file> --confirm       re-sign and resend the records of one failed file
   ledger hook <event>                       hook transport (Claude Code adapter protocol, §10)
@@ -119,6 +121,11 @@ export async function run(argv: string[], io: Io): Promise<number> {
   if (cmd === 'setup') {
     const { cmdSetup } = await import('./setup.ts');
     return cmdSetup(args, io);
+  }
+  // `ledger device` is local file + ssh-keygen work (multi-device F2): no hub client, no spool drain.
+  if (cmd === 'device') {
+    const { cmdDevice } = await import('./device.ts');
+    return cmdDevice(args, io);
   }
   // `cfg` is needed by the offline fallback in `catch`, but `readEnvConfig`
   // itself throws on a bad `LEDGER_HUB_URL` (S2) and that must stay a plain exit 4

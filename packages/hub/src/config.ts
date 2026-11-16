@@ -70,6 +70,11 @@ export interface HubConfig {
   groomWeekly: boolean;
   /** Hard cap on one headless run (ms). */
   headlessTimeoutMs: number;
+
+  /* ---------------- multi-device (docs/multi-device-spec.md §7.1) ---------------- */
+  /** `LEDGER_SYNC_VERIFY`: `warn` (default) reports unsigned/foreign commits, `enforce`
+   *  quarantines them. Read here; acted on by the sync loop (F3). */
+  syncVerify: 'warn' | 'enforce';
 }
 
 const MINUTE = 60_000;
@@ -132,7 +137,16 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): HubConfig {
     trustClaudeRealpath: absoluteOrNull(env.LEDGER_TRUST_CLAUDE_REALPATH),
     groomWeekly: env.LEDGER_GROOM_WEEKLY?.trim() === '1',
     headlessTimeoutMs: clampedMs(env.LEDGER_HEADLESS_TIMEOUT_MS, 5 * MINUTE, 1_000, 30 * MINUTE),
+    syncVerify: syncVerify(env.LEDGER_SYNC_VERIFY),
   };
+}
+
+/** A typo (`enforced`) must not silently fall back to the weaker mode: unknown → startup error. */
+function syncVerify(raw: string | undefined): 'warn' | 'enforce' {
+  const value = raw?.trim().toLowerCase() ?? '';
+  if (value === '' || value === 'warn') return 'warn';
+  if (value === 'enforce') return 'enforce';
+  throw new Error('LEDGER_SYNC_VERIFY must be "warn" or "enforce"');
 }
 
 function guardEnv(raw: string | undefined): 'on' | 'off' | null {

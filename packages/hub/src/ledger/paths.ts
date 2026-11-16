@@ -1,8 +1,9 @@
 import { join } from 'node:path';
-import { ITEM_ID_RE } from '@agent-ledger/shared';
+import { DEVICE_ID_RE, ITEM_ID_RE } from '@agent-ledger/shared';
 
-/** `d_` + 10 base32 chars. The only shape allowed into a counter file name. */
-export const DEVICE_ID_RE = /^d_[a-z2-7]{10}$/;
+/** `d_` + 10 base32 chars. The only shape allowed into a counter file name.
+ *  Defined once in shared (sshkey.ts) so the CLI and the hub cannot drift. */
+export { DEVICE_ID_RE };
 
 export class LedgerPaths {
   readonly root: string;

@@ -96,3 +96,14 @@ test('LEDGER_AGENTS_DIR is expanded, empty means null', () => {
   assert.equal(loadConfig({ ...base, LEDGER_AGENTS_DIR: '/opt/agents' }).agentsDir, '/opt/agents');
   assert.equal(loadConfig({ ...base, LEDGER_AGENTS_DIR: '  ' }).agentsDir, null);
 });
+
+/* multi-device F2: LEDGER_SYNC_VERIFY — default warn, a typo must not silently weaken or strengthen. */
+test('syncVerify: default warn; warn|enforce accepted; anything else is a startup error', () => {
+  assert.equal(loadConfig(base).syncVerify, 'warn');
+  assert.equal(loadConfig({ ...base, LEDGER_SYNC_VERIFY: '' }).syncVerify, 'warn');
+  assert.equal(loadConfig({ ...base, LEDGER_SYNC_VERIFY: 'warn' }).syncVerify, 'warn');
+  assert.equal(loadConfig({ ...base, LEDGER_SYNC_VERIFY: ' ENFORCE ' }).syncVerify, 'enforce');
+  for (const bad of ['enforced', 'on', '1', 'off', 'true']) {
+    assert.throws(() => loadConfig({ ...base, LEDGER_SYNC_VERIFY: bad }), /LEDGER_SYNC_VERIFY/, bad);
+  }
+});

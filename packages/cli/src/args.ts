@@ -23,6 +23,8 @@ const KNOWN_BOOLS = new Set([
   // doctor
   'fix',
   'online',
+  // device init --root
+  'root',
   // show --origin, tidy --apply (rejected, but must not eat the next argument)
   'origin',
   'apply',

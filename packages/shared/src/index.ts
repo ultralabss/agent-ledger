@@ -18,5 +18,8 @@ export * from './platformTrust.ts';
 export * from './hubIdentity.ts';
 export { assertWinPath, validSystemRoot } from './win-ps.ts';
 export * from './snowflake.ts';
+export * from './sshkey.ts';
+export * from './devices.ts';
+export * from './devicestore.ts';
 export * from './context-template.ts';
 export * from './api.ts';
