@@ -338,8 +338,7 @@ test('retryFailedSpool skips a record no longer on the replay allowlist', async 
   const dir = await tmp();
   const env = envFor(dir);
   const failedDir = join(dir, 'failed');
-  await mkdir(failedDir, { recursive: true, mode: 0o700 });
-  await ensurePrivateDir(failedDir); // win32: mkdir mode is ignored, the DACL must be protected explicitly
+  await ensurePrivateDir(failedDir); // creates it private (win32: protected DACL; a plain mkdir inherits and is refused)
   const record = {
     key: 'k1',
     ts: Date.now(),
