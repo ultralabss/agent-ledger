@@ -12,7 +12,7 @@
   "scripts": {
     "hub": "node packages/hub/src/bin.ts",
     "ledger": "node packages/cli/src/bin.ts",
-    "test": "node --test \"packages/*/src/**/*.test.ts\"",
+    "test": "node --test --test-timeout=60000 --test-concurrency=4 \"packages/*/src/**/*.test.ts\"",
     "typecheck": "tsc --noEmit && pnpm --filter @agent-ledger/web typecheck",
     "build": "node scripts/build-hook.mjs && pnpm --filter @agent-ledger/web build",
     "build:hook": "node scripts/build-hook.mjs"
