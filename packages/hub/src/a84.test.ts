@@ -23,6 +23,7 @@ import { HeadlessRunner } from './headless.ts';
 import { gitleaksAvailability, resetGitleaksCache, scanStaged } from './gitleaks.ts';
 import { verifyManagedBinary } from './managedbin.ts';
 import { openTestLedger } from './test-helpers.ts';
+import { skipOnWin32 } from '@agent-ledger/shared/testing';
 
 async function temp(t: { after: (fn: () => unknown) => void }, tag: string): Promise<string> {
   const dir = await mkdtemp(join(tmpdir(), `agent-ledger-a84-${tag}-`));
@@ -45,7 +46,7 @@ async function installManaged(dir: string, name: string, body = '#!/bin/sh\nexit
 
 /* ============ 1. gitleaks: only the managed copy, only if it matches ============ */
 
-test('A8-4: a correctly installed gitleaks copy is used', async (t) => {
+test('A8-4: a correctly installed gitleaks copy is used', { skip: skipOnWin32("POSIX mode-bit/owner trust chain for managed binaries (win32 uses platformTrust, tested there)") }, async (t) => {
   const root = await temp(t, 'ok');
   resetGitleaksCache();
   t.after(() => resetGitleaksCache());
@@ -56,7 +57,7 @@ test('A8-4: a correctly installed gitleaks copy is used', async (t) => {
   assert.equal(res.blocked, false);
 });
 
-test('A8-4: a tampered binary (sha256 mismatch) is NOT run', async (t) => {
+test('A8-4: a tampered binary (sha256 mismatch) is NOT run', { skip: skipOnWin32("POSIX mode-bit/owner trust chain for managed binaries (win32 uses platformTrust, tested there)") }, async (t) => {
   const root = await temp(t, 'swap');
   resetGitleaksCache();
   t.after(() => resetGitleaksCache());
@@ -82,7 +83,7 @@ test('A8-4: a tampered binary (sha256 mismatch) is NOT run', async (t) => {
   assert.equal(gitleaksAvailability().state, 'mismatch', 'healthz/brief must warn');
 });
 
-test('A8-4: a missing or tampered .sha256 is not proof', async (t) => {
+test('A8-4: a missing or tampered .sha256 is not proof', { skip: skipOnWin32("POSIX mode-bit/owner trust chain for managed binaries (win32 uses platformTrust, tested there)") }, async (t) => {
   const root = await temp(t, 'sha');
   const bin = await installManaged(join(root, '.hub', 'bin'), 'gitleaks');
 
@@ -120,7 +121,7 @@ test('A8-4: a symlink instead of a copy is rejected (the install copies, it does
   assert.match(verdict.detail ?? '', /symlink/);
 });
 
-test('A8-4: a group-writable directory chain → the copy is untrusted', async (t) => {
+test('A8-4: a group-writable directory chain → the copy is untrusted', { skip: skipOnWin32("POSIX mode-bit/owner trust chain for managed binaries (win32 uses platformTrust, tested there)") }, async (t) => {
   const root = await temp(t, 'chain');
   const binDir = join(root, '.hub', 'bin');
   const bin = await installManaged(binDir, 'gitleaks');
@@ -161,7 +162,7 @@ async function fakeClaude(dir: string): Promise<string> {
   return bin;
 }
 
-test('A8-4: claude in a trusted chain → headless runs', async (t) => {
+test('A8-4: claude in a trusted chain → headless runs', { skip: skipOnWin32("POSIX mode-bit/owner trust chain for managed binaries (win32 uses platformTrust, tested there)") }, async (t) => {
   const root = await temp(t, 'claude-ok');
   const bin = await fakeClaude(join(root, 'bin'));
   const status = await resolveClaudeBin(bin, { stopAt: root });
@@ -169,7 +170,7 @@ test('A8-4: claude in a trusted chain → headless runs', async (t) => {
   assert.equal(status.path, bin);
 });
 
-test('A8-4: claude in a group-writable directory → headless disabled, with instructions', async (t) => {
+test('A8-4: claude in a group-writable directory → headless disabled, with instructions', { skip: skipOnWin32("POSIX mode-bit/owner trust chain for managed binaries (win32 uses platformTrust, tested there)") }, async (t) => {
   const root = await temp(t, 'claude-gw');
   const bin = await fakeClaude(join(root, 'bin'));
   await chmod(join(root, 'bin'), 0o775);
@@ -220,7 +221,7 @@ test('A8-4: --trust-claude-group does not rescue an o+w path either', async (t) 
   }
 });
 
-test('A8-4: HeadlessRunner refuses the run (503) and reports it in the status', async (t) => {
+test('A8-4: HeadlessRunner refuses the run (503) and reports it in the status', { skip: skipOnWin32("POSIX mode-bit/owner trust chain for managed binaries (win32 uses platformTrust, tested there)") }, async (t) => {
   const led = await openTestLedger();
   const root = await temp(t, 'headless');
   t.after(() => led.cleanup());
@@ -273,7 +274,7 @@ test('A8-4: HeadlessRunner refuses the run (503) and reports it in the status', 
 /* ============ 3. the group enumeration must not come back ============ */
 
 test('A8-4: the hub production code contains no group enumeration', async () => {
-  const srcDir = dirname(new URL(import.meta.url).pathname);
+  const srcDir = dirname(fileURLToPath(import.meta.url));
   const offenders: string[] = [];
   const walk = async (dir: string): Promise<void> => {
     for (const entry of await readdir(dir, { withFileTypes: true })) {

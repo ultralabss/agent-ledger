@@ -15,6 +15,8 @@ function start(session: string, cwd: string): Record<string, unknown> {
   return { session_id: session, cwd, hook_event_name: 'SessionStart', source: 'startup' };
 }
 
+const escapeRe = (x: string): string => x.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+
 test('ONBOARDING block for a new repo, gone after `ledger repo onboarded`', async (t) => {
   const fx = await startTestHub();
   const repo = await makeCodeRepo('fresh');
@@ -116,10 +118,10 @@ test('cwd outside a git repo: NO REPO + repo list + AskUserQuestion instruction'
 
   const res = await fx.hook('session-start', start('eeee1000', parent));
   assert.equal(res.repo, null, 'no home repo');
-  assert.match(res.text, new RegExp(`^NO REPO: cwd ${parent} is not a git repo\\.`, 'm'));
+  assert.match(res.text, new RegExp(`^NO REPO: cwd ${escapeRe(parent)} is not a git repo\\.`, 'm'));
   assert.match(res.text, /Git repos under cwd:/);
-  assert.match(res.text, new RegExp(`${known} — known`));
-  assert.match(res.text, new RegExp(`${unknown} — unregistered`));
+  assert.match(res.text, new RegExp(`${escapeRe(known)} — known`));
+  assert.match(res.text, new RegExp(`${escapeRe(unknown)} — unregistered`));
   assert.equal(res.text.includes('node_modules'), false, 'node_modules is skipped');
   assert.match(res.text, /Registered repos: known, ops/);
   assert.match(res.text, /AskUserQuestion/);

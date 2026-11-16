@@ -7,10 +7,11 @@ import { join } from 'node:path';
 import test from 'node:test';
 import { dirChainTrusted, git, gitToplevel, resolveCheckout } from './git.ts';
 import { startTestHub } from './test-helpers.ts';
+import { skipOnWin32 } from '@agent-ledger/shared/testing';
 
 /* ---------------- N1: the git binary's directory ---------------- */
 
-test('N1: a candidate in a directory writable by group/other is rejected', async (t) => {
+test('N1: a candidate in a directory writable by group/other is rejected', { skip: skipOnWin32("POSIX group/other write bits") }, async (t) => {
   const base = await mkdtemp(join(tmpdir(), 'agent-ledger-n1-'));
   t.after(() => rm(base, { recursive: true, force: true }));
   const uid = process.getuid?.();

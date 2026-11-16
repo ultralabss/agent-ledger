@@ -32,7 +32,7 @@ async function setup(
     rec: 'one calculator',
   });
   assert.equal(created.status, 201, created.text);
-  const why = (p: string) => fx.api('GET', `/v1/repos/acme/why?path=${encodeURIComponent(p)}`);
+  const why = (p: string) => fx.api('GET', `/v1/repos/acme/why?path=${encodeURIComponent(process.platform === 'win32' ? p.replaceAll('\\', '/') : p)}`);
   return { fx, repo, id: created.json.id as string, why };
 }
 

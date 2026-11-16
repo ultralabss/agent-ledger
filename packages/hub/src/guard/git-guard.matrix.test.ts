@@ -410,6 +410,10 @@ for (const [idx, row] of ROWS.entries()) {
     }
 
     // Real row: fresh temp repo, ground truth from an actual git snapshot.
+    if (process.platform === 'win32') {
+      t.skip('skipped on win32: the rows run POSIX shell one-liners; the guard verdict above is still checked');
+      return;
+    }
     const dir = await mkdtemp(join(tmpdir(), 'agent-ledger-guard-matrix-'));
     t.after(async () => {
       row.cleanup?.(dir);

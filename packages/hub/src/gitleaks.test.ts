@@ -344,7 +344,7 @@ test('ahead/behind and the last push are read from the ledger repo', async (t) =
 
 test('S7: gitleaksPath carries .exe on win32 only; scanEnv never inherits PATH', async () => {
   assert.match(gitleaksPath('/l', 'win32').replaceAll('\\', '/'), /\/\.hub\/bin\/gitleaks\.exe$/);
-  assert.match(gitleaksPath('/l', 'linux'), /\/\.hub\/bin\/gitleaks$/);
+  assert.match(gitleaksPath('/l', 'linux'), /[\\/]\.hub[\\/]bin[\\/]gitleaks$/);
   assert.deepEqual(scanEnv('linux', { PATH: '/evil' }, '/l', null), {
     PATH: '/usr/bin:/bin',
     HOME: '/l',

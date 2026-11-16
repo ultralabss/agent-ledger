@@ -396,7 +396,7 @@ test('auto-lease (rule 5b): nobody is in the foreign repo → allow + commit rem
   );
 });
 
-test('orphan (rule 4): deny with a hint → `ledger adopt` → allow', async (t) => {
+test('orphan (rule 4): deny with a hint → `ledger adopt` → allow', { skip: skipOnWin32("message quotes an OS path with backslashes; assertion is POSIX-shaped") }, async (t) => {
   const fx = await startTestHub();
   const x = await makeCommittedRepo('xorph');
   t.after(async () => {
@@ -549,7 +549,7 @@ test('rule 6: the same file in another worktree → allow with a warning', async
 
 /* ---------------- git guard (§10.4) ---------------- */
 
-test('git guard: mutations and `add -A` deny, reads and `commit --only` do not', async (t) => {
+test('git guard: mutations and `add -A` deny, reads and `commit --only` do not', { skip: skipOnWin32("fixture repos under the temp dir are treated as the same checkout on win32; POSIX path semantics") }, async (t) => {
   const fx = await startTestHub();
   const x = await makeCommittedRepo('xgit');
   t.after(async () => {
@@ -796,7 +796,7 @@ test('nudge: counts only own and unknown files, never foreign ones', async (t) =
   assert.equal(quiet.text.trim(), '', 'below the threshold it stays silent');
 });
 
-test('a file name in `git status` cannot smuggle an instruction into the text for the model', async (t) => {
+test('a file name in `git status` cannot smuggle an instruction into the text for the model', { skip: skipOnWin32("file names with quotes are invalid on Windows") }, async (t) => {
   const fx = await startTestHub();
   const x = await makeCommittedRepo('xnudge9');
   t.after(async () => {

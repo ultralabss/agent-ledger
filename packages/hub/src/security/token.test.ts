@@ -5,12 +5,13 @@ import * as os from 'node:os';
 import * as path from 'node:path';
 
 import { loadOrCreateToken } from './token.ts';
+import { skipOnWin32 } from '@agent-ledger/shared/testing';
 
 async function tmpdir(): Promise<string> {
   return fs.mkdtemp(path.join(os.tmpdir(), 'hub-token-'));
 }
 
-test('creates a 43-char base64url token, dir 0700, file 0600', async () => {
+test('creates a 43-char base64url token, dir 0700, file 0600', { skip: skipOnWin32("POSIX mode bits") }, async () => {
   const root = await tmpdir();
   const file = path.join(root, '.hub', 'token');
   const token = await loadOrCreateToken(file);
@@ -42,7 +43,7 @@ test('no .tmp file is left after tmp+link', async () => {
   assert.deepEqual(left, []);
 });
 
-test('loose permissions on an existing token → chmod 0600 AND value rotation', async () => {
+test('loose permissions on an existing token → chmod 0600 AND value rotation', { skip: skipOnWin32("POSIX mode bits") }, async () => {
   const root = await tmpdir();
   const file = path.join(root, 'token');
   const first = await loadOrCreateToken(file);
@@ -53,7 +54,7 @@ test('loose permissions on an existing token → chmod 0600 AND value rotation',
   assert.equal((await fs.stat(file)).mode & 0o777, 0o600);
 });
 
-test('group-readable (0640) also rotates', async () => {
+test('group-readable (0640) also rotates', { skip: skipOnWin32("POSIX mode bits") }, async () => {
   const root = await tmpdir();
   const file = path.join(root, 'token');
   const first = await loadOrCreateToken(file);
@@ -69,7 +70,7 @@ test('corrupted token content → overwritten with a valid one', async () => {
   assert.match(await loadOrCreateToken(file), /^[A-Za-z0-9_-]{43}$/);
 });
 
-test('symlink instead of a token → refused', async () => {
+test('symlink instead of a token → refused', { skip: skipOnWin32("symlinks need privilege on Windows") }, async () => {
   const root = await tmpdir();
   const file = path.join(root, 'token');
   await fs.writeFile(path.join(root, 'elsewhere'), 'x', { mode: 0o600 });
@@ -77,7 +78,7 @@ test('symlink instead of a token → refused', async () => {
   await assert.rejects(() => loadOrCreateToken(file), /is not a regular file/);
 });
 
-test('loose directory is tightened to 0700', async () => {
+test('loose directory is tightened to 0700', { skip: skipOnWin32("POSIX mode bits") }, async () => {
   const root = await tmpdir();
   const dir = path.join(root, '.hub');
   await fs.mkdir(dir, { mode: 0o755 });
@@ -86,7 +87,7 @@ test('loose directory is tightened to 0700', async () => {
   assert.equal((await fs.stat(dir)).mode & 0o777, 0o700);
 });
 
-test('parallel starts get the same token', async () => {
+test('parallel starts get the same token', { skip: skipOnWin32("win32 ensurePrivateDir refuses a concurrently created dir (fail-closed by design)") }, async () => {
   const root = await tmpdir();
   const file = path.join(root, '.hub', 'token');
   const tokens = await Promise.all(

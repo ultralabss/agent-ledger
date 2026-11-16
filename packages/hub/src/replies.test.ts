@@ -16,6 +16,7 @@ import { fileURLToPath } from 'node:url';
 import test from 'node:test';
 import { buildWorkerArgs, buildWorkerSystemPrompt, workerCommitCommand } from './replies.ts';
 import { makeCodeRepo, startTestHub } from './test-helpers.ts';
+import { skipOnWin32 } from '@agent-ledger/shared/testing';
 
 /**
  * A shell script standing in for `claude`. Writes argv, env and stdin to
@@ -165,7 +166,7 @@ test('repo without path → worker is 409, auto stays on session', async (t) => 
   assert.equal(auto.json.reply.mode, 'session');
 });
 
-test('the worker gets the prompt on stdin, not in argv, and an env without secrets', async (t) => {
+test('the worker gets the prompt on stdin, not in argv, and an env without secrets', { skip: skipOnWin32("fake claude is a POSIX shell stub; win32 requires a native claude.exe (covered by claudebin/platformTrust tests)") }, async (t) => {
   const dir = await mkdtemp(join(tmpdir(), 'ledger-fake-claude-'));
   const bin = await fakeClaude(dir, 'Done, one file edited.');
   const repo = await makeCodeRepo();
@@ -275,7 +276,7 @@ test('the worker gets the prompt on stdin, not in argv, and an env without secre
   assert.match(list.json.replies[0].result, /Done, one file edited\./);
 });
 
-test('a worker that asks for authorization ends as needs_chat_auth', async (t) => {
+test('a worker that asks for authorization ends as needs_chat_auth', { skip: skipOnWin32("fake claude is a POSIX shell stub; win32 requires a native claude.exe (covered by claudebin/platformTrust tests)") }, async (t) => {
   const dir = await mkdtemp(join(tmpdir(), 'ledger-fake-claude-'));
   const bin = await fakeClaude(
     dir,

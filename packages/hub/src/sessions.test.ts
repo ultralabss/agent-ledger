@@ -2,7 +2,7 @@
 
 import assert from 'node:assert/strict';
 import { mkdir, writeFile } from 'node:fs/promises';
-import { join } from 'node:path';
+import { basename, join } from 'node:path';
 import test from 'node:test';
 import { git, resolveCheckout } from './git.ts';
 import { makeCodeRepo, startTestHub, type HubFixture } from './test-helpers.ts';
@@ -312,7 +312,7 @@ test('a worktree belongs to the same repo (identity = git-common-dir)', async (t
   await git(repo.path, ['-c', 'user.email=t@t', '-c', 'user.name=t', 'commit', '-m', 'init']);
   await registerRepo(fx, 'wt', 'WT', repo.path);
 
-  const wtPath = join(repo.path, '..', `${repo.path.split('/').pop()}-wt`);
+  const wtPath = join(repo.path, '..', `${basename(repo.path)}-wt`);
   const added = await git(repo.path, ['worktree', 'add', wtPath, '-b', 'task/demo']);
   assert.equal(added.code, 0, added.stderr);
 

@@ -18,6 +18,7 @@ import { join } from 'node:path';
 import test from 'node:test';
 import { matchedRoot, parentChain, readHeadVerified, readTailVerified, resolveRoots, snapshotChain } from './safeRead.ts';
 import { readTranscriptTitle } from './transcript.ts';
+import { skipOnWin32 } from '@agent-ledger/shared/testing';
 
 interface Fixture {
   root: string;
@@ -80,7 +81,7 @@ test('an empty file is empty text, not an error', async (t) => {
   assert.deepEqual(await readHeadVerified(fx.root, fx.file, 64), { text: '', skipped: null });
 });
 
-test('a symlink in place of the file → aliased (O_NOFOLLOW), the target is not read', async (t) => {
+test('a symlink in place of the file → aliased (O_NOFOLLOW), the target is not read', { skip: skipOnWin32("symlinks need privilege on Windows") }, async (t) => {
   const fx = await fixture('secret-ignored');
   t.after(fx.cleanup);
   const outside = join(fx.dir, '..', '..', 'outside.txt');
@@ -170,7 +171,7 @@ test('a path outside the roots is not read at all', async (t) => {
   assert.equal(await readTranscriptTitle(null, fx.roots), null);
 });
 
-test('S4: matchedRoot casefolds and unifies separators on win32 only', () => {
+test('S4: matchedRoot casefolds and unifies separators on win32 only', { skip: skipOnWin32("uses POSIX roots; win32 casefold is covered by the platform-pure variant") }, () => {
   const roots = ['C:\\Users\\Me\\.claude'];
   assert.equal(matchedRoot('c:/users/me/.CLAUDE/projects/x.jsonl', roots, 'win32'), roots[0]);
   assert.equal(matchedRoot('C:\\Users\\Me\\.claude', roots, 'win32'), roots[0], 'the root itself');

@@ -50,7 +50,7 @@ export async function tempConfig(overrides: Partial<HubConfig> = {}): Promise<Te
     dir,
     config,
     cleanup: async () => {
-      await rm(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
+      await rm(dir, { recursive: true, force: true, maxRetries: 20, retryDelay: 250 });
     },
   };
 }

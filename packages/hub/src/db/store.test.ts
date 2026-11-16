@@ -14,7 +14,7 @@ async function tempDb(): Promise<{ file: string; cleanup: () => Promise<void> }>
   const dir = await mkdtemp(join(tmpdir(), 'agent-ledger-db-'));
   return {
     file: join(dir, 'hub.sqlite'),
-    cleanup: () => rm(dir, { recursive: true, force: true }),
+    cleanup: () => rm(dir, { recursive: true, force: true, maxRetries: 20, retryDelay: 250 }),
   };
 }
 

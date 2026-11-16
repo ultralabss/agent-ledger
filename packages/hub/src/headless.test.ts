@@ -17,6 +17,7 @@ import {
 } from './headless.ts';
 import { matchGlob } from './guard/globs.ts';
 import { openTestLedger } from './test-helpers.ts';
+import { skipOnWin32 } from '@agent-ledger/shared/testing';
 
 /** K7: `Read(...)` tool-permission pattern → checkout-relative path `matchGlob`
  *  understands, anchored at a fixed fake home so `~/` and `//<abs>` compare
@@ -109,7 +110,7 @@ test('nextMondayNine: always the nearest Monday 9:00, never in the past', () => 
   assert.ok(c.getTime() > wednesday.getTime());
 });
 
-test('runIntake: runs the binary with exact flags, cwd = ledger, headless env', async (t) => {
+test('runIntake: runs the binary with exact flags, cwd = ledger, headless env', { skip: skipOnWin32("fake claude is a POSIX shell stub; win32 requires a native claude.exe (covered by claudebin/platformTrust tests)") }, async (t) => {
   const { led, runner, binDir } = await fixture(t);
   const rec = await led.ledger.createIntake({ text: 'do X and Y', channel: 'web' });
 
@@ -208,7 +209,7 @@ test('J2: deny must not cover the ledger — real glob matching, not just a stri
   assert.ok(args.includes(`Read(//${ledgerRoot.replace(/^\/+/, '')}/**)`));
 });
 
-test('H2: the child gets an env allowlist, not process.env with secrets', async (t) => {
+test('H2: the child gets an env allowlist, not process.env with secrets', { skip: skipOnWin32("fake claude is a POSIX shell stub; win32 requires a native claude.exe (covered by claudebin/platformTrust tests)") }, async (t) => {
   const binDir = await mkdtemp(join(tmpdir(), 'agent-ledger-bin-'));
   const bin = join(binDir, 'claude');
   await writeFile(
@@ -251,7 +252,7 @@ printf '{"result":"ok","is_error":false}\\n'
   assert.match(dump, /^LEDGER_HUB_HEADLESS=1$/m);
 });
 
-test('J5: proxy/CA env passes to the child (not a secret, a network necessity)', async (t) => {
+test('J5: proxy/CA env passes to the child (not a secret, a network necessity)', { skip: skipOnWin32("fake claude is a POSIX shell stub; win32 requires a native claude.exe (covered by claudebin/platformTrust tests)") }, async (t) => {
   const binDir = await mkdtemp(join(tmpdir(), 'agent-ledger-bin-'));
   const bin = join(binDir, 'claude');
   await writeFile(
@@ -302,7 +303,7 @@ printf '{"result":"ok","is_error":false}\\n'
   }
 });
 
-test('runGroom: is recorded as `groom` and kept in status.last_groom', async (t) => {
+test('runGroom: is recorded as `groom` and kept in status.last_groom', { skip: skipOnWin32("fake claude is a POSIX shell stub; win32 requires a native claude.exe (covered by claudebin/platformTrust tests)") }, async (t) => {
   const { led, runner } = await fixture(t);
   const run = await runner.runGroom({ repo: null });
   assert.equal(run.kind, 'groom');
@@ -324,7 +325,7 @@ test('without LEDGER_CLAUDE_BIN it is a 503 with instructions, not a silent no-o
   });
 });
 
-test('a missing ledger-keeper.md is a 503, not a hub crash', async (t) => {
+test('a missing ledger-keeper.md is a 503, not a hub crash', { skip: skipOnWin32("fake claude is a POSIX shell stub; win32 requires a native claude.exe (covered by claudebin/platformTrust tests)") }, async (t) => {
   const led = await openTestLedger();
   const binDir = await mkdtemp(join(tmpdir(), 'agent-ledger-bin-'));
   t.after(async () => {
@@ -339,7 +340,7 @@ test('a missing ledger-keeper.md is a 503, not a hub crash', async (t) => {
   await assert.rejects(runner.runGroom(), /ledger-keeper/);
 });
 
-test('binary failure: ok=false, exit code in the run, the hub stays alive', async (t) => {
+test('binary failure: ok=false, exit code in the run, the hub stays alive', { skip: skipOnWin32("fake claude is a POSIX shell stub; win32 requires a native claude.exe (covered by claudebin/platformTrust tests)") }, async (t) => {
   const { runner } = await fixture(t, '#!/bin/bash\necho "crashed" >&2\nexit 7\n');
   const run = await runner.runIntake({ ids: ['1'] });
   assert.equal(run.ok, false);
@@ -347,7 +348,7 @@ test('binary failure: ok=false, exit code in the run, the hub stays alive', asyn
   assert.match(run.text, /crashed/);
 });
 
-test('queue: two runs never start in parallel', async (t) => {
+test('queue: two runs never start in parallel', { skip: skipOnWin32("fake claude is a POSIX shell stub; win32 requires a native claude.exe (covered by claudebin/platformTrust tests)") }, async (t) => {
   const { runner } = await fixture(
     t,
     `#!/bin/bash
@@ -369,7 +370,7 @@ printf '{"result":"ok"}\\n'
   assert.equal(runner.status.queued, 0);
 });
 
-test('a timeout kills the child and the run fails', async (t) => {
+test('a timeout kills the child and the run fails', { skip: skipOnWin32("fake claude is a POSIX shell stub; win32 requires a native claude.exe (covered by claudebin/platformTrust tests)") }, async (t) => {
   const led = await openTestLedger();
   const binDir = await mkdtemp(join(tmpdir(), 'agent-ledger-bin-'));
   const agents = await mkdtemp(join(tmpdir(), 'agent-ledger-agents-'));
@@ -390,7 +391,7 @@ test('a timeout kills the child and the run fails', async (t) => {
   assert.match(run.text, /timeout/);
 });
 
-test('agentsDir unset: 503 with a clear message and the same text in the status', async (t) => {
+test('agentsDir unset: 503 with a clear message and the same text in the status', { skip: skipOnWin32("fake claude is a POSIX shell stub; win32 requires a native claude.exe (covered by claudebin/platformTrust tests)") }, async (t) => {
   const led = await openTestLedger();
   const binDir = await mkdtemp(join(tmpdir(), 'agent-ledger-bin-'));
   t.after(async () => {

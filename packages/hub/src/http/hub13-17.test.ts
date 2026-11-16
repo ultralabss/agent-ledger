@@ -12,6 +12,7 @@ import { mkdir, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import test from 'node:test';
 import { makeCodeRepo, startTestHub } from '../test-helpers.ts';
+import { skipOnWin32 } from '@agent-ledger/shared/testing';
 
 /** A minimal Claude Code transcript. `custom-title` repeats — the last wins. */
 function transcript(lines: Record<string, unknown>[]): string {
@@ -226,7 +227,7 @@ test('without custom-title the summary is used, then the first message', async (
   assert.equal(c?.title_source, 'prompt');
 });
 
-test('a transcript outside the allowed roots is not read', async (t) => {
+test('a transcript outside the allowed roots is not read', { skip: skipOnWin32("uses /tmp (POSIX path)") }, async (t) => {
   const fx = await startTestHub();
   t.after(fx.cleanup);
   // `transcriptRoots` is the fixture dir; `/tmp` is outside it.

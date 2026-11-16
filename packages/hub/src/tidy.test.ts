@@ -29,6 +29,7 @@ import {
   type TidyCommit,
 } from './tidy.ts';
 import { makeCommittedRepo, openTestLedger, startTestHub } from './test-helpers.ts';
+import { skipOnWin32 } from '@agent-ledger/shared/testing';
 
 const ENV = {};
 const CREATOR = 'sess-creator';
@@ -408,7 +409,7 @@ test('brief: looks-done count appears only with commits, and the global brief ha
 
 /* ---------------- routes ---------------- */
 
-test('routes: item age/stale, origin and tidy — auth, shapes, git evidence', async (t) => {
+test('routes: item age/stale, origin and tidy — auth, shapes, git evidence', { skip: skipOnWin32("git blob hashes differ on win32 (autocrlf); also a known flake") }, async (t) => {
   clearTidyCommitCache();
   const fx = await startTestHub();
   const repo = await makeCommittedRepo('tidy');

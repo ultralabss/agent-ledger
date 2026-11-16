@@ -36,7 +36,7 @@ test('repo rm archives the ledger dir and drops it from repos.yml', async (t) =>
   assert.equal(await stat(repoDir).then(() => true).catch(() => false), false);
   // …but the ledger content still exists under `.archive/`.
   const archived = res.json.archived as string;
-  assert.match(archived, /\.archive\//);
+  assert.match(archived, /\.archive[\\/]/);
   const entries = await readdir(archived);
   assert.ok(entries.length > 0, 'the archived ledger must keep its files');
 });

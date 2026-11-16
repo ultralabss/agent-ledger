@@ -16,6 +16,7 @@ import { writeBitsTrusted } from './bintrust.ts';
 import { CHECK_ERROR_WARN_AFTER, dirChainTrusted, git, resolveTrustedBinaryInfo } from './git.ts';
 import { hubHealthParts } from './health.ts';
 import { openTestLedger } from './test-helpers.ts';
+import { skipOnWin32 } from '@agent-ledger/shared/testing';
 
 /* ===================== evidence vs. error ===================== */
 
@@ -323,7 +324,7 @@ test('o+w never, g+w only with explicit permission (default = no)', async () => 
   assert.equal(await writeBitsTrusted(0o775, TRUSTED_GID, async () => false), false);
 });
 
-test('a g+w directory passes only with explicit permission (default fail-closed)', async (t) => {
+test('a g+w directory passes only with explicit permission (default fail-closed)', { skip: skipOnWin32("POSIX group-write bit") }, async (t) => {
   const base = await mkdtemp(join(tmpdir(), 'agent-ledger-h29-'));
   t.after(() => rm(base, { recursive: true, force: true }));
   const uid = process.getuid?.();
@@ -364,7 +365,7 @@ test('a g+w directory passes only with explicit permission (default fail-closed)
  * all (A8-4 removed group enumeration), so there is no system binary left to
  * resolve. `a84.test.ts` asserts the enumeration cannot come back. */
 
-test('a symlink in an untrusted directory is rejected even when the target is fine', async (t) => {
+test('a symlink in an untrusted directory is rejected even when the target is fine', { skip: skipOnWin32("POSIX symlink + mode semantics") }, async (t) => {
   const raw = await mkdtemp(join(tmpdir(), 'agent-ledger-h29-link-'));
   t.after(() => rm(raw, { recursive: true, force: true }));
   // macOS `tmpdir()` is itself a symlink (`/var` → `/private/var`); the chain

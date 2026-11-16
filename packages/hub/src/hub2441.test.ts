@@ -292,7 +292,7 @@ async function groupWritableClaude(
   return { bin, stopAt: root, gid };
 }
 
-test('opt-in without a pin (gid/realpath) does NOT enable headless', async (t) => {
+test('opt-in without a pin (gid/realpath) does NOT enable headless', { skip: skipOnWin32("POSIX gid pin on a claude shell stub; win32 requires a native claude.exe") }, async (t) => {
   const { bin, stopAt } = await groupWritableClaude(t);
   const status = await resolveClaudeBin(bin, { trustGroup: true, stopAt });
   assert.equal(status.state, 'group_writable');
@@ -300,7 +300,7 @@ test('opt-in without a pin (gid/realpath) does NOT enable headless', async (t) =
   assert.match(status.detail ?? '', /LEDGER_TRUST_CLAUDE_GID/);
 });
 
-test('opt-in pinned to the right gid and realpath enables headless', async (t) => {
+test('opt-in pinned to the right gid and realpath enables headless', { skip: skipOnWin32("POSIX gid pin on a claude shell stub; win32 requires a native claude.exe") }, async (t) => {
   const { bin, stopAt, gid } = await groupWritableClaude(t);
   const status = await resolveClaudeBin(bin, {
     trustGroup: true,
@@ -312,7 +312,7 @@ test('opt-in pinned to the right gid and realpath enables headless', async (t) =
   assert.match(status.detail ?? '', new RegExp(`gid ${gid}`));
 });
 
-test('a group other than the pinned one → headless disabled with a message', async (t) => {
+test('a group other than the pinned one → headless disabled with a message', { skip: skipOnWin32("POSIX gid pin on a claude shell stub; win32 requires a native claude.exe") }, async (t) => {
   const { bin, stopAt, gid } = await groupWritableClaude(t);
   const status = await resolveClaudeBin(bin, {
     trustGroup: true,
@@ -325,7 +325,7 @@ test('a group other than the pinned one → headless disabled with a message', a
   assert.match(status.detail ?? '', /the allowed group was/);
 });
 
-test('a path other than the pinned one → headless disabled with a message', async (t) => {
+test('a path other than the pinned one → headless disabled with a message', { skip: skipOnWin32("POSIX gid pin on a claude shell stub; win32 requires a native claude.exe") }, async (t) => {
   const { bin, stopAt, gid } = await groupWritableClaude(t);
   const status = await resolveClaudeBin(bin, {
     trustGroup: true,

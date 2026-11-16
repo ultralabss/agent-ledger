@@ -42,7 +42,10 @@ try {
   # Start-Process -Credential inherits the runner's USERPROFILE, so name the test user's profile explicitly.
   $lt = "$env:SystemDrive\Users\$user\lt"
   $nodeCmd = if ($DiagScript) { "node `"$DiagScript`"" } else { "node --test --test-timeout=120000 $ExtraArgs `"$Files`"" }
-  $cmd = "set PATH=$nodeDir;%PATH%&& mkdir `"$lt`"& set `"TEMP=$lt`"& set `"TMP=$lt`"& set `"TMPDIR=$lt`"& cd /d `"$ws`" && $nodeCmd > `"$log`" 2>&1"
+  $up = "$env:SystemDrive\Users\$user"
+  # Start-Process -Credential inherits the runner's profile variables; point them at the test user's own.
+  $envSet = "set `"USERPROFILE=$up`"& set `"LOCALAPPDATA=$up\AppData\Local`"& set `"APPDATA=$up\AppData\Roaming`"& set `"HOMEPATH=\Users\$user`"& set `"HOMEDRIVE=$env:SystemDrive`"& mkdir `"$up\AppData\Local`"& mkdir `"$up\AppData\Roaming`"& set `"NODE_OPTIONS=--import=./scripts/ci-win-preload.mjs`"& "
+  $cmd = "set PATH=$nodeDir;%PATH%&& mkdir `"$lt`"& set `"TEMP=$lt`"& set `"TMP=$lt`"& set `"TMPDIR=$lt`"& " + $envSet + "cd /d `"$ws`" && $nodeCmd > `"$log`" 2>&1"
   $proc = Start-Process -FilePath cmd.exe -ArgumentList '/d','/s','/c',"`"$cmd`"" -Credential $cred -LoadUserProfile -WorkingDirectory $env:RUNNER_TEMP -PassThru -WindowStyle Hidden
   # Stream the log while the suite runs (a hang must be visible, not silent) and stop before the job limit.
   $deadline = (Get-Date).AddMinutes($MaxMinutes)
