@@ -7,12 +7,12 @@ import { mkdir, readdir, readFile, stat, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import test from 'node:test';
 import { parse as parseYaml } from 'yaml';
-import { snowflake, slotWorkerId } from '@agent-ledger/shared';
+import { configureSnowflakeWorker, snowflake, slotWorkerId } from '@agent-ledger/shared';
 import { skipOnWin32 } from '@agent-ledger/shared/testing';
 import { git } from '../git.ts';
 import { originHintFromUrl, readRootSha } from '../gitreader.ts';
 import { makeCommittedRepo, tempConfig, type TempLedger } from '../test-helpers.ts';
-import { LedgerFormatError, newDeviceId, readAllCounters } from './device.ts';
+import { COUNTER_MAX, LedgerFormatError, newDeviceId, parseCounterFile, readAllCounters } from './device.ts';
 import { Ledger } from './ledger.ts';
 
 const base = {
@@ -233,23 +233,43 @@ test('migration is skipped (nothing rewritten) when repos.yml does not parse', a
   assert.ok(ledger.warnings.has(ledger.paths.reposYml));
 });
 
-test('a legacy repos.yml written AFTER boot is still read (path/next honoured, not rewritten on read)', async (t) => {
+test('A1: in format 2 a (peer-written) repos.yml cannot inject path/next/graphify/absolute docs', async (t) => {
   const tmp = await tempConfig();
   t.after(tmp.cleanup);
-  const { ledger, close } = await open(tmp);
+  const { ledger, logs, close } = await open(tmp);
   t.after(close);
-  const legacy = 'old:\n  prefix: OL\n  path: ~/nowhere\n  next: 7\n';
-  await writeFile(ledger.paths.reposYml, legacy, 'utf8');
+  assert.equal((await readFile(join(tmp.dir, 'ledger.format'), 'utf8')).trim(), '2');
+  await ledger.registerRepo({ slug: 'new0', prefix: 'NZ', path: null });
+  const hostile =
+    'old:\n  prefix: OL\n  path: ~/nowhere\n  next: 9000000\n  graphify: /etc\n  docs:\n    - docs/ok.md\n    - /etc/passwd\n    - ../../up.md\n    - C:/win.md\n';
+  await writeFile(ledger.paths.reposYml, hostile, 'utf8');
   await ledger.reindex();
-  assert.equal(ledger.repos().old?.next, 7);
-  assert.equal(ledger.repos().old?.path, '~/nowhere');
-  assert.equal(await readFile(ledger.paths.reposYml, 'utf8'), legacy);
-  // first mutation folds `next` into the counters before the key disappears
+  const view = ledger.repos().old;
+  assert.equal(view?.path, null, 'path from the synced file is ignored');
+  assert.equal(view?.next, 1, 'next from the synced file is ignored');
+  assert.equal(view?.graphify, undefined);
+  assert.deepEqual(view?.docs, ['docs/ok.md']);
+  assert.equal(ledger.repoPath('old'), null);
+  assert.equal(logs.some((l) => /migrated to format/.test(l) && l.includes('2')), true, 'only the boot migration logged');
+  assert.equal((await ledger.createItem({ ...base, repo: 'old', title: 'x' })).fm.id, 'OL-1');
+  // the next write drops the legacy keys for good and no counter was inflated
   await ledger.registerRepo({ slug: 'new1', prefix: 'NW', path: null });
-  assert.doesNotMatch(await readFile(ledger.paths.reposYml, 'utf8'), /\bnext:/);
+  assert.doesNotMatch(await readFile(ledger.paths.reposYml, 'utf8'), /\b(?:path|next|graphify):|passwd/);
   const counters = await yaml(join(tmp.dir, 'counters', `${ledger.device.device_id}.yml`));
-  assert.equal(counters.old, 6);
-  assert.equal((await ledger.createItem({ ...base, repo: 'old', title: 'x' })).fm.id, 'OL-7');
+  assert.equal(counters.old, 1);
+});
+
+test('A1: during the 1 → 2 migration a legacy next is still read, but capped', async (t) => {
+  const tmp = await tempConfig();
+  t.after(tmp.cleanup);
+  await writeFormat1(tmp.dir, 'acme:\n  prefix: ACME\n  path: null\n  next: 9007199254740000\nsane:\n  prefix: SN\n  path: null\n  next: 143\n');
+  const { ledger, logs, close } = await open(tmp);
+  t.after(close);
+  const counters = await yaml(join(tmp.dir, 'counters', `${ledger.device.device_id}.yml`));
+  assert.equal(counters.sane, 142, 'a plausible next is honoured exactly');
+  assert.equal(counters.acme, COUNTER_MAX, 'an absurd next is capped, not burned into the id space');
+  assert.ok(logs.some((l) => /implausibly large/.test(l)));
+  assert.equal((await ledger.createItem({ ...base, repo: 'sane', title: 'x' })).fm.id, 'SN-143');
 });
 
 /* ---------------- F1.2 counters ---------------- */
@@ -319,7 +339,7 @@ test('F1.2: unreadable counter file → creates are refused, nothing is guessed'
   assert.equal((await readdir(ledger.paths.itemsDir('acme'))).length, 0);
 });
 
-test('F1.2: lost device.yml (new device id, still slot "") cannot restart numbering below existing ids', async (t) => {
+test('A3: lost device.yml next to existing counters/items fails closed; `device init` style restore continues numbering', async (t) => {
   const tmp = await tempConfig();
   t.after(tmp.cleanup);
   const a = await open(tmp);
@@ -328,12 +348,129 @@ test('F1.2: lost device.yml (new device id, still slot "") cannot restart number
   const oldId = a.ledger.device.device_id;
   await a.close();
   const { rm } = await import('node:fs/promises');
-  await rm(join(tmp.dir, '.hub', 'device.yml'));
+  const deviceYml = join(tmp.dir, '.hub', 'device.yml');
+  await rm(deviceYml);
+  const refused = new Ledger({ config: tmp.config, log: () => undefined });
+  await assert.rejects(
+    () => refused.init(),
+    (err: any) => err.code === 'DEVICE_MISSING' && /device identity missing: run `ledger device init`/.test(err.message),
+  );
+  assert.equal(await exists(deviceYml), false, 'no identity was minted');
+
+  // the human restores an identity (what `ledger device init` writes): numbering continues
+  const fresh = newDeviceId();
+  await writeFile(deviceYml, `device_id: ${fresh}\nlabel: mac\nslot: ""\n`, 'utf8');
   const b = await open(tmp);
   t.after(b.close);
   assert.notEqual(b.ledger.device.device_id, oldId);
   assert.equal(b.ledger.repos().acme?.next, 4, 'seeded from the per-key max over counters/*.yml');
   assert.equal((await b.ledger.createItem({ ...base, repo: 'acme', title: 'after loss' })).fm.id, 'ACME-4');
+});
+
+test('A3: foreign counters/d_*.yml alone (cloned ledger, no identity) and marker+items without counters both fail closed', async (t) => {
+  // cloned ledger: a peer's counter file, no .hub/device.yml
+  const t1 = await tempConfig();
+  t.after(t1.cleanup);
+  await mkdir(join(t1.dir, 'counters'), { recursive: true });
+  await writeFile(join(t1.dir, 'counters', `${newDeviceId()}.yml`), 'acme: 5\n', 'utf8');
+  await assert.rejects(
+    () => new Ledger({ config: t1.config, log: () => undefined }).init(),
+    (err: any) => err.code === 'DEVICE_MISSING',
+  );
+  assert.equal(await exists(join(t1.dir, '.hub', 'device.yml')), false);
+
+  // marker + an item, counters missing
+  const t2 = await tempConfig();
+  t.after(t2.cleanup);
+  await mkdir(join(t2.dir, 'acme', 'items'), { recursive: true });
+  await writeFile(join(t2.dir, 'ledger.format'), '2\n', 'utf8');
+  await writeFile(join(t2.dir, 'acme', 'items', 'ACME-1.md'), '---\nid: ACME-1\n---\n', 'utf8');
+  await assert.rejects(
+    () => new Ledger({ config: t2.config, log: () => undefined }).init(),
+    (err: any) => err.code === 'DEVICE_MISSING',
+  );
+
+  // control: a format-1 ledger with items but NO marker is the legitimate upgrade path
+  const t3 = await tempConfig();
+  t.after(t3.cleanup);
+  await mkdir(join(t3.dir, 'acme', 'items'), { recursive: true });
+  await writeFile(join(t3.dir, 'repos.yml'), 'acme:\n  prefix: ACME\n  path: null\n  next: 2\n', 'utf8');
+  await writeFile(join(t3.dir, 'acme', 'items', 'ACME-1.md'), '---\nid: ACME-1\n---\n', 'utf8');
+  const ok = await open(t3);
+  t.after(ok.close);
+  assert.equal(ok.ledger.device.slot, '');
+  assert.equal(ok.ledger.repos().acme?.next, 2);
+});
+
+test('A5: an empty / null / comment-only own counter file is invalid, never a silent reset', async (t) => {
+  for (const body of ['', '\n', '# nothing\n', 'null\n', '~\n']) {
+    const tmp = await tempConfig();
+    t.after(tmp.cleanup);
+    const deviceId = newDeviceId();
+    await mkdir(join(tmp.dir, '.hub'), { recursive: true });
+    await writeFile(join(tmp.dir, '.hub', 'device.yml'), `device_id: ${deviceId}\nlabel: mac\nslot: ""\n`, 'utf8');
+    await mkdir(join(tmp.dir, 'counters'), { recursive: true });
+    await writeFile(join(tmp.dir, 'counters', `${deviceId}.yml`), body, 'utf8');
+    const { ledger, close } = await open(tmp);
+    t.after(close);
+    await ledger.registerRepo({ slug: 'acme', prefix: 'ACME', path: null });
+    await assert.rejects(
+      () => ledger.createItem({ ...base, repo: 'acme', title: 'x' }),
+      (err: any) => err.code === 'COUNTERS_INVALID',
+      JSON.stringify(body),
+    );
+    assert.equal(await readFile(join(tmp.dir, 'counters', `${deviceId}.yml`), 'utf8'), body, 'file left for the human');
+  }
+  assert.throws(() => parseCounterFile(''), /invalid counter file/);
+  assert.deepEqual([...parseCounterFile('{}\n')], []);
+});
+
+test('A5: id = max(memory, disk) — a counter file truncated under a running hub never rewinds numbering', async (t) => {
+  const tmp = await tempConfig();
+  t.after(tmp.cleanup);
+  const { ledger, close } = await open(tmp);
+  t.after(close);
+  await ledger.registerRepo({ slug: 'acme', prefix: 'ACME', path: null });
+  for (let i = 0; i < 3; i += 1) await ledger.createItem({ ...base, repo: 'acme', title: `t${i}` });
+  const file = join(tmp.dir, 'counters', `${ledger.device.device_id}.yml`);
+  // reset to a VALID but lower state, and to an empty file
+  await writeFile(file, '{}\n', 'utf8');
+  assert.equal((await ledger.createItem({ ...base, repo: 'acme', title: 'after reset' })).fm.id, 'ACME-4');
+  await writeFile(file, '', 'utf8');
+  assert.equal((await ledger.createItem({ ...base, repo: 'acme', title: 'after truncate' })).fm.id, 'ACME-5');
+  assert.deepEqual(await yaml(file), { acme: 5 }, 'the file is repaired from memory');
+  // a larger value on disk wins over memory
+  await writeFile(file, 'acme: 40\n', 'utf8');
+  assert.equal((await ledger.createItem({ ...base, repo: 'acme', title: 'jump' })).fm.id, 'ACME-41');
+});
+
+test('A8: SNOWFLAKE_WORKER_ID 2..25 is rejected on the primary at startup; other values and device slots are unaffected', async (t) => {
+  const prevWorker = snowflake.workerId;
+  const prevEnv = process.env.SNOWFLAKE_WORKER_ID;
+  t.after(() => {
+    snowflake.setWorkerId(prevWorker);
+    if (prevEnv === undefined) delete process.env.SNOWFLAKE_WORKER_ID;
+    else process.env.SNOWFLAKE_WORKER_ID = prevEnv;
+  });
+  for (const bad of ['2', '13', '25']) {
+    process.env.SNOWFLAKE_WORKER_ID = bad;
+    const tmp = await tempConfig();
+    t.after(tmp.cleanup);
+    await assert.rejects(
+      () => new Ledger({ config: tmp.config, log: () => undefined }).init(),
+      /SNOWFLAKE_WORKER_ID .* reserved for device slots/,
+      bad,
+    );
+    assert.equal(snowflake.workerId, prevWorker, 'worker id untouched by the failed start');
+  }
+  for (const okValue of ['0', '1', '26', '1023']) {
+    process.env.SNOWFLAKE_WORKER_ID = okValue;
+    configureSnowflakeWorker('');
+    assert.equal(snowflake.workerId, Number(okValue));
+  }
+  process.env.SNOWFLAKE_WORKER_ID = '7';
+  configureSnowflakeWorker('W'); // a lettered device ignores the env entirely
+  assert.equal(snowflake.workerId, slotWorkerId('W'));
 });
 
 test('F1.2: an existing item file is never overwritten, the allocator skips past it', async (t) => {
@@ -514,9 +651,10 @@ test('F1.3: root_sha of an empty repo / a missing dir is null, never throws', as
   assert.equal(await readRootSha(empty.path).catch(() => 'threw'), null);
 });
 
-test('F1.3: unknown checkout binds by root_sha (no slug created); wrong or ambiguous → null', async (t) => {
+test('F1.3: unknown checkout binds by root_sha + equal origin (no slug created); wrong or ambiguous → null', async (t) => {
   const code = await makeCommittedRepo('f2bind');
   t.after(code.cleanup);
+  await git(code.path, ['remote', 'add', 'origin', 'https://github.com/acme/app.git']);
   await code.commit('root', { 'a.txt': 'a' });
   const other = await distinctRepo('f2other');
   t.after(other.cleanup);
@@ -568,13 +706,14 @@ test('F1.3: same root commit but a different origin (template clone) is not auto
 test('F1.3: two unbound slugs with the same root_sha are ambiguous → not bound', async (t) => {
   const code = await makeCommittedRepo('f2amb');
   t.after(code.cleanup);
+  await git(code.path, ['remote', 'add', 'origin', 'https://github.com/acme/app.git']);
   await code.commit('root', { 'a.txt': 'a' });
   const sha = (await git(code.path, ['rev-list', '--max-parents=0', 'HEAD'])).stdout.trim();
   const tmp = await tempConfig();
   t.after(tmp.cleanup);
   await writeFile(
     join(tmp.dir, 'repos.yml'),
-    `one:\n  prefix: ONE\n  identity:\n    root_sha: ${sha}\ntwo:\n  prefix: TWO\n  identity:\n    root_sha: ${sha}\n`,
+    `one:\n  prefix: ONE\n  identity:\n    root_sha: ${sha}\n    origin_hint: github.com/acme/app\ntwo:\n  prefix: TWO\n  identity:\n    root_sha: ${sha}\n    origin_hint: github.com/acme/app\n`,
     'utf8',
   );
   const { ledger, close } = await open(tmp);
@@ -582,6 +721,39 @@ test('F1.3: two unbound slugs with the same root_sha are ambiguous → not bound
   assert.equal(await ledger.bindByRootSha(code.path), null);
   assert.equal(ledger.repos().one?.path, null);
   assert.equal(ledger.repos().two?.path, null);
+});
+
+test('A2: root_sha alone never auto-binds — an origin must exist on BOTH sides and be equal', async (t) => {
+  const withOrigin = async (label: string, origin: string | null): Promise<{ path: string; sha: string; cleanup: () => Promise<void> }> => {
+    const repo = await distinctRepo(label);
+    if (origin !== null) await git(repo.path, ['remote', 'add', 'origin', origin]);
+    const sha = (await git(repo.path, ['rev-list', '--max-parents=0', 'HEAD'])).stdout.trim();
+    return { ...repo, sha };
+  };
+  const cases: { name: string; local: string | null; hint: string | null; bound: boolean }[] = [
+    { name: 'neither side has an origin', local: null, hint: null, bound: false },
+    { name: 'synced identity has no origin_hint', local: 'https://github.com/acme/app.git', hint: null, bound: false },
+    { name: 'checkout has no origin', local: null, hint: 'github.com/acme/app', bound: false },
+    { name: 'origins differ (template clone)', local: 'https://github.com/other/app.git', hint: 'github.com/acme/app', bound: false },
+    { name: 'origins equal', local: 'https://github.com/acme/app.git', hint: 'github.com/acme/app', bound: true },
+  ];
+  for (const c of cases) {
+    const code = await withOrigin(`f2a2-${c.bound ? 'y' : 'n'}`, c.local);
+    t.after(code.cleanup);
+    const tmp = await tempConfig();
+    t.after(tmp.cleanup);
+    const hint = c.hint === null ? '' : `    origin_hint: ${c.hint}\n`;
+    await writeFile(join(tmp.dir, 'repos.yml'), `app:\n  prefix: APP\n  identity:\n    root_sha: ${code.sha}\n${hint}`, 'utf8');
+    const { ledger, close } = await open(tmp);
+    t.after(close);
+    const got = await ledger.bindByRootSha(code.path);
+    assert.equal(got, c.bound ? 'app' : null, c.name);
+    assert.equal(ledger.repoPath('app') !== null, c.bound, c.name);
+    if (!c.bound) {
+      // the explicit, human-driven bind still works (it verifies root_sha itself)
+      assert.equal((await ledger.bindRepo('app', code.path)).path, ledger.repoPath('app'), c.name);
+    }
+  }
 });
 
 test('F1.3: `repo bind` verifies the root commit and refuses a different repo or a held path', async (t) => {

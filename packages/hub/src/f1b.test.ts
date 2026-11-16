@@ -88,7 +88,11 @@ test('F1.3: SessionStart in a checkout that matches an unbound repo binds it, no
     await fx.cleanup();
     await mine.cleanup();
   });
-  await syncedRepos(fx, `ops:\n  kind: system\n  prefix: OPS\napp:\n  prefix: APP\n  identity:\n    root_sha: ${mine.root}\n`);
+  await git(mine.path, ['remote', 'add', 'origin', 'https://github.com/acme/app.git']);
+  await syncedRepos(
+    fx,
+    `ops:\n  kind: system\n  prefix: OPS\napp:\n  prefix: APP\n  identity:\n    root_sha: ${mine.root}\n    origin_hint: github.com/acme/app\n`,
+  );
   const before = Object.keys((await fx.api('GET', '/v1/repos')).json.repos).sort();
   assert.equal(fx.hub.ledger.repos().app?.path, null);
 
@@ -98,6 +102,19 @@ test('F1.3: SessionStart in a checkout that matches an unbound repo binds it, no
   const after = await fx.api('GET', '/v1/repos');
   assert.deepEqual(Object.keys(after.json.repos).sort(), before, 'no slug was created');
   assert.ok(after.json.repos.app.path, 'path is bound locally');
+});
+
+test('A2: a matching root commit WITHOUT an origin_hint is not auto-bound (needs `ledger repo bind`)', async (t) => {
+  const fx = await startTestHub();
+  const mine = await distinctRepo('f1b-noorigin');
+  t.after(async () => {
+    await fx.cleanup();
+    await mine.cleanup();
+  });
+  await syncedRepos(fx, `ops:\n  kind: system\n  prefix: OPS\napp:\n  prefix: APP\n  identity:\n    root_sha: ${mine.root}\n`);
+  const res = await fx.hook('session-start', { session_id: 'f1b00003', cwd: mine.path, source: 'startup' });
+  assert.ok(res.repo && res.repo !== 'app', 'a peer-controlled root_sha alone does not claim this checkout');
+  assert.equal(fx.hub.ledger.repos().app?.path, null);
 });
 
 test('F1.3: SessionStart in an unrelated checkout still auto-registers a fresh slug', async (t) => {

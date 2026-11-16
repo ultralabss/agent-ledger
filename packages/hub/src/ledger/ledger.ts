@@ -77,6 +77,7 @@ import { normalizeGitPath, samePathGit } from '../gitpath.ts';
 import { readOriginHint, readRootSha } from '../gitreader.ts';
 import { MemoryIndex, type ItemFilter, type LedgerIndex, type StoredItem } from '../index-store.ts';
 import {
+  COUNTER_MAX,
   isAbsoluteLike,
   LEDGER_FORMAT,
   loadOrCreateDevice,
@@ -186,6 +187,11 @@ export class Ledger {
   /** `repos.yml` still carries `path`/`next`/`graphify`/absolute docs. */
   private legacyPresent = false;
   private deviceIdentity: DeviceIdentity | null = null;
+  /** `ledger.format` as read at boot, raised to {@link LEDGER_FORMAT} once the
+   *  migration wrote the marker. Below 2 (migration window) the legacy
+   *  `path`/`next`/`graphify` of `repos.yml` are still read; from 2 on that file
+   *  is synced, i.e. peer-controlled, and they are ignored. */
+  private formatNum = 1;
 
   private readonly logFn: (line: string) => void;
 
@@ -230,6 +236,7 @@ export class Ledger {
     // Before ANY other write: a ledger written by a newer hub (higher
     // `ledger.format`) has a layout this code does not understand. Fail closed.
     const format = await readLedgerFormat(this.paths.formatFile);
+    this.formatNum = format;
     // win32: a plain mkdir inherits the parent's ACL (e.g. BUILTIN\\Users write under a shared
     // temp/data root), which the token/hooks trust checks rightly refuse. Create `.hub` private
     // (DACL {me, SYSTEM}, inheritance removed). POSIX keeps the mode-based path unchanged.
@@ -241,7 +248,11 @@ export class Ledger {
     // Device identity decides the id slot and the snowflake worker: load it
     // before anything can mint an id. Process-wide on purpose: `generate()` is
     // called from the DB layer too.
-    this.deviceIdentity = await loadOrCreateDevice(this.paths.deviceYml);
+    this.deviceIdentity = await loadOrCreateDevice(this.paths.deviceYml, {
+      countersDir: this.paths.countersDir,
+      formatFile: this.paths.formatFile,
+      root: this.paths.root,
+    });
     configureSnowflakeWorker(this.device.slot);
     const created = await ensureFile(
       this.paths.reposYml,
@@ -282,6 +293,8 @@ export class Ledger {
       await this.saveRepos();
     }
     if (format < LEDGER_FORMAT) await writeLedgerFormat(this.paths.formatFile);
+    this.formatNum = LEDGER_FORMAT;
+    this.legacyPresent = false;
     this.logFn(`ledger migrated to format ${LEDGER_FORMAT}`);
     return true;
   }
@@ -367,16 +380,25 @@ export class Ledger {
     const merged: ReposFile = {};
     const floor = new Map<string, number>();
     let legacy = false;
+    // Legacy keys are honoured ONLY while migrating 1 → 2. In format 2 the synced
+    // file is peer-controlled: a `path` there would route sessions (and file
+    // reads) at an attacker-chosen directory, a `next` would burn the id space.
+    const migrating = this.formatNum < LEDGER_FORMAT;
     for (const [slug, s] of Object.entries(res.data)) {
       const loc = this.localRaw.get(slug);
       const own = this.counters.get(slug) ?? 0;
-      const legacyNext = s.next === undefined ? 0 : s.next - 1;
-      if (s.next !== undefined) floor.set(slug, legacyNext);
+      let legacyNext = 0;
+      if (migrating && s.next !== undefined) {
+        if (s.next - 1 > COUNTER_MAX) this.logFn(`repos.yml: next of "${slug}" is implausibly large and was capped`);
+        legacyNext = Math.min(s.next - 1, COUNTER_MAX);
+        floor.set(slug, legacyNext);
+      }
       if (
-        s.path !== undefined ||
-        s.next !== undefined ||
-        s.graphify !== undefined ||
-        (s.docs ?? []).some(isAbsoluteLike)
+        migrating &&
+        (s.path !== undefined ||
+          s.next !== undefined ||
+          s.graphify !== undefined ||
+          (s.docs ?? []).some(isAbsoluteLike))
       ) {
         legacy = true;
       }
@@ -384,14 +406,17 @@ export class Ledger {
         ...(s.kind === undefined ? {} : { kind: s.kind }),
         ...(s.host === undefined ? {} : { host: s.host }),
         prefix: s.prefix,
-        path: loc?.path !== undefined ? loc.path : (s.path ?? null),
+        path: loc?.path !== undefined ? loc.path : migrating ? (s.path ?? null) : null,
         next: Math.max(own, legacyNext) + 1,
       };
-      const graphify = loc?.graphify !== undefined ? loc.graphify : s.graphify;
+      const graphify = loc?.graphify !== undefined ? loc.graphify : migrating ? s.graphify : undefined;
       if (graphify !== undefined) cfg.graphify = graphify;
       if (s.graphify_rel !== undefined) cfg.graphify_rel = s.graphify_rel;
       if (s.identity !== undefined) cfg.identity = s.identity;
-      const docs = [...new Set([...(s.docs ?? []), ...(loc?.docs ?? [])])];
+      const syncedDocs = migrating
+        ? (s.docs ?? [])
+        : (s.docs ?? []).filter((d) => !isAbsoluteLike(d) && !d.split(/[\\/]/).includes('..'));
+      const docs = [...new Set([...syncedDocs, ...(loc?.docs ?? [])])];
       if (s.docs !== undefined || docs.length > 0) cfg.docs = docs;
       if (s.prefix_aliases !== undefined) cfg.prefix_aliases = s.prefix_aliases;
       if (s.onboarded !== undefined) cfg.onboarded = s.onboarded;
@@ -426,13 +451,18 @@ export class Ledger {
     const file = this.paths.counterFile(this.device.device_id);
     try {
       const own = await readCounterFile(file);
-      this.counters =
+      const disk =
         own ??
         (this.device.slot === ''
           ? await readAllCounters(this.paths.countersDir, (name) =>
               this.logFn(`counters/${name} is not valid and was ignored`),
             )
-          : new Map());
+          : new Map<string, number>());
+      // max(memory, disk): a counter file reset or truncated under a running hub
+      // (or by a bad merge) can never move numbering backwards.
+      const next = new Map(disk);
+      for (const [slug, n] of this.counters) if (n > (next.get(slug) ?? 0)) next.set(slug, n);
+      this.counters = next;
       this.countersLoaded = true;
       this.warnings.delete(file);
     } catch {
@@ -779,17 +809,19 @@ export class Ledger {
       );
       if (held) return null;
       // A template clone shares its root commit with the original, so root_sha alone
-      // is a hint: when both sides know an origin and they differ, do not guess.
-      const hintClash = (c: RepoConfig): boolean =>
+      // is only a hint — and `identity` arrives through the synced (peer-controlled)
+      // repos.yml. Auto-bind needs an origin on BOTH sides and they must be equal;
+      // anything else needs a human: `ledger repo bind <slug> <path>`.
+      const hintMatch = (c: RepoConfig): boolean =>
         c.identity?.origin_hint != null &&
         identity.origin_hint !== null &&
-        c.identity.origin_hint !== identity.origin_hint;
+        c.identity.origin_hint === identity.origin_hint;
       const matches = Object.entries(this.reposRaw).filter(
         ([, c]) =>
           repoKindOf(c) === 'repo' &&
           c.path === null &&
           c.identity?.root_sha === identity.root_sha &&
-          !hintClash(c),
+          hintMatch(c),
       );
       if (matches.length !== 1) return null;
       const [slug, cfg] = matches[0] as [string, RepoConfig];

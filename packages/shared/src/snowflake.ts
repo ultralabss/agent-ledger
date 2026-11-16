@@ -69,8 +69,7 @@ export function parseWorkerId(raw: string | undefined): number {
  * like 1 and 0). Slot `""` is the primary (existing) ledger and keeps worker 1,
  * the value every single-machine ledger has always used. A letter maps to
  * worker 2 + index (2..25), so two devices can never mint the same id.
- * (`SNOWFLAKE_WORKER_ID` only applies to slot `""`; do not set it to 2..25 on a
- * primary that syncs with lettered devices.)
+ * (`SNOWFLAKE_WORKER_ID` only applies to slot `""`; 2..25 is REJECTED there at startup.)
  */
 export const SLOT_LETTERS = 'ABCDEFGHJKLMNPQRSTUVWXYZ';
 
@@ -165,7 +164,19 @@ export const snowflake = new Snowflake({
  *  value from `SNOWFLAKE_WORKER_ID` (default 1), i.e. no change for a
  *  single-machine ledger. Called by `Ledger.init()`. */
 export function configureSnowflakeWorker(slot: string): void {
-  snowflake.setWorkerId(slot === '' ? parseWorkerId(process.env.SNOWFLAKE_WORKER_ID) : slotWorkerId(slot));
+  if (slot !== '') {
+    snowflake.setWorkerId(slotWorkerId(slot));
+    return;
+  }
+  const worker = parseWorkerId(process.env.SNOWFLAKE_WORKER_ID);
+  // 2..25 belong to lettered device slots: a primary on one of them could mint
+  // the same snowflake as the device that owns that slot. Fail at startup.
+  if (worker >= 2 && worker < 2 + SLOT_LETTERS.length) {
+    throw new Error(
+      `SNOWFLAKE_WORKER_ID ${worker} is reserved for device slots (2..${1 + SLOT_LETTERS.length}); unset it or use another value on the primary`,
+    );
+  }
+  snowflake.setWorkerId(worker);
 }
 
 /** Convenience: `id = generate()`. */

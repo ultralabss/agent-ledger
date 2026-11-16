@@ -92,11 +92,51 @@ function parseDevice(text: string): DeviceIdentity | null {
   return res.success ? res.data : null;
 }
 
+/** Where a lost `.hub/device.yml` would leave evidence of an existing ledger. */
+export interface DeviceContext {
+  countersDir: string;
+  formatFile: string;
+  /** Ledger root (`<slug>/items/` directories live here). */
+  root: string;
+}
+
+const NOT_ITEM_DIRS = new Set(['counters', 'intake']);
+
+/** A foreign or lost counter file, or a format marker next to existing items:
+ *  numbering already started on a device whose identity we no longer have. */
+async function priorLedgerEvidence(ctx: DeviceContext): Promise<boolean> {
+  try {
+    const names = await readdir(ctx.countersDir);
+    if (names.some((n) => n.endsWith('.yml') && DEVICE_ID_RE.test(n.slice(0, -4)))) return true;
+  } catch {
+    // no counters/ directory
+  }
+  if ((await readText(ctx.formatFile)) === null) return false;
+  let entries: string[];
+  try {
+    entries = await readdir(ctx.root);
+  } catch {
+    return false;
+  }
+  for (const e of entries) {
+    if (e.startsWith('.') || NOT_ITEM_DIRS.has(e)) continue;
+    try {
+      if ((await readdir(join(ctx.root, e, 'items'))).some((n) => n.endsWith('.md'))) return true;
+    } catch {
+      // not a repo directory
+    }
+  }
+  return false;
+}
+
 /** Read `.hub/device.yml`, creating it on first boot (slot `""`, random id).
  *  An existing but invalid file is NEVER regenerated: a new device id and a
  *  default slot next to an existing counters/ directory is exactly how two
- *  writers end up minting the same id. */
-export async function loadOrCreateDevice(file: string): Promise<DeviceIdentity> {
+ *  writers end up minting the same id. The same holds for a MISSING file when
+ *  the ledger already has history (foreign `counters/d_*.yml`, or a format
+ *  marker with items): that is a lost identity, not a fresh install, and the
+ *  human picks the identity (`ledger device init` / `sync join`). */
+export async function loadOrCreateDevice(file: string, ctx: DeviceContext): Promise<DeviceIdentity> {
   const text = await readText(file);
   if (text !== null) {
     const dev = parseDevice(text);
@@ -109,6 +149,13 @@ export async function loadOrCreateDevice(file: string): Promise<DeviceIdentity> 
     }
     return dev;
   }
+  if (await priorLedgerEvidence(ctx)) {
+    throw new LedgerError(
+      500,
+      'DEVICE_MISSING',
+      'device identity missing: run `ledger device init` (or `ledger sync join`) — refusing to mint ids as an anonymous primary',
+    );
+  }
   const fresh: DeviceIdentity = { device_id: newDeviceId(), label: defaultLabel(), slot: '' };
   await writeAtomic(file, stringifyYaml(fresh, { lineWidth: 0 }), 0o600);
   // Whoever won a (theoretical) race, everyone must agree with what is on disk.
@@ -119,11 +166,21 @@ export async function loadOrCreateDevice(file: string): Promise<DeviceIdentity> 
 
 /* ---------------- counters/<device_id>.yml ---------------- */
 
-/** `{slug: n}` — n = LAST allocated number (0 / absent = none yet). */
-const counterFileSchema = z.record(slugSchema, z.number().int().min(0).max(Number.MAX_SAFE_INTEGER - 1));
+/** Upper bound of one counter (and of a format-1 `next`): no real ledger comes
+ *  near it, while a hostile value (`9007199254740990`) would exhaust the id
+ *  space of a repo for good. Shared with the sync ingress validator. */
+export const COUNTER_MAX = 10_000_000;
 
+/** `{slug: n}` — n = LAST allocated number (0 / absent = none yet). */
+const counterFileSchema = z.record(slugSchema, z.number().int().min(0).max(COUNTER_MAX));
+
+/** An EMPTY (or `null`) file is invalid, never "no counters": a truncated own
+ *  counter file must not silently restart numbering. A real file always holds
+ *  at least `{}`. */
 export function parseCounterFile(text: string): Map<string, number> {
-  const res = counterFileSchema.safeParse(parseYaml(text) ?? {});
+  const raw: unknown = parseYaml(text);
+  if (raw === null || raw === undefined) throw new Error('invalid counter file');
+  const res = counterFileSchema.safeParse(raw);
   if (!res.success) throw new Error('invalid counter file');
   return new Map(Object.entries(res.data));
 }
