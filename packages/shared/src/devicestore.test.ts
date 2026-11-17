@@ -956,16 +956,47 @@ test('bootstrapSigners: trusts every NON-revoked device of the registry once the
   const joiner = await ledger(t, 'join');
   await initDevice(joiner, { label: 'phone' });
   const l = deviceLayout(joiner);
-  assert.deepEqual(await bootstrapSigners(joiner, reg.file, reg.rootFp), { added: reg.ids });
+  assert.deepEqual(await bootstrapSigners(joiner, reg.file, reg.rootFp), { added: reg.ids, rootRevoked: false });
   const signers = await readSigners(l);
   assert.deepEqual(signers.map((s) => s.id).sort(), reg.ids);
   assert.ok(!signers.some((s) => s.id === reg.revokedId), 'a revoked key is never trusted');
   assert.equal(await mode(l.allowedSigners), 0o600);
   const own = (await listDevices(joiner)).length;
   assert.equal(own, 0, 'devices.yml itself is not written by the bootstrap');
-  // only on a device that trusts nobody yet: never widens an existing trust set
-  await assert.rejects(bootstrapSigners(joiner, reg.file, reg.rootFp), bsErr('SIGNERS_NOT_EMPTY'));
+  // idempotent for the SAME set (id + pubkey): a crash-and-rerun is fine and writes nothing
+  const bytes = await readFile(l.allowedSigners, 'utf8');
+  const mt = (await stat(l.allowedSigners)).mtimeMs;
+  assert.deepEqual(await bootstrapSigners(joiner, reg.file, reg.rootFp), { added: reg.ids, rootRevoked: false });
+  assert.equal(await readFile(l.allowedSigners, 'utf8'), bytes);
+  assert.equal((await stat(l.allowedSigners)).mtimeMs, mt, 'not rewritten');
+  // a DIFFERENT set never widens or swaps an existing trust set
+  const grown = structuredClone(reg.file);
+  const extra = await otherDevice(t);
+  grown.devices.push({ id: extra.id, label: 'tab', slot: 'Y', pubkey: extra.pub, added: '2026-11-16T10:00:00.000Z', added_by: reg.rootId, revoked: null, role: 'owner' });
+  await assert.rejects(bootstrapSigners(joiner, grown, reg.rootFp), bsErr('SIGNERS_NOT_EMPTY'));
+  const shrunk = structuredClone(reg.file);
+  shrunk.devices.splice(1, 1);
+  await assert.rejects(bootstrapSigners(joiner, shrunk, reg.rootFp), bsErr('SIGNERS_NOT_EMPTY'));
+  assert.equal(await readFile(l.allowedSigners, 'utf8'), bytes);
   assert.deepEqual((await readSigners(l)).map((s) => s.id).sort(), reg.ids);
+});
+
+test('bootstrapSigners: the same id with a DIFFERENT key is a different set; zero signers throws NO_SIGNERS and writes nothing', { skip }, async (t) => {
+  const reg = await registry(t);
+  const joiner = await ledger(t, 'join');
+  await initDevice(joiner, { label: 'phone' });
+  const l = deviceLayout(joiner);
+  const other = await otherDevice(t);
+  await writeFile(l.allowedSigners, `${reg.rootId} namespaces="agent-ledger-v1,git" ${other.pub}\n`, { mode: 0o600 });
+  await assert.rejects(bootstrapSigners(joiner, reg.file, reg.rootFp), bsErr('SIGNERS_NOT_EMPTY'));
+  const lone = await ledger(t, 'lone');
+  const j2 = await ledger(t, 'join2');
+  const r = await initDevice(lone, { root: true, label: 'mac' });
+  const file = (await readDevices(deviceLayout(lone))) as DevicesFile;
+  (file.devices[0] as { revoked: unknown }).revoked = { at: '2026-11-16T11:00:00.000Z', by: r.deviceId, reason: 'lost' };
+  await initDevice(j2, { label: 'tab' });
+  await assert.rejects(bootstrapSigners(j2, file, r.fingerprint), bsErr('NO_SIGNERS'));
+  await assert.rejects(stat(deviceLayout(j2).allowedSigners), { code: 'ENOENT' });
 });
 
 test('bootstrapSigners: a wrong or malformed root fingerprint changes nothing; so does a hostile registry', { skip }, async (t) => {
@@ -1000,6 +1031,7 @@ test('bootstrapSigners: an existing but EMPTY allowed_signers is fine; one with 
   const l = deviceLayout(joiner);
   await writeFile(l.allowedSigners, '', { mode: 0o600 });
   const res = await bootstrapSigners(joiner, revokedRoot, reg.rootFp);
+  assert.equal(res.rootRevoked, true);
   assert.ok(!res.added.includes(reg.rootId), 'the revoked root key is never trusted');
   assert.deepEqual((await readSigners(l)).map((s) => s.id), res.added);
   const joiner2 = await ledger(t, 'join2');

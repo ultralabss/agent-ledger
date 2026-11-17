@@ -291,3 +291,52 @@ test('pinHostKey: real ssh-keygen finds the pinned entry (plain form for 22, [ho
     assert.notEqual(await find('other.invalid'), 0);
   });
 });
+
+test('pinHostKey (AL-61d): racing FIRST pins never replace each other (link + re-read); the loser decides against what the winner wrote', { skip: !posix }, async () => {
+  await withTmp(async (d) => {
+    const sd = nodePath.join(d, 'sync');
+    // two different hosts racing the very first creation: both end up in the file
+    const [a, b, c] = [ed(), ec(), ed()];
+    const res = await Promise.all([pinHostKey(sd, 'one.invalid', 22, a), pinHostKey(sd, 'two.invalid', 22, b), pinHostKey(sd, 'three.invalid', 2222, c)]);
+    for (const r of res) assert.equal(r.written, true);
+    const file = nodePath.join(sd, 'known_hosts');
+    const lines = (await readFile(file, 'utf8')).trim().split('\n').sort();
+    assert.deepEqual(lines, [`[three.invalid]:2222 ${c}`, `one.invalid ${a}`, `two.invalid ${b}`].sort(), 'no pin was lost');
+    assert.deepEqual((await readdir(sd)).filter((n) => n.includes('.tmp')), []);
+  });
+});
+
+test('pinHostKey (AL-61d): two racing first pins for the SAME host: exactly one key wins, the other is REPIN_REFUSED', { skip: !posix }, async () => {
+  await withTmp(async (d) => {
+    const sd = nodePath.join(d, 'sync');
+    const x = ed();
+    const y = ed();
+    const out = await Promise.allSettled([pinHostKey(sd, 'same.invalid', 22, x), pinHostKey(sd, 'same.invalid', 22, y)]);
+    assert.equal(out.filter((o) => o.status === 'fulfilled').length, 1);
+    const lost = out.find((o) => o.status === 'rejected');
+    assert.ok(lost?.status === 'rejected' && lost.reason instanceof HostKeyError && lost.reason.code === 'REPIN_REFUSED');
+    const lines = (await readFile(nodePath.join(sd, 'known_hosts'), 'utf8')).trim().split('\n');
+    assert.equal(lines.length, 1);
+    assert.ok(lines[0] === `same.invalid ${x}` || lines[0] === `same.invalid ${y}`);
+  });
+});
+
+test('pinHostKey (AL-61d): the token is matched case-insensitively; a mixed-case duplicate line in the file is CORRUPT, never a second pin', { skip: !posix }, async () => {
+  await withTmp(async (d) => {
+    const sd = nodePath.join(d, 'sync');
+    const file = nodePath.join(sd, 'known_hosts');
+    const a = ed();
+    const evil = ed();
+    await pinHostKey(sd, 'example.invalid', 22, a);
+    // somebody wrote an upper-case row for the same host by hand: it IS the pinned row, a different key is refused
+    await writeFile(file, `Example.Invalid ${a}\n`, { mode: 0o600 });
+    assert.deepEqual(await pinHostKey(sd, 'EXAMPLE.invalid', 22, a), { written: false, fingerprint: fingerprintOf(a) });
+    await assert.rejects(pinHostKey(sd, 'example.invalid', 22, evil), code('REPIN_REFUSED'));
+    await writeFile(file, `Example.Invalid ${a}\nexample.invalid ${evil}\n`, { mode: 0o600 });
+    await assert.rejects(pinHostKey(sd, 'example.invalid', 22, a), code('CORRUPT'));
+    // the rewrite of a mixed-case file stores lowercase tokens only
+    await writeFile(file, `Example.Invalid ${a}\n`, { mode: 0o600 });
+    await pinHostKey(sd, 'other.invalid', 22, evil);
+    assert.equal(await readFile(file, 'utf8'), `example.invalid ${a}\nother.invalid ${evil}\n`);
+  });
+});

@@ -2,7 +2,7 @@
  *  the grow-only ratchet, backoff bounds, inflight marker path validation, `sync.yml`. */
 
 import assert from 'node:assert/strict';
-import { lstat, mkdtemp, mkdir, readFile, readdir, rm, stat, symlink, truncate, utimes, writeFile } from 'node:fs/promises';
+import { chmod, lstat, mkdtemp, mkdir, readFile, readdir, rm, stat, symlink, truncate, utimes, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import nodePath from 'node:path';
 import test from 'node:test';
@@ -19,7 +19,7 @@ import {
   readSyncConfig,
   writeEnrolMarker,
   writeSyncConfig,
-  type EnrolMarker,
+  type EnrolMarkerInput,
   type HaltState,
   type Inflight,
   type SyncState,
@@ -410,45 +410,50 @@ test('writeSyncConfig: re-validates the remote (ssh/scp only, no credentials, no
   });
 });
 
-function enrol(over: Partial<EnrolMarker> = {}): EnrolMarker {
-  return { v: 1, kind: 'init', stage: 'start', pid: process.pid, startedAt: new Date().toISOString(), remote: REMOTE, ...over };
+function enrol(over: Partial<EnrolMarkerInput> = {}): EnrolMarkerInput {
+  return { v: 1, kind: 'init', stage: 'start', startedAt: new Date().toISOString(), remote: REMOTE, ...over };
 }
 const alive = (v: boolean) => ({ pidAlive: () => v });
+/** One process playing the owner `pid` (the production pid is always `process.pid`). */
+const as = (pid: number, extra: Record<string, unknown> = {}) => ({ selfPid: pid, pidAlive: (p: number) => p === pid, ...extra });
 
-test('enrol marker: absent = null; written private; stage advance by the same pid and kind; read back strictly', async () => {
+test('enrol marker: absent = null; written private; the pid is process.pid; stage advance by the same pid and kind', async () => {
   await withDir(async (dir) => {
     assert.equal(await readEnrolMarker(dir), null);
     const m = enrol();
     await writeEnrolMarker(dir, m);
-    assert.deepEqual(await readEnrolMarker(dir), m);
+    assert.deepEqual(await readEnrolMarker(dir), { ...m, pid: process.pid });
     const file = nodePath.join(syncDir(dir), 'enrol.json');
     if (posix) assert.equal((await stat(file)).mode & 0o777, 0o600);
     await writeEnrolMarker(dir, { ...m, stage: 'committed' });
     assert.equal((await readEnrolMarker(dir))?.stage, 'committed');
-    const j = enrol({ kind: 'join', pid: 4_000_001, stage: 'awaiting-add', F0: A });
     await clearEnrolMarker(dir);
-    await writeEnrolMarker(dir, j);
-    assert.deepEqual(await readEnrolMarker(dir), j);
-    assert.deepEqual((await readdir(syncDir(dir))).filter((n) => n.includes('.tmp') || n.includes('.stale')), []);
+    const j = enrol({ kind: 'join', stage: 'awaiting-add', F0: A });
+    await writeEnrolMarker(dir, j, as(4_000_001));
+    assert.deepEqual(await readEnrolMarker(dir), { ...j, pid: 4_000_001 });
+    assert.deepEqual((await readdir(syncDir(dir))).filter((n) => n.includes('.tmp') || n.includes('.stale') || n.endsWith('.lock')), [], 'no leftovers, lock released');
   });
 });
 
-test('enrol marker: invalid input is refused before anything touches the disk; invalid files are CORRUPT (fail closed)', async () => {
+test('enrol marker (AL-61): the caller cannot supply a pid; invalid input is refused before anything touches the disk; invalid files are CORRUPT', async () => {
   await withDir(async (dir) => {
     const bad: unknown[] = [
-      enrol({ kind: 'x' as 'init' }), enrol({ stage: 'Bad Stage' }), enrol({ stage: '' }), enrol({ pid: 0 }), enrol({ pid: 1.5 }),
-      enrol({ pid: -3 }), enrol({ startedAt: 'yesterday' }), enrol({ remote: '' }), enrol({ remote: 'a b' }), enrol({ remote: '-oProxyCommand=x' }),
+      { ...enrol(), pid: 1 }, { ...enrol(), pid: process.pid },
+      enrol({ kind: 'x' as 'init' }), enrol({ stage: 'Bad Stage' }), enrol({ stage: '' }),
+      enrol({ startedAt: 'yesterday' }), enrol({ remote: '' }), enrol({ remote: 'a b' }), enrol({ remote: '-oProxyCommand=x' }),
       enrol({ remote: `ssh://h/${'a'.repeat(1100)}` }), enrol({ F0: 'xyz' }), { ...enrol(), extra: 1 }, { ...enrol(), v: 2 }, null, 'x',
     ];
-    for (const b of bad) await assert.rejects(writeEnrolMarker(dir, b as EnrolMarker), isState('INVALID'));
+    for (const b of bad) await assert.rejects(writeEnrolMarker(dir, b as EnrolMarkerInput), isState('INVALID'));
     assert.equal(await readEnrolMarker(dir), null);
+    await assert.rejects(writeEnrolMarker(dir, enrol(), { selfPid: 0 }), isState('INVALID'), 'a bad seam pid is still schema-checked');
     await writeEnrolMarker(dir, enrol());
     const file = nodePath.join(syncDir(dir), 'enrol.json');
     const put = (t: string): Promise<void> => writeFile(file, t, { mode: 0o600 });
-    for (const t of ['', '{', 'null', '[]', JSON.stringify({ ...enrol(), extra: 1 }), JSON.stringify({ ...enrol(), pid: 'x' }), `{"v":1,"pad":"${'a'.repeat(5000)}"}`]) {
+    const onDisk = enrol();
+    for (const t of ['', '{', 'null', '[]', JSON.stringify({ ...onDisk, pid: 1, extra: 1 }), JSON.stringify({ ...onDisk, pid: 'x' }), `{"v":1,"pad":"${'a'.repeat(5000)}"}`]) {
       await put(t);
       await assert.rejects(readEnrolMarker(dir), isState('CORRUPT'), t.slice(0, 30));
-      await assert.rejects(writeEnrolMarker(dir, enrol({ pid: 4_000_002 })), isState('CORRUPT'), 'a corrupt marker is never overwritten silently');
+      await assert.rejects(writeEnrolMarker(dir, enrol(), as(4_000_002)), isState('CORRUPT'), 'a corrupt marker is never overwritten silently');
     }
     // the human --abort can still remove it
     await clearEnrolMarker(dir, { force: true });
@@ -458,25 +463,25 @@ test('enrol marker: invalid input is refused before anything touches the disk; i
 
 test('enrol marker: a live foreign owner is BUSY (no URL in the message); a dead pid or a > 24 h marker is taken over', async () => {
   await withDir(async (dir) => {
-    const other = enrol({ pid: 4_000_003, kind: 'join', stage: 'awaiting-add', F0: B });
-    await writeEnrolMarker(dir, other);
+    const other = enrol({ kind: 'join', stage: 'awaiting-add', F0: B });
+    await writeEnrolMarker(dir, other, as(4_000_003));
     await assert.rejects(writeEnrolMarker(dir, enrol(), alive(true)), (e: unknown) => {
       assert.ok(e instanceof StateError && e.code === 'BUSY');
       assert.ok(!e.message.includes('example'));
       return true;
     });
-    assert.deepEqual(await readEnrolMarker(dir), other, 'the live marker is untouched');
+    assert.deepEqual(await readEnrolMarker(dir), { ...other, pid: 4_000_003 }, 'the live marker is untouched');
     // same pid, other kind, owner alive: not an "advance"
-    await assert.rejects(writeEnrolMarker(dir, enrol({ pid: 4_000_003, kind: 'init' }), alive(true)), isState('BUSY'));
+    await assert.rejects(writeEnrolMarker(dir, enrol({ kind: 'init' }), as(4_000_003)), isState('BUSY'));
     // dead owner
     await writeEnrolMarker(dir, enrol(), alive(false));
     assert.equal((await readEnrolMarker(dir))?.pid, process.pid);
-    assert.deepEqual((await readdir(syncDir(dir))).filter((n) => n.includes('.stale')), [], 'no stale leftovers');
+    assert.deepEqual((await readdir(syncDir(dir))).filter((n) => n.includes('.stale')), [], 'no aside file');
     // alive owner but old: pid reuse must not wedge enrolment (distance, in both directions: clocks jump)
     const t0 = Date.parse('2026-11-17T10:00:00.000Z');
     for (const skew of [25 * 3_600_000, -25 * 3_600_000]) {
       await clearEnrolMarker(dir, { force: true });
-      await writeEnrolMarker(dir, enrol({ pid: 4_000_004, startedAt: new Date(t0).toISOString() }));
+      await writeEnrolMarker(dir, enrol({ startedAt: new Date(t0).toISOString() }), as(4_000_004));
       await assert.rejects(writeEnrolMarker(dir, enrol(), { ...alive(true), now: () => t0 + 23 * 3_600_000 }), isState('BUSY'));
       await writeEnrolMarker(dir, enrol(), { ...alive(true), now: () => t0 + skew });
       assert.equal((await readEnrolMarker(dir))?.pid, process.pid);
@@ -484,28 +489,82 @@ test('enrol marker: a live foreign owner is BUSY (no URL in the message); a dead
   });
 });
 
-test('enrol marker: creation is exclusive: of two racing creators exactly one wins', async () => {
+test('enrol marker (AL-61): takeover swaps by rename — the path is never empty, nothing is moved aside, reader never sees a gap', async () => {
   await withDir(async (dir) => {
     await StateStore.open(dir);
-    const results = await Promise.allSettled([
-      writeEnrolMarker(dir, enrol({ pid: 4_000_005 }), alive(true)),
-      writeEnrolMarker(dir, enrol({ pid: 4_000_006 }), alive(true)),
-      writeEnrolMarker(dir, enrol({ pid: 4_000_007 }), alive(true)),
-    ]);
-    assert.equal(results.filter((r) => r.status === 'fulfilled').length, 1);
-    for (const r of results) if (r.status === 'rejected') assert.ok(r.reason instanceof StateError && r.reason.code === 'BUSY');
-    const m = await readEnrolMarker(dir);
-    assert.ok(m !== null && [4_000_005, 4_000_006, 4_000_007].includes(m.pid));
+    await writeEnrolMarker(dir, enrol(), as(4_100_000));
+    let stop = false;
+    const seen = { gaps: 0, asides: 0, reads: 0 };
+    const reader = (async () => {
+      while (!stop) {
+        try {
+          if ((await readEnrolMarker(dir)) === null) seen.gaps += 1;
+        } catch {
+          seen.gaps += 1;
+        }
+        seen.reads += 1;
+        if ((await readdir(syncDir(dir))).some((n) => n.includes('.stale'))) seen.asides += 1;
+        await new Promise((r) => setImmediate(r));
+      }
+    })();
+    // every owner is dead as soon as the next one comes: 40 takeovers
+    for (let k = 1; k <= 40; k += 1) {
+      await writeEnrolMarker(dir, enrol(), { selfPid: 4_100_000 + k, pidAlive: () => false });
+    }
+    stop = true;
+    await reader;
+    assert.ok(seen.reads > 5);
+    assert.deepEqual({ gaps: seen.gaps, asides: seen.asides }, { gaps: 0, asides: 0 });
+    assert.equal((await readEnrolMarker(dir))?.pid, 4_100_040);
   });
 });
 
-test('enrol marker: clear = no-op without a marker, allowed for the owner / a dead owner, BUSY for a live foreign one; a symlink is UNSAFE', async () => {
+test('enrol marker (AL-61): of three racing takers of a dead marker exactly one wins; of three racing creators exactly one wins', async () => {
+  await withDir(async (dir) => {
+    await StateStore.open(dir);
+    const creators = await Promise.allSettled([11, 12, 13].map((n) => writeEnrolMarker(dir, enrol(), { selfPid: 4_200_000 + n, pidAlive: () => true })));
+    assert.equal(creators.filter((r) => r.status === 'fulfilled').length, 1);
+    for (const r of creators) if (r.status === 'rejected') assert.ok(r.reason instanceof StateError && r.reason.code === 'BUSY');
+    const winner = (await readEnrolMarker(dir))?.pid ?? 0;
+    assert.ok([4_200_011, 4_200_012, 4_200_013].includes(winner));
+    await clearEnrolMarker(dir, { force: true });
+    await writeEnrolMarker(dir, enrol(), as(4_300_000));
+    const dead = 4_300_000;
+    const takers = await Promise.allSettled([21, 22, 23].map((n) => writeEnrolMarker(dir, enrol(), { selfPid: 4_300_000 + n, pidAlive: (p: number) => p !== dead })));
+    assert.equal(takers.filter((r) => r.status === 'fulfilled').length, 1);
+    for (const r of takers) if (r.status === 'rejected') assert.ok(r.reason instanceof StateError && r.reason.code === 'BUSY');
+    assert.ok([4_300_021, 4_300_022, 4_300_023].includes((await readEnrolMarker(dir))?.pid ?? 0));
+    assert.deepEqual((await readdir(syncDir(dir))).filter((n) => n.includes('.tmp') || n.includes('.stale') || n.endsWith('.lock')), []);
+  });
+});
+
+test('enrol marker (AL-61): a stale enrol.lock (dead holder) is taken over; a live fresh one makes the writer BUSY after a bounded wait', { skip: !posix }, async () => {
+  await withDir(async (dir) => {
+    await StateStore.open(dir);
+    const lock = nodePath.join(syncDir(dir), 'enrol.lock');
+    await writeFile(lock, `4400000 ${String(Date.now())} deadbeef\n`, { mode: 0o600 });
+    const old = new Date(Date.now() - 60_000);
+    await utimes(lock, old, old);
+    await writeEnrolMarker(dir, enrol(), alive(false));
+    assert.equal((await readEnrolMarker(dir))?.pid, process.pid);
+    await assert.rejects(lstat(lock), { code: 'ENOENT' }, 'our lock released');
+    // a live holder, fresh: bounded wait, then BUSY, the lock is not ours to delete
+    await writeFile(lock, `4400001 ${String(Date.now())} cafebabe\n`, { mode: 0o600 });
+    const t0 = Date.now();
+    await assert.rejects(writeEnrolMarker(dir, enrol({ stage: 'committed' }), alive(true)), isState('BUSY'));
+    assert.ok(Date.now() - t0 < 10_000, 'bounded');
+    assert.ok((await readFile(lock, 'utf8')).startsWith('4400001 '), 'the live holder\'s lock is untouched');
+    assert.equal((await readEnrolMarker(dir))?.stage, 'start');
+  });
+});
+
+test('enrol marker: clear = no-op ONLY for ENOENT, allowed for the owner / a dead owner, BUSY for a live foreign one; a symlink is UNSAFE', async () => {
   await withDir(async (dir) => {
     await clearEnrolMarker(dir);
     await writeEnrolMarker(dir, enrol());
     await clearEnrolMarker(dir);
     assert.equal(await readEnrolMarker(dir), null);
-    await writeEnrolMarker(dir, enrol({ pid: 4_000_008 }));
+    await writeEnrolMarker(dir, enrol(), as(4_000_008));
     await assert.rejects(clearEnrolMarker(dir, alive(true)), isState('BUSY'));
     assert.equal((await readEnrolMarker(dir))?.pid, 4_000_008);
     await clearEnrolMarker(dir, alive(false));
@@ -513,12 +572,26 @@ test('enrol marker: clear = no-op without a marker, allowed for the owner / a de
     if (posix) {
       const file = nodePath.join(syncDir(dir), 'enrol.json');
       const victim = nodePath.join(dir, 'victim.json');
-      await writeFile(victim, JSON.stringify(enrol()), { mode: 0o600 });
+      await writeFile(victim, JSON.stringify({ ...enrol(), pid: 7 }), { mode: 0o600 });
       await symlink(victim, file);
       await assert.rejects(readEnrolMarker(dir), isState('UNSAFE'));
       await assert.rejects(writeEnrolMarker(dir, enrol()), isState('UNSAFE'));
       await clearEnrolMarker(dir, { force: true });
       assert.equal(await readFile(victim, 'utf8') !== '', true, 'force removes the link, never the target');
     }
+  });
+});
+
+test('enrol marker (AL-61): a stat failure other than ENOENT is an IO error, not "no marker"', { skip: !posix || process.getuid?.() === 0 }, async () => {
+  await withDir(async (dir) => {
+    await writeEnrolMarker(dir, enrol());
+    await chmod(syncDir(dir), 0o000);
+    try {
+      await assert.rejects(clearEnrolMarker(dir), isState('IO'));
+      await assert.rejects(clearEnrolMarker(dir, { force: true }), isState('IO'));
+    } finally {
+      await chmod(syncDir(dir), 0o700);
+    }
+    assert.ok((await readEnrolMarker(dir)) !== null, 'the marker survived');
   });
 });

@@ -9,12 +9,16 @@
  *  symlinks and exec bits, `.hub/x`, and history rewrites (`update-ref` without an old value).
  */
 
-import { chmod, mkdir, mkdtemp, realpath, rm, writeFile } from 'node:fs/promises';
+import { chmod, mkdir, mkdtemp, readFile, realpath, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import nodePath from 'node:path';
 import {
+  addDevice,
+  approveDevice,
   deviceLayout,
   generateKeyPair,
+  parseEd25519Pub,
+  readDeviceFile,
   readSigners,
   renderAllowedSigners,
   renderDevicesYaml,
@@ -27,6 +31,8 @@ import {
   type GitSigningInput,
 } from '@agent-ledger/shared';
 import type { CommitOutcome } from '../git.ts';
+import { Ledger } from '../ledger/ledger.ts';
+import { tempConfig } from '../test-helpers.ts';
 import type { ApplyDeps, ApplyHost, DeliverNotes } from './apply.ts';
 import type { CycleDeps } from './cycle.ts';
 import { Gitx, REF_ACCEPTED, REF_MAIN, isSha, type GitxResult } from './gitx.ts';
@@ -606,4 +612,75 @@ export function cycleDeps(lh: LedgerHub, kit: Kit, over: Partial<CycleDeps> = {}
     testLocalRemotes: [kit.remote.path],
     ...over,
   };
+}
+
+
+/* ---------------- B4b additions: legacy ledgers and a trusted device for enrol tests ---------------- */
+
+export interface LegacyLedger {
+  dir: string;
+  /** The random F1 device id the ledger minted before any key existed. */
+  legacyId: string;
+  /** Ids of the items created (`OPS-1`, ...). */
+  itemIds: string[];
+  cleanup(): Promise<void>;
+}
+
+const ITEM_BASE = { kind: 'BACKLOG', priority: 'P2', owner: 'agent', steps: [] as string[], blocked_by: [] as string[], aliases: [] as string[], proposed: false } as const;
+
+/** A REAL legacy ledger: `Ledger.init()` on a fresh directory (git repo, pinned `.gitignore` / `.gitattributes`,
+ *  `ledger.format` 2, a RANDOM legacy device id, no key, unsigned commits) with `n` items, all committed. The hub is
+ *  closed again: this is what `sync init` meets on a stopped hub. `pre` = files written BEFORE the first boot
+ *  (the ledger repairs `.gitignore` / `.gitattributes` around them). */
+export async function makeLegacyLedger(n = 3, pre: Readonly<Record<string, string>> = {}): Promise<LegacyLedger> {
+  const tmp = await tempConfig({ commitDebounceMs: 3_600_000 });
+  const dir = await realpath(tmp.dir);
+  for (const [name, text] of Object.entries(pre)) await writeFile(nodePath.join(dir, name), text, { mode: 0o600 });
+  const ledger = new Ledger({ config: { ...tmp.config, ledgerDir: dir }, log: () => undefined });
+  await ledger.init();
+  const itemIds: string[] = [];
+  for (let i = 1; i <= n; i += 1) {
+    const it = await ledger.createItem({ ...ITEM_BASE, repo: 'ops', title: `legacy item ${String(i)}` });
+    itemIds.push(it.fm.id);
+  }
+  await ledger.git.flush();
+  const legacyId = ledger.device.device_id;
+  await ledger.close();
+  return { dir, legacyId, itemIds, cleanup: () => tmp.cleanup() };
+}
+
+/** The TRUSTED side of an add, done the way a hub does it, but offline: `device add` into the worktree, a signed commit
+ *  holding ONLY `devices.yml` on top of the device's `main`, the worktree moved to it, pushed to the kit remote.
+ *  `approve` also trusts the new key locally. Returns the new commit. */
+export async function trustedAdd(
+  trustedDir: string,
+  remote: string,
+  joiner: { pubkey: string; label: string; fingerprint: string },
+  o: { approve?: boolean; push?: boolean } = {},
+): Promise<string> {
+  const gitx = await Gitx.open({ syncDir: nodePath.join(trustedDir, '.hub', 'sync'), testLocalRemotes: [remote] });
+  const trees = new TreeBuilder(gitx, trustedDir, nodePath.join(trustedDir, '.hub', 'sync', 'tmp'));
+  const store = new ObjectStore(gitx, trustedDir);
+  const L = (await store.revParse(REF_MAIN)) as string;
+  const l = deviceLayout(trustedDir);
+  await addDevice(trustedDir, joiner.pubkey, joiner.label, joiner.fingerprint);
+  const devices = await readFile(l.devicesYml, 'utf8');
+  const pub = await publicKeyOf(l.keyFile, await resolveSshKeygen());
+  const tree = await trees.buildTree(L, [{ path: 'devices.yml', content: devices }]);
+  const label = (await readDeviceFile(l))?.label ?? 'trusted';
+  const sha = await trees.commitTree({
+    tree,
+    parents: [L],
+    message: 'testkit: device add',
+    identity: { name: label, email: `${pub.deviceId}@devices.agent-ledger.invalid` },
+    signing: { sshKeygenBin: await resolveSshKeygen(), keyFile: l.keyFile, allowedSignersFile: l.allowedSigners },
+  });
+  await trees.updateRef(REF_MAIN, sha, L);
+  await gitx.mustRun(['read-tree', '--reset', '-u', sha], { cwd: trustedDir });
+  if (o.approve !== false) await approveDevice(trustedDir, parseEd25519Pub(joiner.pubkey)?.deviceId as string, joiner.fingerprint);
+  if (o.push !== false) {
+    const res = await gitx.push(trustedDir, remote, sha);
+    if (!res.ok) throw new Error('testkit: trusted add could not be pushed');
+  }
+  return sha;
 }

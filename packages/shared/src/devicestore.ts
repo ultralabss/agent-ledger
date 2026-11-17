@@ -688,14 +688,18 @@ export async function approveLocked(ledgerDir: string, id: string, fingerprint: 
 
 /** JOIN bootstrap (OQ-5 = A): trust every NON-revoked device of a registry the caller already validated
  *  (`validateGenesis`), anchored on the root fingerprint the HUMAN confirmed out of band. Only on a
- *  device that trusts nobody yet (`allowed_signers` absent or empty): this can never widen an existing
- *  trust set. The root entry (slot "", self-added) must have exactly `rootFp` (`timingSafeEqual`); a
- *  revoked key (the root included) is never added. Takes the device lock itself (the joiner holds none). */
+ *  device that trusts nobody yet (`allowed_signers` absent or empty), OR when it already holds EXACTLY the
+ *  set this call would write (id + pubkey; idempotent re-run after a crash, nothing is rewritten). Any other
+ *  existing set is refused (`SIGNERS_NOT_EMPTY`): this can never widen or swap an existing trust set. The
+ *  root entry (slot "", self-added) must have exactly `rootFp` (`timingSafeEqual`) and is the anchor even
+ *  when it is revoked in the registry; a revoked key is never added, `rootRevoked` reports it (the caller
+ *  decides, join refuses). A registry that would leave ZERO trusted signers throws `NO_SIGNERS`. Takes the
+ *  device lock itself (the joiner holds none). */
 export async function bootstrapSigners(
   ledgerDir: string,
   devices: DevicesFile,
   rootFp: string,
-): Promise<{ added: string[] }> {
+): Promise<{ added: string[]; rootRevoked: boolean }> {
   if (typeof rootFp !== 'string' || !FP_RE.test(rootFp)) {
     throw new DevicesError('FP_REQUIRED', 'the root key fingerprint is required (SHA256:…)');
   }
@@ -711,21 +715,31 @@ export async function bootstrapSigners(
   if (want.length !== have.length || !timingSafeEqual(want, have)) {
     throw new DevicesError('FP_MISMATCH', 'root key fingerprint does not match — refusing');
   }
+  const signers: Signer[] = [];
+  for (const d of devices.devices) {
+    if (d.revoked !== null) continue;
+    const pub = parseEd25519Pub(d.pubkey);
+    if (pub === null) throw new DevicesError('KEY_INVALID', `${d.id}: registered key is invalid`);
+    signers.push({ id: d.id, pubkey: pub.line });
+  }
+  if (signers.length === 0) throw new DevicesError('NO_SIGNERS', 'every device in the registry is revoked — nothing to trust');
+  const rootRevoked = root.revoked !== null;
+  const ids = signers.map((x) => x.id).sort();
   const l = deviceLayout(ledgerDir);
   return lockLayout(l, async () => {
     await ensureHubDir(l);
-    if ((await readSigners(l)).length !== 0) {
-      throw new DevicesError('SIGNERS_NOT_EMPTY', 'this device already trusts signers — bootstrap refused');
-    }
-    const signers: Signer[] = [];
-    for (const d of devices.devices) {
-      if (d.revoked !== null) continue;
-      const pub = parseEd25519Pub(d.pubkey);
-      if (pub === null) throw new DevicesError('KEY_INVALID', `${d.id}: registered key is invalid`);
-      signers.push({ id: d.id, pubkey: pub.line });
+    const existing = await readSigners(l);
+    if (existing.length !== 0) {
+      const key = (x: Signer): string => `${x.id} ${x.pubkey}`;
+      const a = new Set(existing.map(key));
+      const b = new Set(signers.map(key));
+      if (a.size !== b.size || [...a].some((k) => !b.has(k))) {
+        throw new DevicesError('SIGNERS_NOT_EMPTY', 'this device already trusts a different set of signers — bootstrap refused');
+      }
+      return { added: ids, rootRevoked }; // same set: nothing to write
     }
     await writeAtomic(l.allowedSigners, renderAllowedSigners(signers));
-    return { added: signers.map((x) => x.id).sort() };
+    return { added: ids, rootRevoked };
   });
 }
 

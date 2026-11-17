@@ -21,7 +21,7 @@
 
 import { spawn } from 'node:child_process';
 import { createHash, randomBytes } from 'node:crypto';
-import { lstat, open, rm } from 'node:fs/promises';
+import { link, lstat, open, rm } from 'node:fs/promises';
 import nodePath from 'node:path';
 import { ensurePrivateDir, openPrivate, renameRetry, resolveTrustedExecutable, TrustError } from '@agent-ledger/shared';
 import { sshCandidates } from './gitx.ts';
@@ -241,8 +241,10 @@ export async function scanHostKeys(host: string, port: number, opts: ScanOptions
 /* ---------------- pin ---------------- */
 
 /** Strict `known_hosts` reader: every non-empty line must be `<token> <type> <base64>` with a valid blob.
- *  Returns `[token, type, b64]` triples; anything else (hashed hosts, markers, comments, wildcards) is CORRUPT:
- *  this file is written only by `pinHostKey`, so a foreign line means somebody else touched it. */
+ *  Returns `[token, type, b64]` triples with the token LOWERCASED (ssh matches host names case-insensitively, so
+ *  `Example.com` and `example.com` are ONE host: both lines is CORRUPT, and a pin always finds the existing
+ *  row); anything else (hashed hosts, markers, comments, wildcards) is CORRUPT: this file is written only by
+ *  `pinHostKey`, so a foreign line means somebody else touched it. */
 function parsePinFile(text: string): [string, HostKeyType, string][] {
   const rows: [string, HostKeyType, string][] = [];
   const seen = new Set<string>();
@@ -250,9 +252,10 @@ function parsePinFile(text: string): [string, HostKeyType, string][] {
     if (l === '') continue;
     const parts = l.split(' ');
     const k = parts.length === 3 && /^[A-Za-z0-9[\].:-]{1,300}$/.test(parts[0] as string) ? parseKeyPart(parts[1] as string, parts[2] as string) : null;
-    if (k === null || seen.has(parts[0] as string)) throw new HostKeyError('CORRUPT', 'known_hosts has an unexpected line');
-    seen.add(parts[0] as string);
-    rows.push([parts[0] as string, k.type, k.b64]);
+    const token = (parts[0] as string).toLowerCase();
+    if (k === null || seen.has(token)) throw new HostKeyError('CORRUPT', 'known_hosts has an unexpected line');
+    seen.add(token);
+    rows.push([token, k.type, k.b64]);
   }
   return rows;
 }
@@ -308,7 +311,8 @@ export interface PinResult {
   fingerprint: string;
 }
 
-/** Pin ONE host key into `<syncDir>/known_hosts` (private dir 0700, file 0600, tmp + fsync + rename). `line` is
+/** Pin ONE host key into `<syncDir>/known_hosts` (private dir 0700, file 0600; first creation = tmp + fsync + `link`
+ *  with a re-read on EEXIST, later changes = tmp + fsync + rename). `line` is
  *  `[<host>] <type> <base64>` of a key the HUMAN confirmed; the stored token is always recomputed here from
  *  `host`/`port` (plain host for 22, `[host]:port` otherwise), so a caller cannot pin under another name.
  *  One line per host: a DIFFERENT key already pinned for that host is refused (`REPIN_REFUSED`) unless
@@ -335,34 +339,92 @@ export async function pinHostKey(
     throw new HostKeyError('IO', 'cannot create the sync directory');
   }
   const path = nodePath.join(syncDir, 'known_hosts');
-  const text = await readPinFile(path);
-  const rows = text === null ? [] : parsePinFile(text);
-  const at = rows.findIndex((r) => r[0] === token);
-  if (at >= 0) {
-    const [, t, b] = rows[at] as [string, HostKeyType, string];
-    if (t === key.type && b === key.b64) return { written: false, fingerprint: key.fingerprint };
-    if (opts.repin !== true) throw new HostKeyError('REPIN_REFUSED', 'a different key is already pinned for this host');
-    rows[at] = [token, key.type, key.b64];
-  } else {
-    rows.push([token, key.type, key.b64]);
-  }
-  const out = `${rows.map((r) => r.join(' ')).join('\n')}\n`;
-  if (Buffer.byteLength(out, 'utf8') > KNOWN_HOSTS_MAX_BYTES) throw new HostKeyError('CORRUPT', 'known_hosts would exceed its size cap');
-  const tmp = `${path}.${String(process.pid)}.${randomBytes(6).toString('hex')}.tmp`;
-  try {
-    const h = await openPrivate(tmp, 'excl', 0o600);
+  return withPinLock(syncDir, () => pinLocked(syncDir, path, token, key, opts));
+}
+
+/** Short lock (`known_hosts.lock`, created with `link`, bounded wait, stale after 30 s by mtime distance) so two
+ *  pinners cannot lose each other's rows (read-modify-write). Residual: a crash inside the critical section leaves
+ *  the lock until it ages out; the file itself is never torn (tmp + rename). */
+async function withPinLock<T>(syncDir: string, fn: () => Promise<T>): Promise<T> {
+  const lock = nodePath.join(syncDir, 'known_hosts.lock');
+  const t0 = Date.now();
+  for (;;) {
+    const tmp = `${lock}.${String(process.pid)}.${randomBytes(6).toString('hex')}.tmp`;
     try {
-      await h.writeFile(out);
-      await h.sync();
-    } finally {
+      const h = await openPrivate(tmp, 'excl', 0o600);
       await h.close();
+      await link(tmp, lock);
+      await rm(tmp, { force: true }).catch(() => undefined);
+      break;
+    } catch (err) {
+      await rm(tmp, { force: true }).catch(() => undefined);
+      if (err instanceof TrustError) throw new HostKeyError('UNSAFE', 'sync directory failed the ownership check');
+      if ((err as NodeJS.ErrnoException).code !== 'EEXIST') throw new HostKeyError('IO', 'cannot lock known_hosts');
     }
-    await renameRetry(tmp, path);
-  } catch (err) {
-    await rm(tmp, { force: true }).catch(() => undefined);
-    if (err instanceof TrustError) throw new HostKeyError('UNSAFE', 'sync directory failed the ownership check');
-    throw new HostKeyError('IO', 'cannot write known_hosts');
+    const st = await lstat(lock).catch(() => null);
+    if (st !== null && Math.abs(Date.now() - st.mtimeMs) > 30_000) await rm(lock, { force: true }).catch(() => undefined);
+    else if (Date.now() - t0 > 5_000) throw new HostKeyError('IO', 'known_hosts is being changed by another process');
+    await new Promise((r) => setTimeout(r, 10 + Math.floor(Math.random() * 20)));
   }
-  await fsyncDir(syncDir);
-  return { written: true, fingerprint: key.fingerprint };
+  try {
+    return await fn();
+  } finally {
+    await rm(lock, { force: true }).catch(() => undefined);
+  }
+}
+
+async function pinLocked(
+  syncDir: string,
+  path: string,
+  token: string,
+  key: { type: HostKeyType; b64: string; fingerprint: string },
+  opts: { repin?: boolean },
+): Promise<PinResult> {
+  // First creation is `link` (create-if-absent with complete content): a racing first creator can never be
+  // replaced; the loser re-reads and decides against what the winner wrote. Later updates replace by rename.
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    const text = await readPinFile(path);
+    const rows = text === null ? [] : parsePinFile(text);
+    const at = rows.findIndex((r) => r[0] === token);
+    if (at >= 0) {
+      const [, t, b] = rows[at] as [string, HostKeyType, string];
+      if (t === key.type && b === key.b64) return { written: false, fingerprint: key.fingerprint };
+      if (opts.repin !== true) throw new HostKeyError('REPIN_REFUSED', 'a different key is already pinned for this host');
+      rows[at] = [token, key.type, key.b64];
+    } else {
+      rows.push([token, key.type, key.b64]);
+    }
+    const out = `${rows.map((r) => r.join(' ')).join('\n')}\n`;
+    if (Buffer.byteLength(out, 'utf8') > KNOWN_HOSTS_MAX_BYTES) throw new HostKeyError('CORRUPT', 'known_hosts would exceed its size cap');
+    const tmp = `${path}.${String(process.pid)}.${randomBytes(6).toString('hex')}.tmp`;
+    let raced = false;
+    try {
+      const h = await openPrivate(tmp, 'excl', 0o600);
+      try {
+        await h.writeFile(out);
+        await h.sync();
+      } finally {
+        await h.close();
+      }
+      if (text === null) {
+        try {
+          await link(tmp, path);
+        } catch (err) {
+          if ((err as NodeJS.ErrnoException).code !== 'EEXIST') throw err;
+          raced = true;
+        }
+      } else {
+        await renameRetry(tmp, path);
+      }
+    } catch (err) {
+      if (err instanceof TrustError) throw new HostKeyError('UNSAFE', 'sync directory failed the ownership check');
+      throw new HostKeyError('IO', 'cannot write known_hosts');
+    } finally {
+      await rm(tmp, { force: true }).catch(() => undefined);
+    }
+    if (raced) continue;
+    await fsyncDir(syncDir);
+    return { written: true, fingerprint: key.fingerprint };
+  }
+  throw new HostKeyError('IO', 'known_hosts is being changed by another process');
 }

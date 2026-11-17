@@ -5,7 +5,8 @@
   "exports": {
     ".": "./src/index.ts",
     "./test-helpers": "./src/test-helpers.ts",
-    "./git": "./src/git.ts"
+    "./git": "./src/git.ts",
+    "./sync-enrol": "./src/sync/enrol.ts"
   },
   "dependencies": {
     "@hono/node-server": "^1.19.5",

@@ -18,7 +18,7 @@
  */
 
 import { randomBytes } from 'node:crypto';
-import { link, lstat, mkdir, open, readdir, rename, rm } from 'node:fs/promises';
+import { link, lstat, mkdir, open, readdir, rm } from 'node:fs/promises';
 import nodePath from 'node:path';
 import { ensurePrivateDir, openPrivate, renameRetry, TrustError } from '@agent-ledger/shared';
 import { parse as parseYaml } from 'yaml';
@@ -429,7 +429,7 @@ async function writeDurable(path: string, text: string): Promise<void> {
   }
 }
 
-const TMP_LEFTOVER_RE = /^(?:state|inflight|enrol)\.json\.\d+\.[0-9a-f]{12}\.tmp$/;
+const TMP_LEFTOVER_RE = /^(?:(?:state|inflight|enrol)\.json|enrol\.lock)\.\d+\.[0-9a-f]{12}\.tmp$/;
 const TMP_STALE_MS = 10 * 60_000;
 
 async function sweepTmp(dir: string): Promise<void> {
@@ -641,7 +641,11 @@ const enrolSchema = z.strictObject({
   remote: syncConfigSchema.shape.remote,
   F0: sha.optional(),
 });
+/** What is ON DISK (read side). */
 export type EnrolMarker = z.infer<typeof enrolSchema>;
+/** What a caller may hand to `writeEnrolMarker`: no `pid` (AL-61: the owner pid is `process.pid`, supplied here, never by the caller). */
+const enrolInputSchema = enrolSchema.omit({ pid: true });
+export type EnrolMarkerInput = z.infer<typeof enrolInputSchema>;
 
 function parseEnrol(text: string): EnrolMarker {
   let raw: unknown;
@@ -669,9 +673,11 @@ function pidAlive(pid: number): boolean {
 }
 
 export interface EnrolOptions {
-  /** Test seams. */
+  /** Test seams (never from env / argv). */
   now?: () => number;
   pidAlive?: (pid: number) => boolean;
+  /** TEST seam: stands in for `process.pid` so one process can play two owners. Production never sets it. */
+  selfPid?: number;
 }
 
 /** `null` = no marker. Present but invalid / oversize / unsafe THROWS (fail closed: the hub stays down). */
@@ -687,8 +693,8 @@ function takeoverAllowed(m: EnrolMarker, o: EnrolOptions): boolean {
   return !(o.pidAlive ?? pidAlive)(m.pid);
 }
 
-/** `link(tmp, path)` = atomic create-if-absent with complete content (never a torn marker). */
-async function createExclusive(path: string, text: string): Promise<void> {
+/** `link(tmp, path)` = atomic create-if-absent with complete content (never a torn file). */
+async function createExclusive(path: string, text: string, what = 'enrolment marker'): Promise<void> {
   const tmp = `${path}.${String(process.pid)}.${randomBytes(6).toString('hex')}.tmp`;
   try {
     const h = await openPrivate(tmp, 'excl', 0o600);
@@ -701,13 +707,13 @@ async function createExclusive(path: string, text: string): Promise<void> {
     try {
       await link(tmp, path);
     } catch (err) {
-      if (isErrno(err, 'EEXIST')) throw new StateError('BUSY', 'an enrolment marker already exists');
-      throw new StateError('IO', 'cannot create the enrolment marker');
+      if (isErrno(err, 'EEXIST')) throw new StateError('BUSY', `an ${what} already exists`);
+      throw new StateError('IO', `cannot create the ${what}`);
     }
   } catch (err) {
     if (err instanceof StateError) throw err;
     if (err instanceof TrustError) throw new StateError('UNSAFE', 'sync directory failed the ownership check');
-    throw new StateError('IO', 'cannot write the enrolment marker');
+    throw new StateError('IO', `cannot write the ${what}`);
   } finally {
     await rm(tmp, { force: true }).catch(() => undefined);
   }
@@ -718,70 +724,106 @@ async function createExclusive(path: string, text: string): Promise<void> {
   }
 }
 
-/** Move a stale marker out of the way. `rename` is atomic, so of two simultaneous takers one gets
- *  ENOENT. What was moved must be the exact marker we judged stale; otherwise (someone created a
- *  fresh one in between) put it back and report BUSY. */
-async function removeStale(path: string, judged: EnrolMarker): Promise<void> {
-  const aside = `${path}.stale.${String(process.pid)}.${randomBytes(6).toString('hex')}`;
-  try {
-    await rename(path, aside);
-  } catch (err) {
-    if (isErrno(err, 'ENOENT')) return;
-    throw new StateError('IO', 'cannot take over the enrolment marker');
+/* ---- short lock around read + judge + replace of the marker (AL-61) ---- */
+
+export const ENROL_LOCK_FILE = 'enrol.lock';
+const ENROL_LOCK_WAIT_MS = 3_000;
+const ENROL_LOCK_DEAD_HOLDER_MS = 2_000;
+const ENROL_LOCK_ABANDONED_MS = 30_000;
+
+/** The lock critical section is two small file operations. Content `<pid> <ms> <rand>`; created with `link`
+ *  (complete content or nothing). A holder that is dead (pid gone) for > 2 s, or any lock older than 30 s
+ *  (distance: clocks jump), is stale: removed only when its content is still exactly what we judged.
+ *  Residual (same as `device.lock`, AL-16): two takers judging the SAME stale lock at the same instant need a
+ *  crash plus exact timing; the marker swap itself stays a `rename`, so the worst case is one lost stage
+ *  advance, never an empty path or a torn marker. Bounded wait on a monotonic clock, then `BUSY`. */
+async function withEnrolLock<T>(ledgerDir: string, o: EnrolOptions, fn: () => Promise<T>): Promise<T> {
+  const lockPath = nodePath.join(ledgerDir, SYNC_DIR, ENROL_LOCK_FILE);
+  const self = o.selfPid ?? process.pid;
+  const token = `${String(self)} ${String((o.now ?? Date.now)())} ${randomBytes(8).toString('hex')}\n`;
+  const t0 = process.hrtime.bigint();
+  for (;;) {
+    try {
+      await createExclusive(lockPath, token, 'enrolment lock');
+      break;
+    } catch (err) {
+      if (!(err instanceof StateError) || err.code !== 'BUSY') throw err;
+    }
+    const first = await readCapped(lockPath, 256).catch(() => '');
+    if (first !== null) {
+      const st = await lstat(lockPath).catch(() => null);
+      const age = st === null ? 0 : Math.abs((o.now ?? Date.now)() - st.mtimeMs);
+      const pid = /^(\d{1,10}) /.exec(first)?.[1];
+      const dead = pid === undefined || !(o.pidAlive ?? pidAlive)(Number(pid));
+      if (st !== null && ((dead && age > ENROL_LOCK_DEAD_HOLDER_MS) || age > ENROL_LOCK_ABANDONED_MS)) {
+        if ((await readCapped(lockPath, 256).catch(() => null)) === first) await rm(lockPath, { force: true }).catch(() => undefined);
+        continue;
+      }
+    }
+    if (Number(process.hrtime.bigint() - t0) / 1e6 > ENROL_LOCK_WAIT_MS) throw new StateError('BUSY', 'an enrolment is being updated by another process');
+    await new Promise((r) => setTimeout(r, 15 + Math.floor(Math.random() * 25)));
   }
   try {
-    const moved = parseEnrol((await readCapped(aside, MAX_ENROL_BYTES)) ?? '');
-    if (moved.pid !== judged.pid || moved.startedAt !== judged.startedAt || moved.kind !== judged.kind) {
-      await link(aside, path).catch(() => undefined);
-      throw new StateError('BUSY', 'an enrolment marker is held by another process');
-    }
-  } catch (err) {
-    if (err instanceof StateError && err.code === 'BUSY') throw err;
-    // the moved file was unreadable now: it is not what we judged, put it back untouched
-    await link(aside, path).catch(() => undefined);
-    throw new StateError('BUSY', 'an enrolment marker is held by another process');
+    return await fn();
   } finally {
-    await rm(aside, { force: true }).catch(() => undefined);
+    // only OUR lock (a takeover after a very long stall must not delete the new holder's)
+    if ((await readCapped(lockPath, 256).catch(() => null)) === token) await rm(lockPath, { force: true }).catch(() => undefined);
   }
 }
 
-/** Create or advance the marker. No marker: created atomically and exclusively. Same pid and kind
- *  (stage advance): replaced atomically. Marker of a dead pid, or older than 24 h: taken over. Anything
- *  else (live foreign owner, other kind of the same live pid) THROWS `StateError('BUSY')`; a corrupt
- *  marker throws `CORRUPT` (clear it with `clearEnrolMarker(dir, { force: true })`). The input is
- *  validated first (strict, 4 KB): nothing invalid ever reaches the disk. */
-export async function writeEnrolMarker(ledgerDir: string, marker: EnrolMarker, opts: EnrolOptions = {}): Promise<void> {
-  const res = enrolSchema.safeParse(marker);
-  if (!res.success) throw new StateError('INVALID', 'refusing to write an invalid enrolment marker');
-  const text = JSON.stringify(res.data);
+/** Create or advance the marker (AL-61: read + judge + replace happen under `enrol.lock`; the owner pid is
+ *  ALWAYS `process.pid`, the input schema has no `pid`). No marker: created atomically and exclusively. Same
+ *  pid and kind (stage advance), or a dead owner, or a marker older than 24 h: replaced by `rename(tmp, path)`,
+ *  so the path is never empty and nothing is moved aside. A live foreign owner (or the same live pid with
+ *  another kind) THROWS `StateError('BUSY')`; a corrupt marker throws `CORRUPT` (clear it with
+ *  `clearEnrolMarker(dir, { force: true })`). The input is validated first (strict, 4 KB). */
+export async function writeEnrolMarker(ledgerDir: string, marker: EnrolMarkerInput, opts: EnrolOptions = {}): Promise<void> {
+  const parsed = enrolInputSchema.safeParse(marker);
+  if (!parsed.success) throw new StateError('INVALID', 'refusing to write an invalid enrolment marker');
+  const self = opts.selfPid ?? process.pid;
+  const full: EnrolMarker = { ...parsed.data, pid: self };
+  const check = enrolSchema.safeParse(full);
+  if (!check.success) throw new StateError('INVALID', 'refusing to write an invalid enrolment marker');
+  const text = JSON.stringify(check.data);
   if (Buffer.byteLength(text, 'utf8') > MAX_ENROL_BYTES) throw new StateError('INVALID', 'refusing to write an oversize enrolment marker');
   await ensureLedgerHub(ledgerDir, true);
   const path = enrolPath(ledgerDir);
-  const existing = await readEnrolMarker(ledgerDir);
-  if (existing === null) return createExclusive(path, text);
-  if (existing.pid === res.data.pid && existing.kind === res.data.kind) return writeDurable(path, text);
-  if (!takeoverAllowed(existing, opts)) throw new StateError('BUSY', 'an enrolment is already in progress');
-  await removeStale(path, existing);
-  return createExclusive(path, text);
+  await withEnrolLock(ledgerDir, opts, async () => {
+    const existing = await readEnrolMarker(ledgerDir);
+    if (existing === null) return createExclusive(path, text);
+    if (!(existing.pid === self && existing.kind === full.kind) && !takeoverAllowed(existing, opts)) {
+      throw new StateError('BUSY', 'an enrolment is already in progress');
+    }
+    return writeDurable(path, text); // rename(tmp, path): atomic replace, the path is never empty
+  });
 }
 
-/** Remove the marker. No marker = no-op. Allowed for the owner (same pid) and for a takeover-eligible
- *  marker; a live foreign marker THROWS `BUSY`. `force: true` (the human `--abort`) removes whatever is
- *  there, a corrupt marker included: it only ever unlinks the marker path itself. */
+/** Remove the marker. No marker (ENOENT) = no-op; any other stat failure is an `IO` error, never "absent".
+ *  Allowed for the owner (same pid) and for a takeover-eligible marker; a live foreign marker THROWS `BUSY`.
+ *  `force: true` (the human `--abort`) removes whatever is there, a corrupt marker included: it only ever
+ *  unlinks the marker path itself. Judge + unlink run under `enrol.lock`. */
 export async function clearEnrolMarker(ledgerDir: string, opts: EnrolOptions & { force?: boolean } = {}): Promise<void> {
   const path = enrolPath(ledgerDir);
-  if ((await lstat(path).catch(() => null)) === null) return;
-  if (opts.force !== true) {
-    const existing = await readEnrolMarker(ledgerDir);
-    if (existing === null) return;
-    if (existing.pid !== process.pid && !takeoverAllowed(existing, opts)) {
-      throw new StateError('BUSY', 'an enrolment is in progress in another process');
-    }
-  }
   try {
-    await rm(path, { force: true });
-    await fsyncDir(nodePath.dirname(path));
-  } catch {
-    throw new StateError('IO', 'cannot remove the enrolment marker');
+    await lstat(path);
+  } catch (err) {
+    if (isErrno(err, 'ENOENT')) return;
+    throw new StateError('IO', 'cannot inspect the enrolment marker');
   }
+  const self = opts.selfPid ?? process.pid;
+  await withEnrolLock(ledgerDir, opts, async () => {
+    if (opts.force !== true) {
+      const existing = await readEnrolMarker(ledgerDir);
+      if (existing === null) return;
+      if (existing.pid !== self && !takeoverAllowed(existing, opts)) {
+        throw new StateError('BUSY', 'an enrolment is in progress in another process');
+      }
+    }
+    try {
+      await rm(path, { force: true }); // force: ENOENT only (vanished) is fine
+      await fsyncDir(nodePath.dirname(path));
+    } catch {
+      throw new StateError('IO', 'cannot remove the enrolment marker');
+    }
+  });
 }
