@@ -3,9 +3,11 @@
 
 import assert from 'node:assert/strict';
 import { createHash, randomBytes } from 'node:crypto';
+import { execFile } from 'node:child_process';
 import { chmod, mkdir, mkdtemp, readFile, readdir, rm, stat, symlink, utimes, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import test from 'node:test';
 import { parse as parseYaml } from 'yaml';
 import { DevicesError, acceptDevicesChange, parseAllowedSigners, renderDevicesYaml, type DevicesFile } from './devices.ts';
@@ -17,10 +19,12 @@ import {
   deviceLayout,
   initDevice,
   listDevices,
+  pruneRevokedSigners,
   readDevices,
   readSigners,
   rekeyLegacyDeviceId,
   revokeDevice,
+  withDeviceLock,
 } from './devicestore.ts';
 import { SLOT_LETTERS } from './snowflake.ts';
 import { parseEd25519Pub } from './sshkey.ts';
@@ -736,4 +740,192 @@ test('adoptSlot: joiner takes the registered label + slot; idempotent; refused w
   // a loose private key is refused before anything is adopted
   await chmod(lu.keyFile, 0o644);
   await assert.rejects(adoptSlot(used));
+});
+
+/* ---------------- B3a: exported lock (AL-23), AL-16 takeover, pruneRevokedSigners (AL-45) ---------------- */
+
+const lockFile = (dir: string): string => join(deviceLayout(dir).hubDir, 'device.lock');
+
+test('AL-23: withDeviceLock serialises in-process callers and releases the lock', { skip }, async (t) => {
+  const dir = await ledger(t);
+  const order: string[] = [];
+  const hold = (tag: string): Promise<void> =>
+    withDeviceLock(dir, async () => {
+      order.push(`in-${tag}`);
+      await new Promise((r) => setTimeout(r, 30));
+      order.push(`out-${tag}`);
+    });
+  await Promise.all([hold('a'), hold('b'), hold('c')]);
+  for (let i = 0; i < order.length; i += 2) assert.equal(order[i]?.slice(3), order[i + 1]?.slice(4), `interleaved: ${order.join(',')}`);
+  assert.ok(!(await readdir(deviceLayout(dir).hubDir)).some((n) => n.startsWith('device.lock')), 'lock + takeover mutex released');
+  // returns fn's value, propagates its error, still releases
+  assert.equal(await withDeviceLock(dir, async () => 7), 7);
+  await assert.rejects(withDeviceLock(dir, async () => { throw new Error('boom'); }), /boom/);
+  assert.equal(await withDeviceLock(dir, async () => 8, { waitMs: 0 }), 8);
+});
+
+test('AL-23: waitMs is honoured (LOCKED after ~waitMs, not the 10 s default); 0 and negative = no wait', { skip }, async (t) => {
+  const dir = await ledger(t);
+  await ensureLockDir(dir);
+  await writeFile(lockFile(dir), `${String(process.pid)} ${String(Date.now())} cafe\n`, { mode: 0o600 }); // live holder (us), fresh
+  const isLocked = (e: unknown): boolean => e instanceof DevicesError && e.code === 'LOCKED';
+  let t0 = Date.now();
+  await assert.rejects(withDeviceLock(dir, async () => 1, { waitMs: 200 }), isLocked);
+  let took = Date.now() - t0;
+  assert.ok(took >= 150 && took < 3000, `waited ${String(took)} ms`);
+  t0 = Date.now();
+  await assert.rejects(withDeviceLock(dir, async () => 1, { waitMs: 0 }), isLocked);
+  took = Date.now() - t0;
+  assert.ok(took < 1000, `waitMs 0 must not wait (${String(took)} ms)`);
+  t0 = Date.now();
+  await assert.rejects(withDeviceLock(dir, async () => 1, { waitMs: -5 }), isLocked); // negative = 0, never a long wait
+  assert.ok(Date.now() - t0 < 1000);
+  assert.match(await readFile(lockFile(dir), 'utf8'), /cafe/, 'the foreign lock was not deleted');
+});
+
+async function ensureLockDir(dir: string): Promise<void> {
+  await mkdir(deviceLayout(dir).hubDir, { recursive: true, mode: 0o700 });
+}
+
+const CHILD = `
+import { writeFile, readFile, rm } from 'node:fs/promises';
+const [mod, dir, startAt, n] = process.argv.slice(1);
+const { withDeviceLock } = await import(mod);
+while (Date.now() < Number(startAt)) await new Promise((r) => setTimeout(r, 1));
+let violations = 0;
+for (let i = 0; i < Number(n); i += 1) {
+  await withDeviceLock(dir, async () => {
+    let created = false;
+    try { await writeFile(dir + '/holder', String(process.pid), { flag: 'wx' }); created = true; } catch { violations += 1; }
+    const cur = Number(await readFile(dir + '/counter', 'utf8'));
+    await new Promise((r) => setTimeout(r, 2));
+    await writeFile(dir + '/counter', String(cur + 1));
+    if (created) await rm(dir + '/holder', { force: true });
+  }, { waitMs: 30000 });
+}
+console.log(JSON.stringify({ violations }));
+`;
+
+function runChild(mod: string, dir: string, startAt: number, n: number): Promise<{ violations: number }> {
+  return new Promise((resolve, reject) => {
+    execFile(process.execPath, ['--input-type=module', '-e', CHILD, mod, dir, String(startAt), String(n)], { timeout: 60_000 }, (err, stdout, stderr) => {
+      if (err !== null) reject(new Error(`child failed: ${stderr.slice(0, 500)}`));
+      else resolve(JSON.parse(stdout.trim().split('\n').pop() as string) as { violations: number });
+    });
+  });
+}
+
+test('AL-16: 8 processes race on one STALE lock: exactly one holder at a time, no lost update, no leftovers', { skip }, async (t) => {
+  const mod = pathToFileURL(fileURLToPath(new URL('./devicestore.ts', import.meta.url))).href;
+  const old = new Date(Date.now() - 60_000);
+  for (let round = 0; round < 3; round++) {
+    const dir = await ledger(t, `lk${String(round)}`);
+    await ensureLockDir(dir);
+    await writeFile(join(dir, 'counter'), '0');
+    const lock = lockFile(dir);
+    await writeFile(lock, round === 1 ? '' : '2147480000 1 deadbeef\n', { mode: 0o600 }); // dead holder / empty file
+    await utimes(lock, old, old);
+    const startAt = Date.now() + 1500;
+    const per = 3;
+    const out = await Promise.all(Array.from({ length: 8 }, () => runChild(mod, dir, startAt, per)));
+    assert.deepEqual(out.map((o) => o.violations), Array(8).fill(0), `round ${String(round)}: two holders at once`);
+    assert.equal(Number(await readFile(join(dir, 'counter'), 'utf8')), 8 * per, `round ${String(round)}: lost update`);
+    const left = (await readdir(deviceLayout(dir).hubDir)).filter((n) => n.startsWith('device.lock'));
+    assert.deepEqual(left, [], 'no lock or takeover mutex left behind');
+  }
+});
+
+test('AL-16: a takeover mutex held by someone else defers the takeover; a crashed (old) mutex is cleared and the stale lock then taken', { skip }, async (t) => {
+  const dir = await ledger(t);
+  await ensureLockDir(dir);
+  const lock = lockFile(dir);
+  const old = new Date(Date.now() - 60_000);
+  await writeFile(lock, '2147480000 1 deadbeef\n', { mode: 0o600 });
+  await utimes(lock, old, old);
+  await writeFile(`${lock}.takeover`, `${String(process.pid)} ${String(Date.now())} beef\n`, { mode: 0o600 }); // fresh = a live taker
+  await assert.rejects(withDeviceLock(dir, async () => 1, { waitMs: 150 }), (e: unknown) => e instanceof DevicesError && e.code === 'LOCKED');
+  assert.match(await readFile(lock, 'utf8'), /deadbeef/, 'stale lock untouched while another process takes it over');
+  // the taker crashed long ago: its mutex is cleared, then the stale lock is taken over
+  await utimes(`${lock}.takeover`, old, old);
+  assert.equal(await withDeviceLock(dir, async () => 'ok', { waitMs: 3000 }), 'ok');
+  assert.deepEqual((await readdir(deviceLayout(dir).hubDir)).filter((n) => n.startsWith('device.lock')), []);
+});
+
+test('AL-16: a fresh lock, or an old lock of a LIVE pid, is never removed by the takeover path', { skip }, async (t) => {
+  const dir = await ledger(t);
+  await ensureLockDir(dir);
+  const lock = lockFile(dir);
+  const old = new Date(Date.now() - 60_000);
+  // fresh LIVE lock (as if another process just won the takeover and created its lock): never removed
+  await writeFile(lock, `${String(process.pid)} ${String(Date.now())} fresh\n`, { mode: 0o600 });
+  await assert.rejects(withDeviceLock(dir, async () => 1, { waitMs: 100 }), (e: unknown) => e instanceof DevicesError && e.code === 'LOCKED');
+  assert.match(await readFile(lock, 'utf8'), /fresh/);
+  // an old but LIVE-pid lock is only abandoned after 5 min (recycled pid must not wedge, a live one must not be robbed early)
+  await utimes(lock, old, old);
+  await assert.rejects(withDeviceLock(dir, async () => 1, { waitMs: 100 }), (e: unknown) => e instanceof DevicesError && e.code === 'LOCKED');
+});
+
+test('AL-45: pruneRevokedSigners removes ONLY revoked signers, by id or key; never adds; idempotent; touches nothing when clean', { skip }, async (t) => {
+  const { dir, self, other } = await twoDevices(t);
+  const l = deviceLayout(dir);
+  assert.deepEqual(await pruneRevokedSigners(dir), { removed: [] }, 'nothing revoked');
+  await approveDevice(dir, other.id, fpOf(other.pub));
+  const before = await sha(l.allowedSigners);
+  assert.deepEqual(await pruneRevokedSigners(dir), { removed: [] });
+  assert.equal(await sha(l.allowedSigners), before, 'clean prune does not rewrite the file');
+  // the remote revocation lands in devices.yml (APPLY) but allowed_signers still trusts the key
+  const reg = (await readDevices(l)) as DevicesFile;
+  const o = reg.devices.find((d) => d.id === other.id);
+  assert.ok(o);
+  o.revoked = { at: '2026-11-17T08:00:00.000Z', by: self, reason: 'lost' };
+  await writeFile(l.devicesYml, renderDevicesYaml(reg), { mode: 0o600 });
+  assert.deepEqual((await readSigners(l)).map((x) => x.id).sort(), [self, other.id].sort());
+  assert.deepEqual(await pruneRevokedSigners(dir), { removed: [other.id] });
+  assert.deepEqual((await readSigners(l)).map((x) => x.id), [self]);
+  assert.equal(await mode(l.allowedSigners), 0o600);
+  assert.deepEqual(await pruneRevokedSigners(dir), { removed: [] }, 'idempotent');
+  // never adds: an ACTIVE registered device that was never approved stays unapproved
+  const third = await otherDevice(t);
+  const reg2 = (await readDevices(l)) as DevicesFile;
+  reg2.devices.push({ id: third.id, label: 'x', slot: 'X', pubkey: third.pub, added: '2026-11-17T08:00:00.000Z', added_by: self, revoked: null, role: 'owner' });
+  await writeFile(l.devicesYml, renderDevicesYaml(reg2), { mode: 0o600 });
+  await pruneRevokedSigners(dir);
+  assert.deepEqual((await readSigners(l)).map((x) => x.id), [self]);
+  // no devices.yml / no allowed_signers: removes nothing, creates nothing
+  const bare = await ledger(t, 'bare');
+  assert.deepEqual(await pruneRevokedSigners(bare), { removed: [] });
+  assert.ok(!(await readdir(bare)).includes('.hub'), 'no files created');
+});
+
+test('AL-45: pruneRevokedSigners fails closed on an invalid devices.yml / allowed_signers (throws, signers untouched)', { skip }, async (t) => {
+  const { dir, other, self } = await twoDevices(t);
+  const l = deviceLayout(dir);
+  await approveDevice(dir, other.id, fpOf(other.pub));
+  const before = await readFile(l.allowedSigners, 'utf8');
+  await writeFile(l.devicesYml, '{{{ not yaml', { mode: 0o600 });
+  await assert.rejects(pruneRevokedSigners(dir));
+  assert.equal(await readFile(l.allowedSigners, 'utf8'), before);
+  void self;
+});
+
+test('AL-45: approve racing prune (both under the device lock) never resurrects a revoked key', { skip }, async (t) => {
+  for (let round = 0; round < 6; round++) {
+    const { dir, self, other } = await twoDevices(t);
+    const l = deviceLayout(dir);
+    const reg = (await readDevices(l)) as DevicesFile;
+    const o = reg.devices.find((d) => d.id === other.id);
+    assert.ok(o);
+    o.revoked = { at: '2026-11-17T08:00:00.000Z', by: self, reason: 'lost' };
+    await writeFile(l.devicesYml, renderDevicesYaml(reg), { mode: 0o600 });
+    const jobs = [
+      approveDevice(dir, other.id, fpOf(other.pub)),
+      withDeviceLock(dir, () => pruneRevokedSigners(dir)),
+      approveDevice(dir, other.id, fpOf(other.pub)),
+      withDeviceLock(dir, () => pruneRevokedSigners(dir)),
+    ];
+    if (round % 2 === 1) jobs.reverse();
+    const res = await Promise.allSettled(jobs);
+    for (const r of res) if (r.status === 'rejected') assert.ok(r.reason instanceof DevicesError && r.reason.code === 'REVOKED', `round ${String(round)}: ${String(r.reason)}`);
+    assert.equal((await readSigners(l)).some((x) => x.id === other.id), false, `round ${String(round)}: revoked key trusted`);
+  }
 });

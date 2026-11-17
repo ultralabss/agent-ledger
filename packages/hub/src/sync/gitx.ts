@@ -376,6 +376,9 @@ const HARDENING_CONFIG: readonly string[] = [
   'gc.auto=0',
   'gc.autoDetach=false',
   'maintenance.auto=false',
+  // Durability of objects/refs/index written by sync (crash-safe APPLY). git >= 2.36 honours it;
+  // older versions ignore an unknown value of the key. Verified only by argv test (UNVERIFIED per version).
+  'core.fsync=all',
 ];
 
 function killGroup(pid: number | undefined, fallback: () => void): void {

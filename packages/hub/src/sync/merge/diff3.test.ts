@@ -57,3 +57,27 @@ test('mergeText: huge middle falls back to one hunk instead of exploding', () =>
   const r = mergeText(big.join('\n'), a, b, true);
   assert.equal(r.conflict, true);
 });
+
+test('AL-27: 200 000-line inputs merge without a spread RangeError', () => {
+  const n = 200_000;
+  const base = Array.from({ length: n }, (_, i) => `l${i}`);
+  const ours = base.slice();
+  ours[10] = 'OURS';
+  const theirs = base.slice();
+  theirs[n - 10] = 'THEIRS';
+  const clean = mergeText(base.join('\n'), ours.join('\n'), theirs.join('\n'), true);
+  assert.equal(clean.conflict, false);
+  const lines = clean.text.split('\n');
+  assert.equal(lines.length, n);
+  assert.equal(lines[10], 'OURS');
+  assert.equal(lines[n - 10], 'THEIRS');
+  // insertion of a huge block on one side + a conflicting edit: still a verdict, never a throw
+  const big = Array.from({ length: n }, (_, i) => `x${i}`);
+  const r = mergeText('a\nb', `a\n${big.join('\n')}\nb`, 'a\nT\nb', true);
+  assert.equal(r.conflict, true);
+  assert.ok(r.text.includes('x199999'));
+  // an all-different middle of 200 000 lines (one-hunk fallback) conflicts, loser block returned
+  const x = mergeText(base.join('\n'), big.join('\n'), base.map((l) => `${l}t`).join('\n'), true);
+  assert.equal(x.conflict, true);
+  assert.equal(x.loserBlocks.length, 1);
+});

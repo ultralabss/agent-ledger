@@ -293,6 +293,7 @@ test('spawned child sees a scrubbed env, fixed -c hardening before the subcomman
       'transfer.fsckObjects=true',
       'gc.auto=0',
       'core.fsmonitor=false',
+      'core.fsync=all',
     ]) {
       assert.ok(cfg.includes(want), `missing -c ${want}`);
     }

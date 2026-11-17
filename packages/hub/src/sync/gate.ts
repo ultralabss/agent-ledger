@@ -15,9 +15,18 @@
  *   5. valid signature, key revoked in any parent                        -> Q  (both modes)
  *      valid signature, key revoked in `currentDevices` (local tip)      -> Q  `revoked-current`
  *   6. valid signature, committer-email device id != signer              -> Q  (S19)
- *   7. counters/<x>.yml of another device / item id with another slot    -> Q  (S18)
+ *   7. counters/<x>.yml of another device / item id with another slot    -> Q  (S18);
+ *      no owner at all (unsigned, no device e-mail) + any counters change or item
+ *      creation                                                           -> Q  `unowned` (AL-43)
+ *      merge commit adding an item absent from BOTH parents               -> Q  `merge-item-new` (AL-43)
  *   8. signer rows: trusted+active / registered-unapproved / unknown key / unsigned
  *      (with the OQ-4 ratchet) x devices.yml change, warn vs enforce.
+ *
+ *  D2 (B3a): a root revocation is accepted only when EVERY newly revoked root id has a
+ *  confirmation bound to (this commit sha, that id) in `confirmedRevocations`
+ *  (`confirmationKey`); a revocation of THIS device is never accepted from a peer (the cycle
+ *  turns a confirmed one into `detached`). `currentDevices` and `confirmedRevocations` are
+ *  required inputs: a caller that forgets them gets a quarantine / no confirmation, never a skip.
  *
  *  Deviation from a literal reading of the matrix (see the B2 report): the soft
  *  item-delete row and the counters/slot row are evaluated as conditions on top of the
@@ -37,10 +46,20 @@ import {
 import { mergeDevicesNullable } from './merge/devices.ts';
 import { mergeCounters } from './merge/files.ts';
 import type { SyncNote } from './merge/types.ts';
+import { confirmationKey } from './state.ts';
 
 export type VerifyMode = 'warn' | 'enforce';
 export type GateAction = 'accept' | 'accept-warn' | 'forced-merge-keep-items' | 'quarantine' | 'halt';
 export type HaltReason = 'quarantine:revocation-root' | 'quarantine:revocation-self';
+
+/** Why a halt waits for a human (D2): stored as `HaltState.d2` by the cycle. */
+export interface GateD2 {
+  kind: 'root' | 'self';
+  /** The commit that carries the revocation. */
+  commit: string;
+  /** Root: the newly revoked ROOT ids still to confirm. Self: this device. */
+  deviceIds: string[];
+}
 
 export interface GateSignature {
   valid: boolean;
@@ -62,6 +81,11 @@ export interface GateMergeInput {
   parentCounters: readonly [ReadonlyMap<string, string>, ReadonlyMap<string, string>];
   /** `counters/<id>.yml` texts of the merge commit itself. */
   mergedCounters: ReadonlyMap<string, string>;
+  /** Paths the merge commit ADDS relative to BOTH parents (absent from each of them), i.e. files
+   *  the merger invented. An item among them is quarantined (`merge-item-new`): items only ever
+   *  come from a signed ordinary commit. Required: a caller that cannot compute it must not pass
+   *  a merge commit through (missing = `merge-input-missing`). */
+  addedVsBoth: readonly string[];
 }
 
 export interface GateInput {
@@ -87,9 +111,14 @@ export interface GateInput {
   /** `devices.yml` text at the local tip / last accepted commit (`null` = no registry
    *  there). A valid signature by a key revoked HERE is quarantined (`revoked-current`) in
    *  both modes even when the commit's parents predate the revocation (stolen-key fork).
-   *  `undefined` = not provided: the check is skipped (callers MUST provide it; kept
-   *  optional only so existing call sites stay valid). Present but unparseable -> Q. */
-  currentDevices?: string | null;
+   *  REQUIRED (AL-46): not a string / `null` (e.g. `undefined`) -> quarantine `malformed-input`,
+   *  never a skipped check. Present but unparseable -> Q. */
+  currentDevices: string | null;
+  /** `confirmationKey(sha, deviceId)` of every D2 revocation a human has confirmed (fingerprint
+   *  already checked by the caller). Bound to (commit, id): confirming one revocation never
+   *  confirms another commit or id. Only ROOT revocations can be confirmed into `accept`; a
+   *  revocation of this device always halts. */
+  confirmedRevocations: ReadonlySet<string>;
   /** Paths changed by this commit against its first parent. */
   changes: readonly GateChange[];
   /** `validateIncoming` result for this commit's changes. */
@@ -101,6 +130,8 @@ export interface GateInput {
 export interface GateVerdict {
   action: GateAction;
   haltReason?: HaltReason;
+  /** Set with `halt`: what the human must confirm. */
+  d2?: GateD2;
   /** Machine token of the deciding rule (`ok`, `ingress:symlink`, `revoked-signer`, …). */
   rule: string;
   notes: SyncNote[];
@@ -111,6 +142,7 @@ const ITEM_FILE_RE = /^[a-z0-9-]+\/items\/([A-Z]{2,4}-[A-HJ-NP-Z]?[1-9][0-9]*)\.
 const DEVICE_ID_RE = /^d_[a-z2-7]{10}$/;
 const EMAIL_RE = /^(d_[a-z2-7]{10})@devices\.agent-ledger\.invalid$/;
 const MAX_NOTES = 20;
+const SHA_RE = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/;
 
 /** Committer e-mail -> claimed device id (`<device_id>@devices.agent-ledger.invalid`). */
 export function claimedDeviceFromEmail(email: unknown): string | null {
@@ -161,6 +193,7 @@ function normCounters(text: string | undefined): string | null {
 function mergeProblem(input: GateInput): string | null {
   const m = input.merge;
   if (m === undefined) return 'merge-input-missing';
+  if (!Array.isArray(m.addedVsBoth)) return 'merge-input-missing';
   const [p1, p2] = input.parentDevices as readonly [string | null, string | null];
   const exp = mergeDevicesNullable(m.baseDevices, p1, p2);
   if (!exp.ok) return 'merge-devices';
@@ -176,6 +209,11 @@ function mergeProblem(input: GateInput): string | null {
     }
     const got = m.mergedCounters.has(path) ? normCounters(m.mergedCounters.get(path)) : null;
     if (got === null || got !== normCounters(want)) return 'merge-counters';
+  }
+  // AL-43: the merge commit may not invent an item (absent from both parents)
+  for (const path of m.addedVsBoth) {
+    if (typeof path !== 'string') return 'merge-input-missing';
+    if (ITEM_FILE_RE.test(path)) return 'merge-item-new';
   }
   return null;
 }
@@ -198,6 +236,11 @@ export function gateCommit(input: GateInput): GateVerdict {
     if (parents === null || !Array.isArray(input.changes) || input.ingress === null || typeof input.ingress !== 'object' || !Array.isArray(input.ingress.rejected)) {
       return quarantine('malformed-input', 'gate input malformed');
     }
+    // AL-46: no silent skip of the stolen-key check, and a D2 halt needs a real commit id to bind to
+    if (input.currentDevices !== null && typeof input.currentDevices !== 'string') {
+      return quarantine('malformed-input', 'currentDevices is required (string or null)');
+    }
+    if (typeof input.sha !== 'string' || !SHA_RE.test(input.sha)) return quarantine('malformed-input', 'commit sha malformed');
     if (parents.length > 2) return quarantine('merge-octopus', 'merge commit with more than two parents');
 
     /* rows 1-3: content */
@@ -235,7 +278,7 @@ export function gateCommit(input: GateInput): GateVerdict {
     /* rows 5-6 */
     const signer = signerStatus(input.signature, parsedParents, input.trusted);
     if (signer.status === 'revoked') return quarantine('revoked-signer', 'commit signed by a key revoked in a parent');
-    if (signer.pub !== null && input.currentDevices !== undefined && input.currentDevices !== null) {
+    if (signer.pub !== null && input.currentDevices !== null) {
       const cur = parseOrNull(input.currentDevices);
       if (cur === null) return quarantine('revoked-current', 'current devices.yml is invalid, signer cannot be checked');
       if (cur.devices.some((d) => d.revoked !== null && canonKey(d.pubkey) === signer.pub)) {
@@ -247,24 +290,33 @@ export function gateCommit(input: GateInput): GateVerdict {
       return quarantine('email-mismatch', 'committer e-mail names a different device than the signing key');
     }
 
-    /* row 7: ownership (merge commits are covered by the per-key max rule) */
+    /* row 7: ownership (merge commits are covered by the per-key max rule + `merge-item-new`) */
     if (!isMerge) {
       const owner = signer.entry ?? (claimed === null ? null : (parsedParents[0]?.devices.find((d) => d.id === claimed) ?? null));
-      if (owner !== null) {
-        for (const c of input.changes) {
-          const m = typeof c?.path === 'string' ? COUNTER_RE.exec(c.path) : null;
-          if (m !== null && m[1] !== owner.id) return quarantine('counters-foreign', `counter file of ${m[1]} changed by ${owner.id}`);
-          const im = typeof c?.path === 'string' ? ITEM_FILE_RE.exec(c.path) : null;
-          if (im !== null && c.status !== 'M' && c.status !== 'D') {
-            const slot = parseItemId(im[1] as string)?.slot;
-            if (slot !== owner.slot) return quarantine('item-slot', `item ${im[1]} created by ${owner.id} carries another device's slot`);
+      for (const c of input.changes) {
+        const path = typeof c?.path === 'string' ? c.path : null;
+        const m = path === null ? null : COUNTER_RE.exec(path);
+        const im = path === null ? null : ITEM_FILE_RE.exec(path);
+        const created = im !== null && c.status !== 'M' && c.status !== 'D';
+        if (owner === null) {
+          // AL-43: nobody to own it (unsigned / unknown key, no device e-mail): counters and new item ids
+          // belong to a device slot, so such a commit may not touch them (not even in warn mode)
+          if (path !== null && (path.startsWith('counters/') || created)) {
+            return quarantine('unowned', 'counters file or new item from a commit with no identifiable owner');
           }
+          continue;
+        }
+        if (m !== null && m[1] !== owner.id) return quarantine('counters-foreign', `counter file of ${m[1]} changed by ${owner.id}`);
+        if (created && im !== null) {
+          const slot = parseItemId(im[1] as string)?.slot;
+          if (slot !== owner.slot) return quarantine('item-slot', `item ${im[1]} created by ${owner.id} carries another device's slot`);
         }
       }
     }
 
     /* row 8: signer x devices change x mode */
     let outcome: 'accept' | 'warn';
+    let acceptRule = 'ok';
     let warnNote: [SyncNote['type'], string, string] | null = null;
     switch (signer.status) {
       case 'trusted': {
@@ -281,11 +333,23 @@ export function gateCommit(input: GateInput): GateVerdict {
           }
           const res = acceptDevicesChange(base, incoming, signer.pub as string, input.trusted, { commitTimeMs: input.commitTimeMs });
           if (!res.ok) return quarantine(`devices:${res.reason}`, `devices.yml change refused (${res.reason})`);
+          // D2 (S20). Self: never accepted from a peer, whatever was confirmed. Root: accepted only when
+          // every newly revoked root id was confirmed by a human for THIS commit.
           const self = res.revokes.ids.includes(input.localDevice);
-          if (res.revokes.root || self) {
-            const haltReason: HaltReason = self ? 'quarantine:revocation-self' : 'quarantine:revocation-root';
-            note('sync.reject', haltReason === 'quarantine:revocation-self' ? 'revocation-self' : 'revocation-root', 'revocation of the root or this device is held for human confirmation');
-            return { action: 'halt', haltReason, rule: haltReason === 'quarantine:revocation-self' ? 'revocation-self' : 'revocation-root', notes };
+          const rootIds = res.revokes.root ? res.revokes.ids.filter((id) => base?.devices.find((d) => d.id === id)?.slot === '') : [];
+          if (self) {
+            note('sync.reject', 'revocation-self', 'revocation of this device is held for human confirmation');
+            return { action: 'halt', haltReason: 'quarantine:revocation-self', d2: { kind: 'self', commit: input.sha, deviceIds: [input.localDevice] }, rule: 'revocation-self', notes };
+          }
+          if (res.revokes.root) {
+            const set = input.confirmedRevocations;
+            const confirmed = rootIds.length > 0 && typeof set?.has === 'function' && rootIds.every((id) => set.has(confirmationKey(input.sha, id)));
+            if (!confirmed) {
+              note('sync.reject', 'revocation-root', 'revocation of the root is held for human confirmation');
+              return { action: 'halt', haltReason: 'quarantine:revocation-root', d2: { kind: 'root', commit: input.sha, deviceIds: rootIds }, rule: 'revocation-root', notes };
+            }
+            note('sync.warning', 'revocation-confirmed', 'root revocation applied after human confirmation');
+            acceptRule = 'revocation-confirmed';
           }
         }
         outcome = 'accept';
@@ -319,7 +383,7 @@ export function gateCommit(input: GateInput): GateVerdict {
       for (const r of softDeletes) note('sync.reject', 'delete', 'item delete reverted, item kept', String(r.path));
       return { action: 'forced-merge-keep-items', rule: 'item-delete', notes };
     }
-    return outcome === 'accept' ? { action: 'accept', rule: 'ok', notes } : { action: 'accept-warn', rule: warnNote?.[1] ?? 'warn', notes };
+    return outcome === 'accept' ? { action: 'accept', rule: acceptRule, notes } : { action: 'accept-warn', rule: warnNote?.[1] ?? 'warn', notes };
   } catch {
     return { action: 'quarantine', rule: 'internal', notes: [{ type: 'sync.reject', rule: 'internal', detail: `gate failed (commit ${short})` }] };
   }
@@ -337,5 +401,6 @@ export function gateRange(verdicts: readonly GateVerdict[]): GateVerdict {
   }
   const out: GateVerdict = { action: worst.action, rule: worst.rule, notes };
   if (worst.haltReason !== undefined) out.haltReason = worst.haltReason;
+  if (worst.d2 !== undefined) out.d2 = worst.d2;
   return out;
 }

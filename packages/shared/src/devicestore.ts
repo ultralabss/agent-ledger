@@ -100,7 +100,14 @@ async function readSmall(path: string, max = MAX_SMALL_FILE): Promise<string | n
   }
   if (before.isSymbolicLink()) throw new DevicesError('UNSAFE_FILE', `${name} is a symlink — refusing`);
   if (!before.isFile()) throw new DevicesError('UNSAFE_FILE', `${name} is not a regular file`);
-  const fh = await open(path, 'r');
+  let fh;
+  try {
+    fh = await open(path, 'r');
+  } catch (err) {
+    // removed between lstat and open (a lock released by its holder): absent, not an error
+    if ((err as NodeJS.ErrnoException).code === 'ENOENT') return null;
+    throw err;
+  }
   try {
     const st = await fh.stat({ bigint: true });
     if (!st.isFile() || st.dev !== before.dev || st.ino !== before.ino) {
@@ -142,10 +149,15 @@ async function ensureDirs(l: DeviceLayout): Promise<void> {
 /* ---------------- one lock for every mutating device operation (DK-5) ---------------- */
 
 const LOCK_WAIT_MS = 10_000;
+/** Upper bound for a caller-supplied `waitMs` (a typo must not park a request for minutes). */
+const LOCK_WAIT_MAX_MS = 60_000;
 /** A lock whose holder process is gone is taken over after this; any lock older than
  *  `LOCK_ABANDONED_MS` is abandoned (operations take milliseconds; a recycled pid must not wedge us). */
 const LOCK_DEAD_HOLDER_MS = 2_000;
 const LOCK_ABANDONED_MS = 5 * 60_000;
+/** The takeover critical section is two small file ops; a takeover mutex older than this belongs to a
+ *  crashed process. */
+const TAKEOVER_STALE_MS = 10_000;
 
 function pidAlive(pid: number): boolean {
   try {
@@ -156,7 +168,25 @@ function pidAlive(pid: number): boolean {
   }
 }
 
-/** `true` when a stale lock was removed. Symlink / non-regular lock files throw (refused). */
+/** A takeover mutex (`device.lock.takeover`) left behind by a crashed process: removed only when
+ *  it is old AND unchanged since we read it. Best effort: the residual race (two processes both
+ *  judging the SAME crashed mutex stale) needs a crash plus exact timing and is documented, not hidden. */
+async function clearStaleTakeover(path: string): Promise<void> {
+  const seen = await readSmall(path, 256);
+  if (seen === null) return;
+  const st = await lstat(path).catch(() => null);
+  if (st === null || Math.abs(Date.now() - st.mtimeMs) <= TAKEOVER_STALE_MS) return;
+  if ((await readSmall(path, 256)) === seen) await rm(path, { force: true });
+}
+
+/** `true` when a stale lock was removed (or vanished). `false` = not stale / someone else is taking
+ *  it over: the caller waits and retries. Symlink / non-regular lock files throw (refused).
+ *
+ *  AL-16: the decision to remove is made on a read of the lock file; between that read and `rm`
+ *  another process could have removed the stale lock AND created a fresh one, which a plain `rm`
+ *  would then delete (two holders). So the re-read + compare + `rm` run under a second exclusive
+ *  file (`device.lock.takeover`): inside it nobody else can remove or replace-after-remove, and the
+ *  compare against the content we judged stale proves it is still that same instance. */
 async function clearStaleLock(lockPath: string): Promise<boolean> {
   const first = await readSmall(lockPath, 256);
   if (first === null) return true; // vanished meanwhile: just retry the create
@@ -166,14 +196,35 @@ async function clearStaleLock(lockPath: string): Promise<boolean> {
   const pid = /^(\d{1,10}) /.exec(first)?.[1];
   const dead = pid === undefined || !pidAlive(Number(pid));
   if (!((dead && age > LOCK_DEAD_HOLDER_MS) || age > LOCK_ABANDONED_MS)) return false;
-  if ((await readSmall(lockPath, 256)) !== first) return false; // the holder changed: not stale
-  await rm(lockPath, { force: true });
-  return true;
+
+  const takeoverPath = `${lockPath}.takeover`;
+  const mine = `${String(process.pid)} ${String(Date.now())} ${randomBytes(8).toString('hex')}\n`;
+  try {
+    await writeFile(takeoverPath, mine, { encoding: 'utf8', mode: 0o600, flag: 'wx' });
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== 'EEXIST') throw err;
+    await clearStaleTakeover(takeoverPath);
+    return false; // another process is mid-takeover: wait, then re-evaluate from scratch
+  }
+  try {
+    if ((await readSmall(lockPath, 256)) !== first) return false; // replaced or released: not the stale instance any more
+    await rm(lockPath, { force: true });
+    return true;
+  } finally {
+    if ((await readSmall(takeoverPath, 256).catch(() => null)) === mine) await rm(takeoverPath, { force: true }).catch(() => undefined);
+  }
+}
+
+export interface DeviceLockOptions {
+  /** How long to wait for a live holder before `LOCKED` (ms, 0..60000; default 10000). Measured
+   *  on a monotonic clock. `0` = one attempt (plus a stale takeover) and no waiting. */
+  waitMs?: number;
 }
 
 /** Exclusive (`wx`, 0600) lock file next to the device identity. Re-entrancy is NOT supported:
- *  inner helpers take no lock; only the public operations do. */
-async function withDeviceLock<T>(l: DeviceLayout, fn: () => Promise<T>): Promise<T> {
+ *  inner helpers take no lock; only the public operations do (a nested call waits for itself until
+ *  `LOCKED`). Fails with `DevicesError('LOCKED')` after `waitMs`. */
+async function lockLayout<T>(l: DeviceLayout, fn: () => Promise<T>, waitMs: number = LOCK_WAIT_MS): Promise<T> {
   await ensureHubDir(l);
   const lockPath = nodePath.join(l.hubDir, 'device.lock');
   const token = `${String(process.pid)} ${String(Date.now())} ${randomBytes(8).toString('hex')}\n`;
@@ -186,7 +237,7 @@ async function withDeviceLock<T>(l: DeviceLayout, fn: () => Promise<T>): Promise
       if ((err as NodeJS.ErrnoException).code !== 'EEXIST') throw err;
     }
     if (await clearStaleLock(lockPath)) continue;
-    if (Number(process.hrtime.bigint() - t0) / 1e6 > LOCK_WAIT_MS) {
+    if (Number(process.hrtime.bigint() - t0) / 1e6 > waitMs) {
       throw new DevicesError('LOCKED', 'another ledger device operation is running — retry in a moment');
     }
     await new Promise((r) => setTimeout(r, 15 + Math.floor(Math.random() * 25)));
@@ -197,6 +248,15 @@ async function withDeviceLock<T>(l: DeviceLayout, fn: () => Promise<T>): Promise
     // Remove only OUR lock (a takeover after a very long stall must not delete the new holder's).
     if ((await readSmall(lockPath, 256).catch(() => null)) === token) await rm(lockPath, { force: true }).catch(() => undefined);
   }
+}
+
+/** The ledger-wide device lock (`.hub/device.lock`, cross-process) for callers outside this module
+ *  (the sync APPLY critical section: clean check + read-tree + update-ref + prune). Lock order:
+ *  innermost, short (lock order SF -> R -> Q -> D, docs/f3b-b3-plan.md §3). Not re-entrant. */
+export async function withDeviceLock<T>(ledgerDir: string, fn: () => Promise<T>, opts: DeviceLockOptions = {}): Promise<T> {
+  const w = opts.waitMs;
+  const waitMs = typeof w === 'number' && Number.isFinite(w) ? Math.min(Math.max(w, 0), LOCK_WAIT_MAX_MS) : LOCK_WAIT_MS;
+  return lockLayout(deviceLayout(ledgerDir), fn, waitMs);
 }
 
 /* ---------------- readers ---------------- */
@@ -338,7 +398,7 @@ export async function initDevice(ledgerDir: string, opts: InitOptions = {}): Pro
   const l = deviceLayout(ledgerDir);
   await readDeviceFile(l); // a broken identity is refused before anything is created
   await ensureDirs(l);
-  return withDeviceLock(l, () => initLocked(l, opts, bin));
+  return lockLayout(l, () => initLocked(l, opts, bin));
 }
 
 async function initLocked(l: DeviceLayout, opts: InitOptions, bin: string): Promise<InitResult> {
@@ -506,7 +566,7 @@ export async function rekeyLegacyDeviceId(
 ): Promise<{ from: string; to: string } | null> {
   const bin = opts.bin ?? (await resolveSshKeygen());
   const l = deviceLayout(ledgerDir);
-  return withDeviceLock(l, async () => {
+  return lockLayout(l, async () => {
     const self = await readDeviceFile(l);
     if (self === null) throw new DevicesError('NOT_INITIALISED', 'no device identity to re-key (ledger device init)');
     await assertPrivateFile(l.keyFile, { secret: true });
@@ -603,7 +663,7 @@ function requireFingerprint(given: unknown, actual: string): void {
 export async function approveDevice(ledgerDir: string, id: string, fingerprint: string): Promise<{ added: boolean }> {
   requireId(id);
   const l = deviceLayout(ledgerDir);
-  return withDeviceLock(l, async () => {
+  return lockLayout(l, async () => {
     const { devices } = await requireMember(l);
     const target = devices.devices.find((d) => d.id === id);
     if (target === undefined) throw new DevicesError('NOT_FOUND', `${id} is not in devices.yml`);
@@ -628,7 +688,7 @@ export async function revokeDevice(
     throw new DevicesError('REASON_INVALID', `--reason is required: one line, max ${REVOKE_REASON_MAX} chars`);
   }
   const l = deviceLayout(ledgerDir);
-  await withDeviceLock(l, async () => {
+  await lockLayout(l, async () => {
     const { self, devices } = await requireMember(l);
     if (id === self.device_id) throw new DevicesError('SELF_REVOKE', 'refusing to revoke this device itself — revoke it from another device');
     const target = devices.devices.find((d) => d.id === id);
@@ -643,6 +703,27 @@ export async function revokeDevice(
     };
     await writeAtomic(l.devicesYml, renderDevicesYaml(next));
   });
+}
+
+/** Drop every `allowed_signers` entry whose key (or id) is REVOKED in `devices.yml` (the
+ *  worktree copy = main after APPLY, T-B3-8). ONLY removes, never adds or rewrites a key, so it can
+ *  never widen trust. The CALLER holds `withDeviceLock` (this takes no lock: the lock is not
+ *  re-entrant). A missing `devices.yml` / `allowed_signers` removes nothing; an invalid one throws
+ *  (fail closed: the caller halts, nothing is guessed). Returns the removed ids (sorted). */
+export async function pruneRevokedSigners(ledgerDir: string): Promise<{ removed: string[] }> {
+  const l = deviceLayout(ledgerDir);
+  const devices = await readDevices(l);
+  if (devices === null) return { removed: [] };
+  const revoked = devices.devices.filter((d) => d.revoked !== null);
+  if (revoked.length === 0) return { removed: [] };
+  const revokedIds = new Set(revoked.map((d) => d.id));
+  const revokedKeys = new Set(revoked.map((d) => parseEd25519Pub(d.pubkey)?.line ?? d.pubkey));
+  const signers = await readSigners(l);
+  const keep = signers.filter((s) => !revokedIds.has(s.id) && !revokedKeys.has(s.pubkey));
+  if (keep.length === signers.length) return { removed: [] };
+  await writeAtomic(l.allowedSigners, renderAllowedSigners(keep));
+  const kept = new Set(keep.map((s) => s.id));
+  return { removed: signers.filter((s) => !kept.has(s.id)).map((s) => s.id).sort() };
 }
 
 /* ---------------- enrolment primitives (OQ-1 = A) ---------------- */
@@ -676,7 +757,7 @@ export async function addDevice(
   }
   requireFingerprint(fp, pub.fingerprint);
   const l = deviceLayout(ledgerDir);
-  return withDeviceLock(l, async () => {
+  return lockLayout(l, async () => {
     const { self, devices, pub: mine } = await requireMember(l);
     if (devices.devices.some((d) => d.id === pub.deviceId || d.pubkey === pub.line)) {
       throw new DevicesError('DEVICE_EXISTS', 'that key is already registered in devices.yml');
@@ -713,7 +794,7 @@ export async function adoptSlot(
 ): Promise<{ id: string; label: string; slot: string; changed: boolean }> {
   const bin = opts.bin ?? (await resolveSshKeygen());
   const l = deviceLayout(ledgerDir);
-  return withDeviceLock(l, async () => {
+  return lockLayout(l, async () => {
     const self = await readDeviceFile(l);
     const pub = await readLocalPub(l);
     if (self === null || pub === null) throw new DevicesError('NOT_INITIALISED', 'no device identity yet (ledger device init)');

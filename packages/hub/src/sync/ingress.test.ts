@@ -14,6 +14,7 @@ import {
 import {
   claimGlobProblem,
   validateIncoming,
+  validateTreeShape,
   windowsNameProblem,
   type IncomingChange,
   type IngressRule,
@@ -536,4 +537,86 @@ test('F3A-1: whitespace-run / line-count bombs rejected fast, before the secret 
   assert.equal(lines.get('acme/CONTEXT.md'), 'whitespace-run');
   assert.equal(called, 0, 'scanner never ran');
   assert.equal(rulesOf([blob('acme/CONTEXT.md', `a${' '.repeat(4096)}b\n`)], { scan }).size, 0);
+});
+
+/* ---------------- validateTreeShape (B3a): whole-tree names + modes ---------------- */
+
+const entry = (path: string, over: { mode?: string; type?: string; badUtf8?: boolean } = {}): { path: string; mode: string; type: string; badUtf8?: boolean } => ({
+  path, mode: '100644', type: 'blob', ...over,
+});
+
+test('validateTreeShape: a realistic tree is accepted, nothing is read from content', () => {
+  const paths = ['repos.yml', 'devices.yml', 'ledger.format', '.gitignore', '.gitattributes', `counters/d_${GOOD_DEV}.yml`,
+    'acme/items/ACME-1.md', 'acme/CONTEXT.md', 'acme/DECISIONS.md', 'acme/journal/2026-11.md'];
+  const res = validateTreeShape(paths.map((p) => entry(p)));
+  assert.deepEqual(res.rejected, []);
+  assert.deepEqual(res.accepted.sort(), [...paths].sort());
+  assert.deepEqual(validateTreeShape([]), { accepted: [], rejected: [] });
+});
+
+test('validateTreeShape: symlink, exec, gitlink, other modes, tree type are rejected with the SAME rules as validateIncoming', () => {
+  const cases: [string, { mode?: string; type?: string }, IngressRule][] = [
+    ['acme/CONTEXT.md', { mode: '120000' }, 'symlink'],
+    ['acme/CONTEXT.md', { mode: '100755' }, 'exec'],
+    ['acme/CONTEXT.md', { mode: '160000', type: 'commit' }, 'submodule'],
+    ['acme/CONTEXT.md', { type: 'commit' }, 'submodule'],
+    ['acme/CONTEXT.md', { mode: '100664' }, 'mode'],
+    ['acme/CONTEXT.md', { mode: 'rw-r--r--' }, 'mode'],
+    ['acme/CONTEXT.md', { type: 'tree' }, 'type'],
+  ];
+  for (const [path, over, rule] of cases) {
+    const res = validateTreeShape([entry(path, over)]);
+    assert.deepEqual(res.rejected, [{ path, rule }], JSON.stringify(over));
+    assert.deepEqual(res.accepted, []);
+    // identical verdict to the diff validator for the same name + mode
+    const diff = validateIncoming([blob(path, 'x\n', { mode: over.mode ?? '100644', type: over.type ?? 'blob' })]);
+    assert.equal(diff.rejected[0]?.rule, rule);
+  }
+});
+
+test('validateTreeShape: .hub in any segment / case / dot-space alias, .git names, Windows names, traversal, control chars', () => {
+  const bad: [string, IngressRule][] = [
+    ['.hub/device/key', 'hub-path'], ['.HUB/x', 'hub-path'], ['acme/.Hub/x', 'hub-path'], ['.hub./x', 'hub-path'], ['.hub /x', 'hub-path'],
+    ['.gitmodules', 'git-name'], ['acme/.git/config', 'git-name'], ['.gitconfig', 'git-name'],
+    ['acme/CON', 'windows-name'], ['acme/aux.md', 'windows-name'], ['acme/PROGRA~1', 'windows-name'], ['acme/a:b', 'windows-name'], ['acme/a.', 'windows-name'], ['acme/a ', 'windows-name'],
+    ['../x', 'path-invalid'], ['/abs', 'path-invalid'], ['a//b', 'path-invalid'], ['a\\b', 'path-invalid'], ['a/\u0000b', 'path-invalid'], ['C:evil', 'path-invalid'], ['x'.repeat(513), 'path-invalid'],
+    ['stray.txt', 'layout'], ['acme/other/file.md', 'layout'], ['counters/evil.yml', 'layout'], ['counters/CONTEXT.md', 'layout'],
+  ];
+  for (const [path, rule] of bad) {
+    const res = validateTreeShape([entry(path)]);
+    assert.equal(res.rejected.length, 1, path);
+    assert.equal(res.rejected[0]?.rule, rule, `${path} -> ${String(res.rejected[0]?.rule)}`);
+    assert.deepEqual(res.accepted, []);
+  }
+});
+
+test('validateTreeShape: invalid UTF-8 path bytes are rejected, duplicates and case collisions reject every spelling', () => {
+  assert.deepEqual(validateTreeShape([entry('acme/CONTEXT.md\ufffd', { badUtf8: true })]).rejected, [{ path: 'acme/CONTEXT.md\ufffd', rule: 'encoding' }]);
+  const dup = validateTreeShape([entry('acme/CONTEXT.md'), entry('acme/CONTEXT.md')]);
+  assert.deepEqual(dup.rejected.map((r) => r.rule), ['duplicate']);
+  // the layout allowlist is lower-case, so a colliding spelling inside one tree is already `layout`
+  const clash = validateTreeShape([entry('acme/CONTEXT.md'), entry('ACME/CONTEXT.md')]);
+  assert.deepEqual(clash.rejected, [{ path: 'ACME/CONTEXT.md', rule: 'layout' }]);
+  const solo = validateTreeShape([entry('acme/CONTEXT.md'), entry('other/CONTEXT.md')]);
+  assert.deepEqual(solo.rejected, []);
+  // against another set of paths (e.g. the local tree)
+  const ex = validateTreeShape([entry('acme/CONTEXT.md')], { existingPaths: ['acme/context.md'] });
+  assert.deepEqual(ex.rejected, [{ path: 'acme/CONTEXT.md', rule: 'case-collision' }]);
+  const dirEx = validateTreeShape([entry('acme/journal/2026-11.md')], { existingPaths: ['ACME/x.md'] });
+  assert.deepEqual(dirEx.rejected, [{ path: 'acme/journal/2026-11.md', rule: 'case-collision' }], 'directory prefix collides');
+});
+
+test('validateTreeShape: never throws on hostile input; output paths are sanitised', () => {
+  const hostile: unknown[] = [null, undefined, 5, 'x', {}, [null], [5], [{}], [{ path: 5 }], [{ path: 'a', mode: 1, type: 'blob' }], [{ path: 'a', mode: '100644', type: 'blob', badUtf8: 'yes' }]];
+  for (const h of hostile) {
+    let res: ReturnType<typeof validateTreeShape> | undefined;
+    assert.doesNotThrow(() => { res = validateTreeShape(h as unknown[]); });
+    assert.ok(res !== undefined && res.accepted.length === 0 && res.rejected.length > 0, JSON.stringify(h));
+    assert.ok(res.rejected.every((r) => r.rule === 'malformed'));
+  }
+  const res = validateTreeShape([entry('a\u0000\u202e\u001b[31m/x'), entry(`b/${'y'.repeat(600)}`)]);
+  assert.equal(res.rejected.length, 2);
+  for (const r of res.rejected) {
+    assert.ok(!/[\u0000-\u001f\u202e]/.test(r.path) && r.path.length <= 201, 'sanitised and capped');
+  }
 });

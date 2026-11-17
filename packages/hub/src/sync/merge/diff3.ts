@@ -87,14 +87,21 @@ export function diffHunks(base: readonly string[], side: readonly string[]): Hun
   return hunks;
 }
 
+/** `out.push(...big)` passes every element as an argument and throws RangeError beyond
+ *  ~100k elements (AL-27): hostile input could crash the merge. Loop instead. */
+function pushAll(out: string[], items: readonly string[], from = 0, to = items.length): void {
+  for (let i = from; i < to; i += 1) out.push(items[i] as string);
+}
+
 function apply(base: readonly string[], s: number, e: number, hunks: readonly Hunk[]): string[] {
   const out: string[] = [];
   let pos = s;
   for (const h of hunks) {
-    out.push(...base.slice(pos, h.start), ...h.lines);
+    pushAll(out, base, pos, h.start);
+    pushAll(out, h.lines);
     pos = h.end;
   }
-  out.push(...base.slice(pos, e));
+  pushAll(out, base, pos, e);
   return out;
 }
 
@@ -158,9 +165,9 @@ export function mergeText(
   const out: string[] = [];
   const loserBlocks: string[] = [];
   for (const r of regions) {
-    if (r.kind === 'ok') out.push(...r.lines);
+    if (r.kind === 'ok') pushAll(out, r.lines);
     else {
-      out.push(...(preferOurs ? r.ours : r.theirs));
+      pushAll(out, preferOurs ? r.ours : r.theirs);
       loserBlocks.push(joinLines(preferOurs ? r.theirs : r.ours));
     }
   }

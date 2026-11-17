@@ -418,6 +418,37 @@ function modeProblem(c: IncomingChange): IngressRule | null {
   return null;
 }
 
+/** Paths of `paths` that collide, differing only by case, with another path of `paths` or of
+ *  `existing` — in the file name or in any directory prefix. Shared by `validateIncoming` and
+ *  `validateTreeShape` so the two can never disagree. */
+function caseCollisions(existing: Iterable<string>, paths: readonly string[]): Set<string> {
+  const spellings = new Map<string, Set<string>>();
+  const note = (full: string): void => {
+    const segs = full.split('/');
+    for (let i = 1; i <= segs.length; i += 1) {
+      const prefix = segs.slice(0, i).join('/');
+      const key = prefix.toLowerCase();
+      const set = spellings.get(key) ?? new Set<string>();
+      set.add(prefix);
+      spellings.set(key, set);
+    }
+  };
+  for (const e of existing) if (typeof e === 'string') note(e);
+  for (const p of paths) note(p);
+  const out = new Set<string>();
+  for (const p of paths) {
+    const segs = p.split('/');
+    for (let i = 1; i <= segs.length; i += 1) {
+      const prefix = segs.slice(0, i).join('/');
+      if ((spellings.get(prefix.toLowerCase())?.size ?? 0) > 1) {
+        out.add(p);
+        break;
+      }
+    }
+  }
+  return out;
+}
+
 /**
  * Validate the changes of an incoming commit range. Returns the accepted paths and
  * the rejected ones with the rule that fired. Callers treat ANY rejection as
@@ -526,28 +557,10 @@ export function validateIncoming(changes: readonly unknown[], opts: IngressOpts 
   // Case-insensitive collisions (macOS/Windows checkouts): file names AND every
   // directory prefix. All spellings in a group are rejected, so the verdict does
   // not depend on diff order.
-  const spellings = new Map<string, Set<string>>();
-  const note = (full: string): void => {
-    const segs = full.split('/');
-    for (let i = 1; i <= segs.length; i += 1) {
-      const prefix = segs.slice(0, i).join('/');
-      const key = prefix.toLowerCase();
-      const set = spellings.get(key) ?? new Set<string>();
-      set.add(prefix);
-      spellings.set(key, set);
-    }
-  };
-  for (const e of opts.existingPaths ?? []) if (typeof e === 'string') note(e);
-  for (const { change } of live) note(change.path);
+  const clashing = caseCollisions(opts.existingPaths ?? [], live.map(({ change }) => change.path));
   const survivors: string[] = [];
   for (const { change } of live) {
-    const segs = change.path.split('/');
-    let clash = false;
-    for (let i = 1; i <= segs.length && !clash; i += 1) {
-      const prefix = segs.slice(0, i).join('/');
-      clash = (spellings.get(prefix.toLowerCase())?.size ?? 0) > 1;
-    }
-    if (clash) reject(change.path, 'case-collision');
+    if (clashing.has(change.path)) reject(change.path, 'case-collision');
     else survivors.push(change.path);
   }
 
@@ -555,4 +568,86 @@ export function validateIncoming(changes: readonly unknown[], opts: IngressOpts 
   for (const [path, rule] of rejected) out.push({ path: shown(path), rule });
   for (let i = 0; i < malformed; i += 1) out.push({ path: '(invalid)', rule: 'malformed' });
   return { accepted: survivors, rejected: out };
+}
+
+/* ---------------- whole-tree shape (names + modes, no content) ---------------- */
+
+/** One entry of `ls-tree -r -l` (structurally `objects.ts` `TreeEntry`; kept structural so this
+ *  module stays free of git). */
+export interface TreeShapeEntry {
+  path: string;
+  mode: string;
+  type: string;
+  /** Raw path bytes were not valid UTF-8: the decoded `path` is lossy, so the entry is refused. */
+  badUtf8?: boolean;
+}
+
+/**
+ * Names-and-modes pass over a WHOLE tree (layer T of a sync range: the tree of the fetched tip),
+ * with the very same rule functions `validateIncoming` applies to a diff: `.hub` / hub-path,
+ * `pathProblem` (Windows names, `.git*`, traversal), `modeProblem` (symlink, gitlink, exec, other
+ * modes), `classify` (layout allowlist), duplicates and case collisions. No content is available
+ * here, so content rules (size, secrets, schema, pinned file text) are NOT checked: the per-commit
+ * diff validation owns those. Pure, never throws, fail-closed (a malformed entry is `malformed`).
+ * `rejected` empty = the tree shape is acceptable.
+ */
+export function validateTreeShape(entries: readonly unknown[], opts: { existingPaths?: Iterable<string> } = {}): IngressResult {
+  if (!Array.isArray(entries)) return { accepted: [], rejected: [{ path: '(tree)', rule: 'malformed' }] };
+  const rejected = new Map<string, IngressRule>();
+  const reject = (path: string, rule: IngressRule): void => {
+    if (!rejected.has(path)) rejected.set(path, rule);
+  };
+  const seen = new Map<string, number>();
+  let malformed = 0;
+  const ok = (e: unknown): e is TreeShapeEntry => {
+    if (typeof e !== 'object' || e === null) return false;
+    const o = e as Record<string, unknown>;
+    return typeof o.path === 'string' && typeof o.mode === 'string' && typeof o.type === 'string' && (o.badUtf8 === undefined || typeof o.badUtf8 === 'boolean');
+  };
+  for (const e of entries) {
+    if (!ok(e)) malformed += 1;
+    else seen.set(e.path, (seen.get(e.path) ?? 0) + 1);
+  }
+  const live: string[] = [];
+  for (const e of entries) {
+    if (!ok(e)) continue;
+    if ((seen.get(e.path) ?? 0) > 1) {
+      reject(e.path, 'duplicate');
+      continue;
+    }
+    if (e.badUtf8 === true) {
+      reject(e.path, 'encoding');
+      continue;
+    }
+    if (isHubPath(e.path)) {
+      reject(e.path, 'hub-path');
+      continue;
+    }
+    const pp = pathProblem(e.path);
+    if (pp !== null) {
+      reject(e.path, pp);
+      continue;
+    }
+    // `modeProblem` reads `type`/`mode` only; the other IncomingChange fields are irrelevant to it
+    const mp = modeProblem({ path: e.path, mode: e.mode, type: e.type, size: 0 });
+    if (mp !== null) {
+      reject(e.path, mp);
+      continue;
+    }
+    if (classify(e.path) === null) {
+      reject(e.path, 'layout');
+      continue;
+    }
+    live.push(e.path);
+  }
+  const clashing = caseCollisions(opts.existingPaths ?? [], live);
+  const accepted: string[] = [];
+  for (const p of live) {
+    if (clashing.has(p)) reject(p, 'case-collision');
+    else accepted.push(p);
+  }
+  const out: IngressRejection[] = [];
+  for (const [path, rule] of rejected) out.push({ path: shown(path), rule });
+  for (let i = 0; i < malformed; i += 1) out.push({ path: '(invalid)', rule: 'malformed' });
+  return { accepted, rejected: out };
 }

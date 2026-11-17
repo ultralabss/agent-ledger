@@ -16,6 +16,7 @@ import {
   type VerifyMode,
 } from './gate.ts';
 import { mergeDevices } from './merge/devices.ts';
+import { confirmationKey } from './state.ts';
 
 const WIRE = Buffer.from([0, 0, 0, 11, ...Buffer.from('ssh-ed25519'), 0, 0, 0, 32]);
 function key(): { pub: string; id: string } {
@@ -61,6 +62,8 @@ function base(over: Partial<GateInput> = {}): GateInput {
     seenSigning: new Set<string>(),
     parentDevices: [PARENT],
     devicesText: PARENT,
+    currentDevices: PARENT,
+    confirmedRevocations: new Set<string>(),
     changes: [{ path: 'acme/items/ACME-1.md', status: 'M' }],
     ingress: { accepted: ['acme/items/ACME-1.md'], rejected: [] },
     ...over,
@@ -223,6 +226,7 @@ function mergeInput(over: Partial<GateInput> = {}, mergedCounters = 'acme: 3\n')
       baseCounters: m({ [CTR]: 'acme: 1\n' }),
       parentCounters: [m({ [CTR]: 'acme: 2\n' }), m({ [CTR]: 'acme: 3\n' })],
       mergedCounters: m({ [CTR]: mergedCounters }),
+      addedVsBoth: [],
     },
     ...over,
   };
@@ -312,8 +316,8 @@ test('B12-1 exploit: revoked key X forks pre-revocation; unsigned merge of its r
     const v = run(mode, { signature: sig(KR), parentDevices: [PRE], devicesText: C1, currentDevices: TIP });
     assert.equal(v.action, 'quarantine');
     assert.equal(v.rule, 'revoked-current');
-    // without the current registry the old behaviour (documented: check skipped when not provided)
-    assert.notEqual(run(mode, { signature: sig(KR), parentDevices: [PRE], devicesText: C1 }).rule, 'revoked-current');
+    // AL-46: the current registry is REQUIRED, a missing one is a quarantine, never a skipped check
+    assert.equal(run(mode, { signature: sig(KR), parentDevices: [PRE], devicesText: C1, currentDevices: undefined as never }).rule, 'malformed-input');
     // a key not revoked in the current registry is unaffected
     assert.equal(run(mode, { currentDevices: TIP }).action, 'accept');
     assert.equal(run(mode, { currentDevices: null }).action, 'accept');
@@ -326,7 +330,7 @@ test('B12-1 exploit: revoked key X forks pre-revocation; unsigned merge of its r
   assert.notEqual(M, TIP);
   const input: Partial<GateInput> = {
     parentDevices: [TIP, C1], devicesText: M, signature: sig(null), claimedDevice: null, changes: [],
-    merge: { baseDevices: PRE, baseCounters: m({}), parentCounters: [m({}), m({})], mergedCounters: m({}) },
+    merge: { baseDevices: PRE, baseCounters: m({}), parentCounters: [m({}), m({})], mergedCounters: m({}), addedVsBoth: [] },
   };
   for (const mode of ['warn', 'enforce'] as const) {
     const v = run(mode, input);
@@ -427,4 +431,242 @@ test('claimedDeviceFromEmail: only the exact hub identity form', () => {
     assert.equal(claimedDeviceFromEmail(bad), null);
   }
   void ownA;
+});
+
+/* ---------------- B3a: AL-46 / AL-45 / AL-40 / AL-43 ---------------- */
+
+test('AL-46: currentDevices is REQUIRED: undefined / non-string quarantines (malformed-input), null is fine', () => {
+  for (const mode of ['warn', 'enforce'] as const) {
+    for (const bad of [undefined, 5, {}, [], true]) {
+      const v = run(mode, { currentDevices: bad as never });
+      assert.equal(v.action, 'quarantine', `${mode} ${String(bad)}`);
+      assert.equal(v.rule, 'malformed-input');
+    }
+    // even a commit that would otherwise be an untouched accept / an unsigned warn
+    assert.equal(run(mode, { currentDevices: undefined as never, signature: sig(null) }).rule, 'malformed-input');
+    const rest = base({ mode });
+    delete (rest as Partial<GateInput>).currentDevices;
+    assert.equal(gateCommit(rest).rule, 'malformed-input');
+    assert.equal(run(mode, { currentDevices: null }).action, 'accept', 'no registry at the tip: nothing is revoked there');
+  }
+});
+
+test('AL-46: the commit sha must be a real object id (a D2 halt binds to it)', () => {
+  for (const sha of ['', 'xyz', 'A'.repeat(40), 'a'.repeat(39), 5 as never, null as never]) {
+    assert.equal(run('enforce', { sha }).rule, 'malformed-input', String(sha));
+  }
+  assert.equal(run('enforce', { sha: 'a'.repeat(64) }).action, 'accept');
+});
+
+test('AL-46: side-branch stolen key — a merge signed by a key revoked at the local tip is quarantined (revoked-current), both modes', () => {
+  // the key is active in BOTH parents (a side branch that predates the revocation) and the merge keeps the registry equal
+  const PRE = dev(eA(), eB(), eU(), eR({ revoked: null }));
+  const TIP = dev(eA(), eB(), eU(), eR());
+  const input = (over: Partial<GateInput> = {}): Partial<GateInput> => ({
+    parentDevices: [PRE, PRE], devicesText: PRE, signature: sig(KR), currentDevices: TIP, changes: [],
+    merge: { baseDevices: PRE, baseCounters: m({}), parentCounters: [m({}), m({})], mergedCounters: m({}), addedVsBoth: [] },
+    ...over,
+  });
+  for (const mode of ['warn', 'enforce'] as const) {
+    const v = run(mode, input());
+    assert.equal(v.action, 'quarantine');
+    assert.equal(v.rule, 'revoked-current');
+    assert.equal(run(mode, input({ signature: sig(KB) })).action, 'accept', 'an unrevoked signer is unaffected');
+  }
+});
+
+test('AL-40 regression: an unsigned or untrusted merge whose devices.yml differs from EITHER parent is quarantined (both modes)', () => {
+  const m2 = mergeDevices(MBASE, MP1, MP2);
+  assert.ok(m2.ok);
+  const mk = (over: Partial<GateInput>): Partial<GateInput> => ({ ...mergeInput(), ...over });
+  for (const mode of ['warn', 'enforce'] as const) {
+    assert.equal(run(mode, mk({ signature: sig(null) })).rule, 'unsigned-devices');
+    assert.equal(run(mode, mk({ signature: sig(KU) })).rule, 'unknown-devices', 'key registered on one side only');
+    // registered in BOTH parents but not approved locally
+    const q1 = dev(eA(), eB(), eR(), eU());
+    const q2 = dev(eA(), eB(), eR(), eU(), eN());
+    const qm = mergeDevices(q1, q1, q2);
+    assert.ok(qm.ok);
+    const unapproved = mk({ parentDevices: [q1, q2], devicesText: qm.ok ? qm.merged : '', signature: sig(KU) });
+    unapproved.merge = { ...(unapproved.merge as NonNullable<GateInput['merge']>), baseDevices: q1 };
+    assert.equal(run(mode, unapproved).rule, 'unapproved-devices', 'registered but not approved locally');
+    assert.equal(run(mode, mk({ signature: sig(KX) })).rule, 'unknown-devices');
+    assert.equal(run(mode, mk({ signature: sig(KA, false) })).rule, 'unsigned-devices', 'bad signature');
+    // differs from P2 only (M == P1)
+    const one = mk({ parentDevices: [MERGED, MP1], devicesText: MERGED, signature: sig(null) });
+    one.merge = { ...(one.merge as NonNullable<GateInput['merge']>), baseDevices: MP1 };
+    assert.equal(run(mode, one).rule, 'unsigned-devices');
+  }
+});
+
+test('AL-43: no identifiable owner (unsigned/unknown key, no device e-mail) + counters change or new item -> quarantine unowned, even in warn', () => {
+  const cases: [string, Partial<GateInput>][] = [
+    ['unsigned counters', { signature: sig(null), changes: [{ path: `counters/${KA.id}.yml`, status: 'M' }] }],
+    ['unsigned counters delete', { signature: sig(null), changes: [{ path: `counters/${KB.id}.yml`, status: 'D' }] }],
+    ['unsigned new item', { signature: sig(null), changes: [{ path: 'acme/items/ACME-9.md', status: 'A' }] }],
+    ['unknown-key counters', { signature: sig(KX), changes: [{ path: `counters/${KA.id}.yml`, status: 'A' }] }],
+    ['unknown-key new item', { signature: sig(KX), changes: [{ path: 'acme/items/ACME-B9.md', status: 'A' }] }],
+    ['bad signature new item', { signature: sig(KA, false), changes: [{ path: 'acme/items/ACME-9.md', status: 'A' }] }],
+  ];
+  for (const [name, over] of cases) {
+    for (const mode of ['warn', 'enforce'] as const) {
+      const v = run(mode, over);
+      assert.equal(v.action, 'quarantine', `${name} ${mode}`);
+      assert.equal(v.rule, 'unowned', `${name} ${mode}`);
+    }
+  }
+  // unchanged behaviour: modifying an item without an owner is still the ordinary warn/enforce row
+  const mod = { signature: sig(null), changes: [{ path: 'acme/items/ACME-1.md', status: 'M' }] };
+  assert.equal(run('warn', mod).action, 'accept-warn');
+  assert.equal(run('enforce', mod).rule, 'unsigned');
+  // an owner (device e-mail naming a registered device) keeps the slot rule instead
+  assert.equal(run('warn', { signature: sig(null), claimedDevice: KA.id, changes: [{ path: 'acme/items/ACME-7.md', status: 'A' }] }).action, 'accept-warn');
+  assert.equal(run('warn', { signature: sig(null), claimedDevice: KA.id, changes: [{ path: 'acme/items/ACME-B7.md', status: 'A' }] }).rule, 'item-slot');
+  // a trusted, registered signer is its own owner
+  assert.equal(run('enforce', { changes: [{ path: `counters/${KA.id}.yml`, status: 'M' }, { path: 'acme/items/ACME-7.md', status: 'A' }] }).action, 'accept');
+});
+
+test('AL-43: a merge commit that ADDS an item absent from both parents is quarantined (merge-item-new); other additions and a missing input are handled', () => {
+  const withAdded = (addedVsBoth: unknown): Partial<GateInput> => {
+    const i = mergeInput();
+    i.merge = { ...(i.merge as NonNullable<GateInput['merge']>), addedVsBoth: addedVsBoth as readonly string[] };
+    return i;
+  };
+  for (const mode of ['warn', 'enforce'] as const) {
+    assert.equal(run(mode, withAdded(['acme/items/ACME-9.md'])).rule, 'merge-item-new');
+    assert.equal(run(mode, withAdded(['acme/journal/2026-11.md', 'acme/items/ACME-B3.md'])).rule, 'merge-item-new');
+    assert.equal(run(mode, { ...withAdded(['acme/items/ACME-9.md']), signature: sig(KB) }).rule, 'merge-item-new', 'signed by a trusted device too');
+    assert.equal(run(mode, withAdded([])).action, 'accept');
+    assert.equal(run(mode, withAdded(['acme/journal/2026-11.md', `counters/${KB.id}.yml`])).action, 'accept', 'journal lines / counters are the merger\'s job');
+    for (const bad of [undefined, null, 'acme/items/ACME-9.md', {}, [5], [null]]) {
+      assert.equal(run(mode, withAdded(bad)).rule, 'merge-input-missing', JSON.stringify(bad));
+    }
+  }
+});
+
+/* D2: confirmation bound to (commit sha, device id); self revocation never accepted */
+
+const ROOT_REVOKE: Partial<GateInput> = ROWS.find((r) => r.row === '7 revokes the root')?.over as Partial<GateInput>;
+const SELF_REVOKE: Partial<GateInput> = ROWS.find((r) => r.row === '7 revokes THIS device')?.over as Partial<GateInput>;
+
+test('D2: an unconfirmed root revocation halts with the d2 payload (commit, root ids), both modes', () => {
+  for (const mode of ['warn', 'enforce'] as const) {
+    const v = run(mode, ROOT_REVOKE);
+    assert.equal(v.action, 'halt');
+    assert.equal(v.haltReason, 'quarantine:revocation-root');
+    assert.deepEqual(v.d2, { kind: 'root', commit: SHA, deviceIds: [KA.id] });
+    const s = run(mode, SELF_REVOKE);
+    assert.equal(s.haltReason, 'quarantine:revocation-self');
+    assert.deepEqual(s.d2, { kind: 'self', commit: SHA, deviceIds: [KB.id] });
+  }
+});
+
+test('D2: a confirmation for (this commit, the root id) accepts the root revocation as revocation-confirmed', () => {
+  for (const mode of ['warn', 'enforce'] as const) {
+    const v = run(mode, { ...ROOT_REVOKE, confirmedRevocations: new Set([confirmationKey(SHA, KA.id)]) });
+    assert.equal(v.action, 'accept');
+    assert.equal(v.rule, 'revocation-confirmed');
+    assert.equal(v.haltReason, undefined);
+    assert.equal(v.d2, undefined);
+    assert.ok(v.notes.some((n) => n.rule === 'revocation-confirmed'));
+    // still gated by everything else: the same change from an unsigned commit is a quarantine, confirmed or not
+    const unsigned = run(mode, { ...ROOT_REVOKE, signature: sig(null), confirmedRevocations: new Set([confirmationKey(SHA, KA.id)]) });
+    assert.equal(unsigned.action, 'quarantine');
+    // an invalid devices change by a trusted signer stays refused even with a confirmation
+    const bad = run(mode, {
+      signature: sig(KB),
+      devicesText: dev(eA({ revoked: { at: '2026-11-17T10:00:00.000Z', by: KB.id, reason: 'x' } }), eB(), eU(), eR()), // time-unbound
+      confirmedRevocations: new Set([confirmationKey(SHA, KA.id)]),
+    });
+    assert.equal(bad.rule, 'devices:time-unbound');
+  }
+});
+
+test('D2: a confirmation for another commit, another id, or nothing never accepts (halt stays)', () => {
+  const OTHER = 'b'.repeat(40);
+  const sets: [string, ReadonlySet<string>][] = [
+    ['other commit', new Set([confirmationKey(OTHER, KA.id)])],
+    ['other id', new Set([confirmationKey(SHA, KB.id), confirmationKey(SHA, KU.id)])],
+    ['empty', new Set()],
+    ['raw sha', new Set([SHA])],
+    ['raw id', new Set([KA.id])],
+    ['swapped order', new Set([`${KA.id}:${SHA}`])],
+  ];
+  for (const mode of ['warn', 'enforce'] as const) {
+    for (const [name, confirmedRevocations] of sets) {
+      const v = run(mode, { ...ROOT_REVOKE, confirmedRevocations });
+      assert.equal(v.action, 'halt', `${mode} ${name}`);
+      assert.equal(v.haltReason, 'quarantine:revocation-root');
+    }
+  }
+});
+
+test('D2: hostile confirmedRevocations never accepts: missing / junk halts, a throwing set is a quarantine', () => {
+  const boom = { has(): never { throw new Error('boom'); } };
+  for (const mode of ['warn', 'enforce'] as const) {
+    for (const junk of [undefined, null, {}, [confirmationKey(SHA, KA.id)], 'x', 5]) {
+      const v = run(mode, { ...ROOT_REVOKE, confirmedRevocations: junk as never });
+      assert.equal(v.action, 'halt', `${mode} ${JSON.stringify(junk)}`);
+    }
+    const t = run(mode, { ...ROOT_REVOKE, confirmedRevocations: boom as never });
+    assert.notEqual(t.action, 'accept');
+    assert.notEqual(t.action, 'accept-warn');
+  }
+});
+
+test('D2: revoking THIS device is never accepted from a peer, confirmed or not (the cycle turns a confirmed one into detached)', () => {
+  for (const mode of ['warn', 'enforce'] as const) {
+    for (const confirmedRevocations of [new Set<string>(), new Set([confirmationKey(SHA, KB.id)]), new Set([confirmationKey(SHA, KB.id), confirmationKey(SHA, KA.id)])]) {
+      const v = run(mode, { ...SELF_REVOKE, confirmedRevocations });
+      assert.equal(v.action, 'halt');
+      assert.equal(v.haltReason, 'quarantine:revocation-self');
+      assert.equal(v.rule, 'revocation-self');
+    }
+  }
+  // root AND this device in one commit: self wins, the root confirmation does not help
+  const both = {
+    devicesText: dev(eA({ revoked: { at: T0, by: KA.id, reason: 'x' } }), eB({ revoked: { at: T0, by: KA.id, reason: 'x' } }), eU(), eR()),
+    confirmedRevocations: new Set([confirmationKey(SHA, KA.id), confirmationKey(SHA, KB.id)]),
+  };
+  for (const mode of ['warn', 'enforce'] as const) {
+    const v = run(mode, both);
+    assert.equal(v.haltReason, 'quarantine:revocation-self');
+    assert.deepEqual(v.d2, { kind: 'self', commit: SHA, deviceIds: [KB.id] });
+  }
+});
+
+test('D2: a confirmed root revocation together with a non-root, non-local revocation is accepted; confirming only the non-root id is not enough', () => {
+  const devicesText = dev(eA({ revoked: { at: T0, by: KB.id, reason: 'x' } }), eB(), eU({ revoked: { at: T0, by: KB.id, reason: 'x' } }), eR());
+  for (const mode of ['warn', 'enforce'] as const) {
+    const ok = run(mode, { signature: sig(KB), devicesText, confirmedRevocations: new Set([confirmationKey(SHA, KA.id)]) });
+    assert.equal(ok.action, 'accept');
+    assert.equal(ok.rule, 'revocation-confirmed');
+    const no = run(mode, { signature: sig(KB), devicesText, confirmedRevocations: new Set([confirmationKey(SHA, KU.id)]) });
+    assert.equal(no.action, 'halt');
+    assert.deepEqual(no.d2, { kind: 'root', commit: SHA, deviceIds: [KA.id] });
+  }
+});
+
+test('gateRange carries the d2 payload of the deciding halt', () => {
+  const root = run('enforce', ROOT_REVOKE);
+  const ok = run('enforce', {});
+  const q = run('enforce', { ingress: rejectedIngress('symlink') });
+  const r = gateRange([ok, q, root, ok]);
+  assert.equal(r.action, 'halt');
+  assert.deepEqual(r.d2, { kind: 'root', commit: SHA, deviceIds: [KA.id] });
+  assert.equal(gateRange([ok, q]).d2, undefined);
+  // a confirmed root revocation inside a range is an accept
+  const confirmed = run('enforce', { ...ROOT_REVOKE, confirmedRevocations: new Set([confirmationKey(SHA, KA.id)]) });
+  assert.equal(gateRange([ok, confirmed]).action, 'accept');
+});
+
+test('never relaxes: every existing quarantine still quarantines when the new inputs are supplied', () => {
+  const confirmed = new Set([confirmationKey(SHA, KA.id), confirmationKey(SHA, KB.id)]);
+  for (const r of ROWS.filter((x) => x.warn === 'quarantine' || x.enforce === 'quarantine')) {
+    for (const mode of ['warn', 'enforce'] as const) {
+      const before = run(mode, r.over);
+      const after = run(mode, { ...r.over, confirmedRevocations: confirmed });
+      if (before.action === 'quarantine') assert.equal(after.action, 'quarantine', `${r.row} ${mode}`);
+    }
+  }
 });
