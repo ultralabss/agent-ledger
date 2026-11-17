@@ -10,11 +10,13 @@ import { join } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import test from 'node:test';
 import { parse as parseYaml } from 'yaml';
-import { DevicesError, acceptDevicesChange, parseAllowedSigners, renderDevicesYaml, type DevicesFile } from './devices.ts';
+import { DevicesError, acceptDevicesChange, parseAllowedSigners, planAddDevice, renderDevicesYaml, type DevicesFile } from './devices.ts';
 import {
   addDevice,
   adoptSlot,
   approveDevice,
+  approveLocked,
+  bootstrapSigners,
   deviceHealth,
   deviceLayout,
   initDevice,
@@ -928,4 +930,112 @@ test('AL-45: approve racing prune (both under the device lock) never resurrects 
     for (const r of res) if (r.status === 'rejected') assert.ok(r.reason instanceof DevicesError && r.reason.code === 'REVOKED', `round ${String(round)}: ${String(r.reason)}`);
     assert.equal((await readSigners(l)).some((x) => x.id === other.id), false, `round ${String(round)}: revoked key trusted`);
   }
+});
+
+/* ---------------- B4a: bootstrapSigners, approveLocked, addDevice on planAddDevice ---------------- */
+
+const bsErr = (c: string) => (e: unknown): boolean => e instanceof DevicesError && e.code === c;
+
+/** A registry as a joiner would receive it: real root key (on `rootDir`), two more devices, the last one optionally revoked. */
+async function registry(t: { after: (fn: () => unknown) => void }): Promise<{ file: DevicesFile; rootId: string; rootFp: string; ids: string[]; revokedId: string }> {
+  const rootDir = await ledger(t, 'root');
+  const r = await initDevice(rootDir, { root: true, label: 'mac' });
+  const second = await otherDevice(t);
+  const third = await otherDevice(t);
+  const file = (await readDevices(deviceLayout(rootDir))) as DevicesFile;
+  const at = '2026-11-16T10:00:00.000Z';
+  file.devices.push(
+    { id: second.id, label: 'win', slot: 'W', pubkey: second.pub, added: at, added_by: r.deviceId, revoked: null, role: 'owner' },
+    { id: third.id, label: 'old', slot: 'X', pubkey: third.pub, added: at, added_by: r.deviceId, revoked: { at, by: r.deviceId, reason: 'lost' }, role: 'owner' },
+  );
+  return { file, rootId: r.deviceId, rootFp: r.fingerprint, ids: [r.deviceId, second.id].sort(), revokedId: third.id };
+}
+
+test('bootstrapSigners: trusts every NON-revoked device of the registry once the root fingerprint matches; file 0600', { skip }, async (t) => {
+  const reg = await registry(t);
+  const joiner = await ledger(t, 'join');
+  await initDevice(joiner, { label: 'phone' });
+  const l = deviceLayout(joiner);
+  assert.deepEqual(await bootstrapSigners(joiner, reg.file, reg.rootFp), { added: reg.ids });
+  const signers = await readSigners(l);
+  assert.deepEqual(signers.map((s) => s.id).sort(), reg.ids);
+  assert.ok(!signers.some((s) => s.id === reg.revokedId), 'a revoked key is never trusted');
+  assert.equal(await mode(l.allowedSigners), 0o600);
+  const own = (await listDevices(joiner)).length;
+  assert.equal(own, 0, 'devices.yml itself is not written by the bootstrap');
+  // only on a device that trusts nobody yet: never widens an existing trust set
+  await assert.rejects(bootstrapSigners(joiner, reg.file, reg.rootFp), bsErr('SIGNERS_NOT_EMPTY'));
+  assert.deepEqual((await readSigners(l)).map((s) => s.id).sort(), reg.ids);
+});
+
+test('bootstrapSigners: a wrong or malformed root fingerprint changes nothing; so does a hostile registry', { skip }, async (t) => {
+  const reg = await registry(t);
+  const joiner = await ledger(t, 'join');
+  await initDevice(joiner, { label: 'phone' });
+  const l = deviceLayout(joiner);
+  const other = await otherDevice(t);
+  await assert.rejects(bootstrapSigners(joiner, reg.file, fpOf(other.pub)), bsErr('FP_MISMATCH'));
+  for (const bad of ['', 'SHA256:short', reg.rootFp.slice(0, -1), reg.rootFp.toLowerCase(), `${reg.rootFp}\n`, undefined as unknown as string]) {
+    await assert.rejects(bootstrapSigners(joiner, reg.file, bad), bsErr('FP_REQUIRED'), String(bad));
+  }
+  // the fingerprint of a NON-root member is not an anchor
+  const second = reg.file.devices[1];
+  await assert.rejects(bootstrapSigners(joiner, reg.file, fpOf(second?.pubkey ?? '')), bsErr('FP_MISMATCH'));
+  // no root entry / invariants broken
+  await assert.rejects(bootstrapSigners(joiner, { devices: reg.file.devices.slice(1) }, reg.rootFp), bsErr('DEVICES_INVALID'));
+  const dup = structuredClone(reg.file);
+  (dup.devices[1] as { slot: string }).slot = (dup.devices[2] as { slot: string }).slot;
+  await assert.rejects(bootstrapSigners(joiner, dup, reg.rootFp), bsErr('DEVICES_INVALID'));
+  await assert.rejects(bootstrapSigners(joiner, { devices: [] }, reg.rootFp), bsErr('NO_ROOT'));
+  await assert.rejects(stat(l.allowedSigners), { code: 'ENOENT' }, 'nothing written on refusal');
+});
+
+test('bootstrapSigners: an existing but EMPTY allowed_signers is fine; one with a signer is not; a revoked root is not added', { skip }, async (t) => {
+  const reg = await registry(t);
+  const revokedRoot = structuredClone(reg.file);
+  const rootEntry = revokedRoot.devices[0] as { revoked: unknown };
+  rootEntry.revoked = { at: '2026-11-16T11:00:00.000Z', by: (revokedRoot.devices[1] as { id: string }).id, reason: 'lost' };
+  const joiner = await ledger(t, 'join');
+  await initDevice(joiner, { label: 'phone' });
+  const l = deviceLayout(joiner);
+  await writeFile(l.allowedSigners, '', { mode: 0o600 });
+  const res = await bootstrapSigners(joiner, revokedRoot, reg.rootFp);
+  assert.ok(!res.added.includes(reg.rootId), 'the revoked root key is never trusted');
+  assert.deepEqual((await readSigners(l)).map((s) => s.id), res.added);
+  const joiner2 = await ledger(t, 'join2');
+  await initDevice(joiner2, { label: 'tab' });
+  const other = await otherDevice(t);
+  await writeFile(deviceLayout(joiner2).allowedSigners, `${other.id} namespaces="agent-ledger-v1,git" ${other.pub}\n`, { mode: 0o600 });
+  await assert.rejects(bootstrapSigners(joiner2, reg.file, reg.rootFp), bsErr('SIGNERS_NOT_EMPTY'));
+});
+
+test('approveLocked: same checks as approveDevice, usable while the caller holds the device lock', { skip }, async (t) => {
+  const { dir, other } = await twoDevices(t);
+  await withDeviceLock(dir, async () => {
+    await assert.rejects(approveLocked(dir, other.id, `SHA256:${'A'.repeat(43)}`), bsErr('FP_MISMATCH'));
+    await assert.rejects(approveLocked(dir, '../../etc/passwd', fpOf(other.pub)), bsErr('ID_INVALID'));
+    await assert.rejects(approveLocked(dir, 'd_aaaaaaaaaa', fpOf(other.pub)), bsErr('NOT_FOUND'));
+    assert.deepEqual(await approveLocked(dir, other.id, fpOf(other.pub)), { added: true });
+    assert.deepEqual(await approveLocked(dir, other.id, fpOf(other.pub)), { added: false });
+  });
+  assert.ok((await readSigners(deviceLayout(dir))).some((s) => s.id === other.id));
+  // not a member: no approval, same as approveDevice
+  const stranger = await ledger(t, 'stranger');
+  await initDevice(stranger, { label: 'x' });
+  await assert.rejects(approveLocked(stranger, other.id, fpOf(other.pub)), bsErr('NOT_MEMBER'));
+});
+
+test('addDevice is planAddDevice on disk: same entry, same file bytes, same result', { skip }, async (t) => {
+  const dir = await ledger(t);
+  const root = await initDevice(dir, { root: true });
+  const other = await otherDevice(t);
+  const before = (await readDevices(deviceLayout(dir))) as DevicesFile;
+  const now = new Date();
+  const pub = parseEd25519Pub(other.pub) as NonNullable<ReturnType<typeof parseEd25519Pub>>;
+  const plan = planAddDevice(before, root.deviceId, pub, 'win', now.getTime());
+  const res = await addDevice(dir, other.pub, 'win', fpOf(other.pub), now);
+  assert.deepEqual(res, { id: other.id, label: 'win', slot: plan.entry.slot, fingerprint: fpOf(other.pub) });
+  assert.equal(await readFile(deviceLayout(dir).devicesYml, 'utf8'), renderDevicesYaml(plan.next));
+  await assert.rejects(addDevice(dir, other.pub, 'win', fpOf(other.pub), now), bsErr('DEVICE_EXISTS'));
+  await assert.rejects(addDevice(dir, other.pub, 'BAD LABEL', fpOf(other.pub), now), bsErr('LABEL_INVALID'));
 });

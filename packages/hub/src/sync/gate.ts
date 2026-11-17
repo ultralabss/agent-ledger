@@ -36,6 +36,7 @@
 
 import {
   acceptDevicesChange,
+  deviceIdFromEmail,
   parseDevicesYaml,
   parseEd25519Pub,
   parseItemId,
@@ -140,14 +141,12 @@ export interface GateVerdict {
 const COUNTER_RE = /^counters\/(d_[a-z2-7]{10})\.yml$/;
 const ITEM_FILE_RE = /^[a-z0-9-]+\/items\/([A-Z]{2,4}-[A-HJ-NP-Z]?[1-9][0-9]*)\.md$/;
 const DEVICE_ID_RE = /^d_[a-z2-7]{10}$/;
-const EMAIL_RE = /^(d_[a-z2-7]{10})@devices\.agent-ledger\.invalid$/;
 const MAX_NOTES = 20;
 const SHA_RE = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/;
 
 /** Committer e-mail -> claimed device id (`<device_id>@devices.agent-ledger.invalid`). */
 export function claimedDeviceFromEmail(email: unknown): string | null {
-  const m = typeof email === 'string' ? EMAIL_RE.exec(email) : null;
-  return m === null ? null : (m[1] as string);
+  return deviceIdFromEmail(email);
 }
 
 const shortSha = (sha: unknown): string => (typeof sha === 'string' && /^[0-9a-f]{40,64}$/.test(sha) ? sha.slice(0, 12) : '?');

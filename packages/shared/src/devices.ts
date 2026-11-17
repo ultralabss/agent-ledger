@@ -12,7 +12,8 @@ import { parse as parseYaml, stringify as stringifyYaml } from 'yaml';
 import { z } from 'zod';
 import { isSingleLine, sanitizeField } from './sanitize.ts';
 import { slotSchema } from './schema.ts';
-import { DEVICE_ID_RE, GIT_NAMESPACE, SIGN_NAMESPACE, parseEd25519Pub } from './sshkey.ts';
+import { SLOT_LETTERS } from './snowflake.ts';
+import { DEVICE_ID_RE, GIT_NAMESPACE, SIGN_NAMESPACE, parseEd25519Pub, type Ed25519Pub } from './sshkey.ts';
 
 export const DEVICES_MAX_ENTRIES = 64;
 export const DEVICES_MAX_BYTES = 64 * 1024;
@@ -382,4 +383,58 @@ export function acceptDevicesChange(
     kind: JSON.stringify(old) === JSON.stringify(next) ? 'noop' : 'update',
     revokes: { root: revokesRoot, ids: revokedIds.sort() },
   };
+}
+
+/* ---------------- device e-mail (one producer, one parser) ---------------- */
+
+/** Committer e-mail domain of a device (`<device_id>@devices.agent-ledger.invalid`, `.invalid` = never routable). */
+export const DEVICE_EMAIL_DOMAIN = 'devices.agent-ledger.invalid';
+const DEVICE_EMAIL_RE = new RegExp(`^(d_[a-z2-7]{10})@${DEVICE_EMAIL_DOMAIN.replace(/\./g, '\\.')}$`);
+
+/** Committer e-mail of a device. Throws `DevicesError('ID_INVALID')` for anything that is not a `DEVICE_ID_RE` id. */
+export function deviceEmail(id: string): string {
+  if (typeof id !== 'string' || !DEVICE_ID_RE.test(id)) throw new DevicesError('ID_INVALID', 'device id must look like d_xxxxxxxxxx (a-z, 2-7)');
+  return `${id}@${DEVICE_EMAIL_DOMAIN}`;
+}
+
+/** Inverse of `deviceEmail`; `null` for anything that is not exactly a device e-mail. */
+export function deviceIdFromEmail(email: unknown): string | null {
+  const m = typeof email === 'string' ? DEVICE_EMAIL_RE.exec(email) : null;
+  return m === null ? null : (m[1] as string);
+}
+
+/* ---------------- planAddDevice (pure slot allocation, docs/f3b-b4-plan.md §2.1) ---------------- */
+
+/** Pure: the registry after `pub` joined, and the new entry. Lowest never-used slot (a revoked entry keeps
+ *  its slot, so retired slots are never re-issued). `added` = `nowMs` (the commit time that will carry the
+ *  change, so `acceptDevicesChange` time binding holds). Throws `DevicesError` `DEVICE_EXISTS`,
+ *  `SLOTS_EXHAUSTED`, `LABEL_INVALID`. Does not check authority: callers run `acceptDevicesChange`. */
+export function planAddDevice(
+  devices: DevicesFile,
+  selfId: string,
+  pub: Ed25519Pub,
+  label: string,
+  nowMs: number,
+): { next: DevicesFile; entry: DeviceEntry } {
+  if (!labelSchema.safeParse(label).success) {
+    throw new DevicesError('LABEL_INVALID', 'label: lowercase letters, digits, - (max 32)');
+  }
+  if (devices.devices.some((d) => d.id === pub.deviceId || d.pubkey === pub.line)) {
+    throw new DevicesError('DEVICE_EXISTS', 'that key is already registered in devices.yml');
+  }
+  const used = new Set(devices.devices.map((d) => d.slot));
+  const slot = [...SLOT_LETTERS].find((c) => !used.has(c));
+  if (slot === undefined) throw new DevicesError('SLOTS_EXHAUSTED', 'all device slots are in use (a revoked device keeps its slot forever)');
+  if (!Number.isFinite(nowMs)) throw new DevicesError('ADD_REFUSED', 'invalid time');
+  const entry: DeviceEntry = {
+    id: pub.deviceId,
+    label,
+    slot,
+    pubkey: pub.line,
+    added: new Date(nowMs).toISOString(),
+    added_by: selfId,
+    revoked: null,
+    role: 'owner',
+  };
+  return { next: { devices: [...devices.devices, entry] }, entry };
 }

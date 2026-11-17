@@ -21,6 +21,7 @@ import { copyFile, link, lstat, mkdir, open, readdir, rm, writeFile } from 'node
 import nodePath from 'node:path';
 import { parse as parseYaml, stringify as stringifyYaml } from 'yaml';
 import {
+  DEVICES_MAX_ENTRIES,
   DevicesError,
   REVOKE_REASON_MAX,
   acceptDevicesChange,
@@ -28,6 +29,8 @@ import {
   labelSchema,
   parseAllowedSigners,
   parseDevicesYaml,
+  planAddDevice,
+  devicesInvariantProblem,
   safeOutput,
   renderAllowedSigners,
   renderDevicesYaml,
@@ -39,7 +42,6 @@ import {
 import { renameRetry } from './fsretry.ts';
 import { assertPrivateFile, ensurePrivateDir, isOwnedByMe, isStatOwnedByMe, TrustError } from './platformTrust.ts';
 import { isSingleLine } from './sanitize.ts';
-import { SLOT_LETTERS } from './snowflake.ts';
 import {
   DEVICE_ID_RE,
   SshKeygenError,
@@ -663,15 +665,67 @@ function requireFingerprint(given: unknown, actual: string): void {
 export async function approveDevice(ledgerDir: string, id: string, fingerprint: string): Promise<{ added: boolean }> {
   requireId(id);
   const l = deviceLayout(ledgerDir);
+  return lockLayout(l, () => approveLockedL(l, id, fingerprint));
+}
+
+async function approveLockedL(l: DeviceLayout, id: string, fingerprint: string): Promise<{ added: boolean }> {
+  const { devices } = await requireMember(l);
+  const target = devices.devices.find((d) => d.id === id);
+  if (target === undefined) throw new DevicesError('NOT_FOUND', `${id} is not in devices.yml`);
+  if (target.revoked !== null) throw new DevicesError('REVOKED', `${id} is revoked — a revoked key is never trusted again`);
+  const pub = parseEd25519Pub(target.pubkey);
+  if (pub === null) throw new DevicesError('KEY_INVALID', `${id}: registered key is invalid`);
+  requireFingerprint(fingerprint, pub.fingerprint);
+  return { added: await mergeSigner(l, { id, pubkey: pub.line }) };
+}
+
+/** `approveDevice` for a caller that ALREADY holds the device lock (`withDeviceLock`, not re-entrant:
+ *  calling `approveDevice` there would deadlock). Same checks: member, registered, not revoked, fp equal. */
+export async function approveLocked(ledgerDir: string, id: string, fingerprint: string): Promise<{ added: boolean }> {
+  requireId(id);
+  return approveLockedL(deviceLayout(ledgerDir), id, fingerprint);
+}
+
+/** JOIN bootstrap (OQ-5 = A): trust every NON-revoked device of a registry the caller already validated
+ *  (`validateGenesis`), anchored on the root fingerprint the HUMAN confirmed out of band. Only on a
+ *  device that trusts nobody yet (`allowed_signers` absent or empty): this can never widen an existing
+ *  trust set. The root entry (slot "", self-added) must have exactly `rootFp` (`timingSafeEqual`); a
+ *  revoked key (the root included) is never added. Takes the device lock itself (the joiner holds none). */
+export async function bootstrapSigners(
+  ledgerDir: string,
+  devices: DevicesFile,
+  rootFp: string,
+): Promise<{ added: string[] }> {
+  if (typeof rootFp !== 'string' || !FP_RE.test(rootFp)) {
+    throw new DevicesError('FP_REQUIRED', 'the root key fingerprint is required (SHA256:…)');
+  }
+  const problem = devicesInvariantProblem(devices);
+  if (problem !== null || devices.devices.length > DEVICES_MAX_ENTRIES) {
+    throw new DevicesError('DEVICES_INVALID', 'devices registry is invalid');
+  }
+  const root = devices.devices.find((d) => d.slot === '' && d.added_by === d.id);
+  const rootPub = root === undefined ? null : parseEd25519Pub(root.pubkey);
+  if (root === undefined || rootPub === null) throw new DevicesError('NO_ROOT', 'the registry has no root device');
+  const want = Buffer.from(rootFp);
+  const have = Buffer.from(rootPub.fingerprint);
+  if (want.length !== have.length || !timingSafeEqual(want, have)) {
+    throw new DevicesError('FP_MISMATCH', 'root key fingerprint does not match — refusing');
+  }
+  const l = deviceLayout(ledgerDir);
   return lockLayout(l, async () => {
-    const { devices } = await requireMember(l);
-    const target = devices.devices.find((d) => d.id === id);
-    if (target === undefined) throw new DevicesError('NOT_FOUND', `${id} is not in devices.yml`);
-    if (target.revoked !== null) throw new DevicesError('REVOKED', `${id} is revoked — a revoked key is never trusted again`);
-    const pub = parseEd25519Pub(target.pubkey);
-    if (pub === null) throw new DevicesError('KEY_INVALID', `${id}: registered key is invalid`);
-    requireFingerprint(fingerprint, pub.fingerprint);
-    return { added: await mergeSigner(l, { id, pubkey: pub.line }) };
+    await ensureHubDir(l);
+    if ((await readSigners(l)).length !== 0) {
+      throw new DevicesError('SIGNERS_NOT_EMPTY', 'this device already trusts signers — bootstrap refused');
+    }
+    const signers: Signer[] = [];
+    for (const d of devices.devices) {
+      if (d.revoked !== null) continue;
+      const pub = parseEd25519Pub(d.pubkey);
+      if (pub === null) throw new DevicesError('KEY_INVALID', `${d.id}: registered key is invalid`);
+      signers.push({ id: d.id, pubkey: pub.line });
+    }
+    await writeAtomic(l.allowedSigners, renderAllowedSigners(signers));
+    return { added: signers.map((x) => x.id).sort() };
   });
 }
 
@@ -759,28 +813,12 @@ export async function addDevice(
   const l = deviceLayout(ledgerDir);
   return lockLayout(l, async () => {
     const { self, devices, pub: mine } = await requireMember(l);
-    if (devices.devices.some((d) => d.id === pub.deviceId || d.pubkey === pub.line)) {
-      throw new DevicesError('DEVICE_EXISTS', 'that key is already registered in devices.yml');
-    }
-    const used = new Set(devices.devices.map((d) => d.slot));
-    const slot = [...SLOT_LETTERS].find((c) => !used.has(c));
-    if (slot === undefined) throw new DevicesError('SLOTS_EXHAUSTED', 'all device slots are in use (a revoked device keeps its slot forever)');
-    const entry: DeviceEntry = {
-      id: pub.deviceId,
-      label,
-      slot,
-      pubkey: pub.line,
-      added: now.toISOString(),
-      added_by: self.device_id,
-      revoked: null,
-      role: 'owner',
-    };
-    const next: DevicesFile = { devices: [...devices.devices, entry] };
+    const { next, entry } = planAddDevice(devices, self.device_id, pub, label, now.getTime());
     const trusted = new Set((await readSigners(l)).map((s) => s.pubkey));
     const verdict = acceptDevicesChange(devices, next, mine.line, trusted, { commitTimeMs: now.getTime() });
     if (!verdict.ok) throw new DevicesError('ADD_REFUSED', `device add refused: ${verdict.reason}`);
     await writeAtomic(l.devicesYml, renderDevicesYaml(next));
-    return { id: entry.id, label, slot, fingerprint: pub.fingerprint };
+    return { id: entry.id, label, slot: entry.slot, fingerprint: pub.fingerprint };
   });
 }
 

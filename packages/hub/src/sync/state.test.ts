@@ -2,7 +2,7 @@
  *  the grow-only ratchet, backoff bounds, inflight marker path validation, `sync.yml`. */
 
 import assert from 'node:assert/strict';
-import { mkdtemp, mkdir, readFile, readdir, rm, stat, symlink, truncate, utimes, writeFile } from 'node:fs/promises';
+import { lstat, mkdtemp, mkdir, readFile, readdir, rm, stat, symlink, truncate, utimes, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import nodePath from 'node:path';
 import test from 'node:test';
@@ -13,8 +13,13 @@ import {
   StateStore,
   confirmationKey,
   emptyState,
+  clearEnrolMarker,
   nextBackoff,
+  readEnrolMarker,
   readSyncConfig,
+  writeEnrolMarker,
+  writeSyncConfig,
+  type EnrolMarker,
   type HaltState,
   type Inflight,
   type SyncState,
@@ -354,5 +359,166 @@ test('seenSigning past its cap evicts the OLDEST ids (never throws, never silent
     assert.equal(out.seenSigning.includes(id(0)), false, 'oldest evicted');
     assert.deepEqual(await store.read(), out);
     await assert.rejects(store.update((s) => { s.seenSigning = s.seenSigning.slice(1); }), isState('INVARIANT'), 'an explicit shrink below the cap is still refused');
+  });
+});
+
+/* ---------------- B4a: writeSyncConfig, enrol marker ---------------- */
+
+const REMOTE = 'ssh://git@example.invalid/owner/ledger.git';
+
+test('writeSyncConfig: atomic private write that readSyncConfig reads back; the file replaces, never follows, a symlink', async () => {
+  await withDir(async (dir) => {
+    await writeSyncConfig(dir, REMOTE);
+    assert.deepEqual(await readSyncConfig(dir), { v: 1, remote: REMOTE });
+    const file = nodePath.join(dir, '.hub', 'sync.yml');
+    if (posix) assert.equal((await stat(file)).mode & 0o777, 0o600);
+    await writeSyncConfig(dir, 'git@host.example:o/r.git');
+    assert.deepEqual(await readSyncConfig(dir), { v: 1, remote: 'git@host.example:o/r.git' });
+    assert.deepEqual((await readdir(nodePath.join(dir, '.hub'))).filter((n) => n.endsWith('.tmp')), [], 'no tmp leftovers');
+    if (posix) {
+      const victim = nodePath.join(dir, 'victim.txt');
+      await writeFile(victim, 'keep');
+      await rm(file);
+      await symlink(victim, file);
+      await writeSyncConfig(dir, REMOTE);
+      assert.equal(await readFile(victim, 'utf8'), 'keep', 'the symlink target is untouched');
+      assert.ok(!(await lstat(file)).isSymbolicLink());
+      assert.deepEqual(await readSyncConfig(dir), { v: 1, remote: REMOTE });
+    }
+  });
+});
+
+test('writeSyncConfig: re-validates the remote (ssh/scp only, no credentials, no option injection) and never echoes it', async () => {
+  await withDir(async (dir) => {
+    const hostile = [
+      'https://host.example/o/r.git', 'file:///etc/passwd', 'ext::sh -c id', '-oProxyCommand=evil', 'ssh://-oProxyCommand=x/r',
+      'ssh://user:secret-pw@host.example/o/r.git', 'user:secret-pw@host.example:o/r.git', 'relative/path', '/abs/local/path', '',
+      'ssh://h/p with space', 'ssh://h/p\nv: 2', `ssh://h/${'a'.repeat(600)}`,
+    ];
+    for (const u of hostile) {
+      await assert.rejects(writeSyncConfig(dir, u), (e: unknown) => {
+        assert.ok(e instanceof StateError && e.code === 'INVALID', u.slice(0, 30));
+        assert.ok(!e.message.includes('secret-pw') && !e.message.includes('example'), 'message carries no URL');
+        return true;
+      });
+    }
+    await assert.rejects(writeSyncConfig(dir, 5 as unknown as string), isState('INVALID'));
+    await assert.rejects(stat(nodePath.join(dir, '.hub', 'sync.yml')), { code: 'ENOENT' }, 'nothing written on refusal');
+    // the test seam is explicit and exact, never ambient
+    await assert.rejects(writeSyncConfig(dir, '/abs/local/path'), isState('INVALID'));
+    await writeSyncConfig(dir, '/abs/local/path', { testLocalRemotes: ['/abs/local/path'] });
+  });
+});
+
+function enrol(over: Partial<EnrolMarker> = {}): EnrolMarker {
+  return { v: 1, kind: 'init', stage: 'start', pid: process.pid, startedAt: new Date().toISOString(), remote: REMOTE, ...over };
+}
+const alive = (v: boolean) => ({ pidAlive: () => v });
+
+test('enrol marker: absent = null; written private; stage advance by the same pid and kind; read back strictly', async () => {
+  await withDir(async (dir) => {
+    assert.equal(await readEnrolMarker(dir), null);
+    const m = enrol();
+    await writeEnrolMarker(dir, m);
+    assert.deepEqual(await readEnrolMarker(dir), m);
+    const file = nodePath.join(syncDir(dir), 'enrol.json');
+    if (posix) assert.equal((await stat(file)).mode & 0o777, 0o600);
+    await writeEnrolMarker(dir, { ...m, stage: 'committed' });
+    assert.equal((await readEnrolMarker(dir))?.stage, 'committed');
+    const j = enrol({ kind: 'join', pid: 4_000_001, stage: 'awaiting-add', F0: A });
+    await clearEnrolMarker(dir);
+    await writeEnrolMarker(dir, j);
+    assert.deepEqual(await readEnrolMarker(dir), j);
+    assert.deepEqual((await readdir(syncDir(dir))).filter((n) => n.includes('.tmp') || n.includes('.stale')), []);
+  });
+});
+
+test('enrol marker: invalid input is refused before anything touches the disk; invalid files are CORRUPT (fail closed)', async () => {
+  await withDir(async (dir) => {
+    const bad: unknown[] = [
+      enrol({ kind: 'x' as 'init' }), enrol({ stage: 'Bad Stage' }), enrol({ stage: '' }), enrol({ pid: 0 }), enrol({ pid: 1.5 }),
+      enrol({ pid: -3 }), enrol({ startedAt: 'yesterday' }), enrol({ remote: '' }), enrol({ remote: 'a b' }), enrol({ remote: '-oProxyCommand=x' }),
+      enrol({ remote: `ssh://h/${'a'.repeat(1100)}` }), enrol({ F0: 'xyz' }), { ...enrol(), extra: 1 }, { ...enrol(), v: 2 }, null, 'x',
+    ];
+    for (const b of bad) await assert.rejects(writeEnrolMarker(dir, b as EnrolMarker), isState('INVALID'));
+    assert.equal(await readEnrolMarker(dir), null);
+    await writeEnrolMarker(dir, enrol());
+    const file = nodePath.join(syncDir(dir), 'enrol.json');
+    const put = (t: string): Promise<void> => writeFile(file, t, { mode: 0o600 });
+    for (const t of ['', '{', 'null', '[]', JSON.stringify({ ...enrol(), extra: 1 }), JSON.stringify({ ...enrol(), pid: 'x' }), `{"v":1,"pad":"${'a'.repeat(5000)}"}`]) {
+      await put(t);
+      await assert.rejects(readEnrolMarker(dir), isState('CORRUPT'), t.slice(0, 30));
+      await assert.rejects(writeEnrolMarker(dir, enrol({ pid: 4_000_002 })), isState('CORRUPT'), 'a corrupt marker is never overwritten silently');
+    }
+    // the human --abort can still remove it
+    await clearEnrolMarker(dir, { force: true });
+    assert.equal(await readEnrolMarker(dir), null);
+  });
+});
+
+test('enrol marker: a live foreign owner is BUSY (no URL in the message); a dead pid or a > 24 h marker is taken over', async () => {
+  await withDir(async (dir) => {
+    const other = enrol({ pid: 4_000_003, kind: 'join', stage: 'awaiting-add', F0: B });
+    await writeEnrolMarker(dir, other);
+    await assert.rejects(writeEnrolMarker(dir, enrol(), alive(true)), (e: unknown) => {
+      assert.ok(e instanceof StateError && e.code === 'BUSY');
+      assert.ok(!e.message.includes('example'));
+      return true;
+    });
+    assert.deepEqual(await readEnrolMarker(dir), other, 'the live marker is untouched');
+    // same pid, other kind, owner alive: not an "advance"
+    await assert.rejects(writeEnrolMarker(dir, enrol({ pid: 4_000_003, kind: 'init' }), alive(true)), isState('BUSY'));
+    // dead owner
+    await writeEnrolMarker(dir, enrol(), alive(false));
+    assert.equal((await readEnrolMarker(dir))?.pid, process.pid);
+    assert.deepEqual((await readdir(syncDir(dir))).filter((n) => n.includes('.stale')), [], 'no stale leftovers');
+    // alive owner but old: pid reuse must not wedge enrolment (distance, in both directions: clocks jump)
+    const t0 = Date.parse('2026-11-17T10:00:00.000Z');
+    for (const skew of [25 * 3_600_000, -25 * 3_600_000]) {
+      await clearEnrolMarker(dir, { force: true });
+      await writeEnrolMarker(dir, enrol({ pid: 4_000_004, startedAt: new Date(t0).toISOString() }));
+      await assert.rejects(writeEnrolMarker(dir, enrol(), { ...alive(true), now: () => t0 + 23 * 3_600_000 }), isState('BUSY'));
+      await writeEnrolMarker(dir, enrol(), { ...alive(true), now: () => t0 + skew });
+      assert.equal((await readEnrolMarker(dir))?.pid, process.pid);
+    }
+  });
+});
+
+test('enrol marker: creation is exclusive: of two racing creators exactly one wins', async () => {
+  await withDir(async (dir) => {
+    await StateStore.open(dir);
+    const results = await Promise.allSettled([
+      writeEnrolMarker(dir, enrol({ pid: 4_000_005 }), alive(true)),
+      writeEnrolMarker(dir, enrol({ pid: 4_000_006 }), alive(true)),
+      writeEnrolMarker(dir, enrol({ pid: 4_000_007 }), alive(true)),
+    ]);
+    assert.equal(results.filter((r) => r.status === 'fulfilled').length, 1);
+    for (const r of results) if (r.status === 'rejected') assert.ok(r.reason instanceof StateError && r.reason.code === 'BUSY');
+    const m = await readEnrolMarker(dir);
+    assert.ok(m !== null && [4_000_005, 4_000_006, 4_000_007].includes(m.pid));
+  });
+});
+
+test('enrol marker: clear = no-op without a marker, allowed for the owner / a dead owner, BUSY for a live foreign one; a symlink is UNSAFE', async () => {
+  await withDir(async (dir) => {
+    await clearEnrolMarker(dir);
+    await writeEnrolMarker(dir, enrol());
+    await clearEnrolMarker(dir);
+    assert.equal(await readEnrolMarker(dir), null);
+    await writeEnrolMarker(dir, enrol({ pid: 4_000_008 }));
+    await assert.rejects(clearEnrolMarker(dir, alive(true)), isState('BUSY'));
+    assert.equal((await readEnrolMarker(dir))?.pid, 4_000_008);
+    await clearEnrolMarker(dir, alive(false));
+    assert.equal(await readEnrolMarker(dir), null);
+    if (posix) {
+      const file = nodePath.join(syncDir(dir), 'enrol.json');
+      const victim = nodePath.join(dir, 'victim.json');
+      await writeFile(victim, JSON.stringify(enrol()), { mode: 0o600 });
+      await symlink(victim, file);
+      await assert.rejects(readEnrolMarker(dir), isState('UNSAFE'));
+      await assert.rejects(writeEnrolMarker(dir, enrol()), isState('UNSAFE'));
+      await clearEnrolMarker(dir, { force: true });
+      assert.equal(await readFile(victim, 'utf8') !== '', true, 'force removes the link, never the target');
+    }
   });
 });

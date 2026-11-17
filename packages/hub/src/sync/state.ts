@@ -18,11 +18,12 @@
  */
 
 import { randomBytes } from 'node:crypto';
-import { lstat, mkdir, open, readdir, rm } from 'node:fs/promises';
+import { link, lstat, mkdir, open, readdir, rename, rm } from 'node:fs/promises';
 import nodePath from 'node:path';
 import { ensurePrivateDir, openPrivate, renameRetry, TrustError } from '@agent-ledger/shared';
 import { parse as parseYaml } from 'yaml';
 import { z } from 'zod';
+import { validateRemoteUrl } from './gitx.ts';
 import { assertTreePath } from './treebuild.ts';
 
 export const SYNC_DIR = '.hub/sync';
@@ -30,6 +31,11 @@ export const INFLIGHT_FILE = 'inflight.json';
 export const STATE_FILE = 'state.json';
 /** `<ledger>/.hub/sync.yml`: where the remote lives (written by `sync init`, B4). */
 export const SYNC_CONFIG_FILE = '.hub/sync.yml';
+/** `<ledger>/.hub/sync/enrol.json`: enrolment in progress (`sync init|join`). While it exists the hub refuses to start. */
+export const ENROL_FILE = 'enrol.json';
+export const MAX_ENROL_BYTES = 4 * 1024;
+/** A marker older than this is taken over whatever its pid says (pid reuse must not wedge enrolment). */
+export const ENROL_STALE_MS = 24 * 60 * 60_000;
 
 export const MAX_STATE_BYTES = 512 * 1024;
 export const MAX_INFLIGHT_BYTES = 12 * 1024 * 1024;
@@ -121,7 +127,7 @@ export interface Inflight {
   stage: 'prepared' | 'ref-moved' | 'notes-done';
 }
 
-export type StateErrorCode = 'CORRUPT' | 'INVALID' | 'UNSAFE' | 'INVARIANT' | 'IO';
+export type StateErrorCode = 'CORRUPT' | 'INVALID' | 'UNSAFE' | 'INVARIANT' | 'IO' | 'BUSY';
 
 export class StateError extends Error {
   readonly code: StateErrorCode;
@@ -423,7 +429,7 @@ async function writeDurable(path: string, text: string): Promise<void> {
   }
 }
 
-const TMP_LEFTOVER_RE = /^(?:state|inflight)\.json\.\d+\.[0-9a-f]{12}\.tmp$/;
+const TMP_LEFTOVER_RE = /^(?:state|inflight|enrol)\.json\.\d+\.[0-9a-f]{12}\.tmp$/;
 const TMP_STALE_MS = 10 * 60_000;
 
 async function sweepTmp(dir: string): Promise<void> {
@@ -573,4 +579,209 @@ export async function readSyncConfig(ledgerDir: string): Promise<{ v: 1; remote:
   const res = syncConfigSchema.safeParse(raw);
   if (!res.success) return fail('sync.yml', res.error);
   return res.data as { v: 1; remote: string };
+}
+
+async function ensureLedgerHub(ledgerDir: string, sync: boolean): Promise<void> {
+  const hub = nodePath.join(ledgerDir, '.hub');
+  try {
+    if (process.platform === 'win32') await ensurePrivateDir(hub);
+    else await mkdir(hub, { recursive: true, mode: 0o700 });
+    if (sync) await ensurePrivateDir(nodePath.join(ledgerDir, SYNC_DIR));
+  } catch (err) {
+    if (err instanceof TrustError) throw new StateError('UNSAFE', 'sync directory is not private to this user');
+    throw new StateError('IO', 'cannot create the sync directory');
+  }
+}
+
+/** Parse the config text we are about to write exactly as `readSyncConfig` would, and require the URL back. */
+function syncConfigText(remote: string): string {
+  const text = `v: 1\nremote: ${JSON.stringify(remote)}\n`;
+  let raw: unknown;
+  try {
+    raw = parseYaml(text, { maxAliasCount: 0 });
+  } catch {
+    return fail('sync.yml', null);
+  }
+  const res = syncConfigSchema.safeParse(raw);
+  if (!res.success || res.data.remote !== remote || Buffer.byteLength(text, 'utf8') > MAX_SYNC_CONFIG_BYTES) {
+    return fail('sync.yml', res.success ? null : res.error);
+  }
+  return text;
+}
+
+/** Write `<ledger>/.hub/sync.yml` (`sync init|join`): the remote is re-validated with `validateRemoteUrl`
+ *  (ssh / scp only, no credentials, no leading dash; `testLocalRemotes` is a TEST seam, never from env),
+ *  the file text is parsed back with the reader's schema, then tmp (0600, exclusive) -> fsync -> rename ->
+ *  dir fsync. A symlink at the destination is replaced, never followed (rename). Throws `StateError`
+ *  (`INVALID` for a refused URL: the message never contains it). */
+export async function writeSyncConfig(
+  ledgerDir: string,
+  remote: string,
+  opts: { testLocalRemotes?: readonly string[] } = {},
+): Promise<void> {
+  try {
+    validateRemoteUrl(remote, opts.testLocalRemotes ?? []);
+  } catch {
+    throw new StateError('INVALID', 'refusing to write sync.yml: the remote URL is not acceptable');
+  }
+  const text = syncConfigText(remote);
+  await ensureLedgerHub(ledgerDir, false);
+  await writeDurable(nodePath.join(ledgerDir, SYNC_CONFIG_FILE), text);
+}
+
+/* ---------------- enrol marker (`.hub/sync/enrol.json`) ---------------- */
+
+/** Stage tokens are owned by `enrol.ts` (B4b); the grammar only keeps them out of paths, URLs and prose. */
+const enrolSchema = z.strictObject({
+  v: z.literal(1),
+  kind: z.enum(['init', 'join']),
+  stage: z.string().regex(/^[a-z][a-z0-9-]{0,29}$/),
+  pid: z.number().int().min(1).max(2 ** 31 - 1),
+  startedAt: iso,
+  remote: syncConfigSchema.shape.remote,
+  F0: sha.optional(),
+});
+export type EnrolMarker = z.infer<typeof enrolSchema>;
+
+function parseEnrol(text: string): EnrolMarker {
+  let raw: unknown;
+  try {
+    raw = JSON.parse(text);
+  } catch {
+    return fail('enrol marker', null);
+  }
+  const res = enrolSchema.safeParse(raw);
+  if (!res.success) return fail('enrol marker', res.error);
+  return res.data;
+}
+
+function enrolPath(ledgerDir: string): string {
+  return nodePath.join(ledgerDir, SYNC_DIR, ENROL_FILE);
+}
+
+function pidAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (err) {
+    return !isErrno(err, 'ESRCH'); // EPERM = exists, owned by someone else
+  }
+}
+
+export interface EnrolOptions {
+  /** Test seams. */
+  now?: () => number;
+  pidAlive?: (pid: number) => boolean;
+}
+
+/** `null` = no marker. Present but invalid / oversize / unsafe THROWS (fail closed: the hub stays down). */
+export async function readEnrolMarker(ledgerDir: string): Promise<EnrolMarker | null> {
+  const text = await readCapped(enrolPath(ledgerDir), MAX_ENROL_BYTES);
+  return text === null ? null : parseEnrol(text);
+}
+
+/** Dead owner, or older than `ENROL_STALE_MS` (distance, not sign: clocks jump). */
+function takeoverAllowed(m: EnrolMarker, o: EnrolOptions): boolean {
+  const now = (o.now ?? Date.now)();
+  if (Math.abs(now - Date.parse(m.startedAt)) > ENROL_STALE_MS) return true;
+  return !(o.pidAlive ?? pidAlive)(m.pid);
+}
+
+/** `link(tmp, path)` = atomic create-if-absent with complete content (never a torn marker). */
+async function createExclusive(path: string, text: string): Promise<void> {
+  const tmp = `${path}.${String(process.pid)}.${randomBytes(6).toString('hex')}.tmp`;
+  try {
+    const h = await openPrivate(tmp, 'excl', 0o600);
+    try {
+      await h.writeFile(text);
+      await h.sync();
+    } finally {
+      await h.close();
+    }
+    try {
+      await link(tmp, path);
+    } catch (err) {
+      if (isErrno(err, 'EEXIST')) throw new StateError('BUSY', 'an enrolment marker already exists');
+      throw new StateError('IO', 'cannot create the enrolment marker');
+    }
+  } catch (err) {
+    if (err instanceof StateError) throw err;
+    if (err instanceof TrustError) throw new StateError('UNSAFE', 'sync directory failed the ownership check');
+    throw new StateError('IO', 'cannot write the enrolment marker');
+  } finally {
+    await rm(tmp, { force: true }).catch(() => undefined);
+  }
+  try {
+    await fsyncDir(nodePath.dirname(path));
+  } catch {
+    throw new StateError('IO', 'cannot sync the sync directory');
+  }
+}
+
+/** Move a stale marker out of the way. `rename` is atomic, so of two simultaneous takers one gets
+ *  ENOENT. What was moved must be the exact marker we judged stale; otherwise (someone created a
+ *  fresh one in between) put it back and report BUSY. */
+async function removeStale(path: string, judged: EnrolMarker): Promise<void> {
+  const aside = `${path}.stale.${String(process.pid)}.${randomBytes(6).toString('hex')}`;
+  try {
+    await rename(path, aside);
+  } catch (err) {
+    if (isErrno(err, 'ENOENT')) return;
+    throw new StateError('IO', 'cannot take over the enrolment marker');
+  }
+  try {
+    const moved = parseEnrol((await readCapped(aside, MAX_ENROL_BYTES)) ?? '');
+    if (moved.pid !== judged.pid || moved.startedAt !== judged.startedAt || moved.kind !== judged.kind) {
+      await link(aside, path).catch(() => undefined);
+      throw new StateError('BUSY', 'an enrolment marker is held by another process');
+    }
+  } catch (err) {
+    if (err instanceof StateError && err.code === 'BUSY') throw err;
+    // the moved file was unreadable now: it is not what we judged, put it back untouched
+    await link(aside, path).catch(() => undefined);
+    throw new StateError('BUSY', 'an enrolment marker is held by another process');
+  } finally {
+    await rm(aside, { force: true }).catch(() => undefined);
+  }
+}
+
+/** Create or advance the marker. No marker: created atomically and exclusively. Same pid and kind
+ *  (stage advance): replaced atomically. Marker of a dead pid, or older than 24 h: taken over. Anything
+ *  else (live foreign owner, other kind of the same live pid) THROWS `StateError('BUSY')`; a corrupt
+ *  marker throws `CORRUPT` (clear it with `clearEnrolMarker(dir, { force: true })`). The input is
+ *  validated first (strict, 4 KB): nothing invalid ever reaches the disk. */
+export async function writeEnrolMarker(ledgerDir: string, marker: EnrolMarker, opts: EnrolOptions = {}): Promise<void> {
+  const res = enrolSchema.safeParse(marker);
+  if (!res.success) throw new StateError('INVALID', 'refusing to write an invalid enrolment marker');
+  const text = JSON.stringify(res.data);
+  if (Buffer.byteLength(text, 'utf8') > MAX_ENROL_BYTES) throw new StateError('INVALID', 'refusing to write an oversize enrolment marker');
+  await ensureLedgerHub(ledgerDir, true);
+  const path = enrolPath(ledgerDir);
+  const existing = await readEnrolMarker(ledgerDir);
+  if (existing === null) return createExclusive(path, text);
+  if (existing.pid === res.data.pid && existing.kind === res.data.kind) return writeDurable(path, text);
+  if (!takeoverAllowed(existing, opts)) throw new StateError('BUSY', 'an enrolment is already in progress');
+  await removeStale(path, existing);
+  return createExclusive(path, text);
+}
+
+/** Remove the marker. No marker = no-op. Allowed for the owner (same pid) and for a takeover-eligible
+ *  marker; a live foreign marker THROWS `BUSY`. `force: true` (the human `--abort`) removes whatever is
+ *  there, a corrupt marker included: it only ever unlinks the marker path itself. */
+export async function clearEnrolMarker(ledgerDir: string, opts: EnrolOptions & { force?: boolean } = {}): Promise<void> {
+  const path = enrolPath(ledgerDir);
+  if ((await lstat(path).catch(() => null)) === null) return;
+  if (opts.force !== true) {
+    const existing = await readEnrolMarker(ledgerDir);
+    if (existing === null) return;
+    if (existing.pid !== process.pid && !takeoverAllowed(existing, opts)) {
+      throw new StateError('BUSY', 'an enrolment is in progress in another process');
+    }
+  }
+  try {
+    await rm(path, { force: true });
+    await fsyncDir(nodePath.dirname(path));
+  } catch {
+    throw new StateError('IO', 'cannot remove the enrolment marker');
+  }
 }

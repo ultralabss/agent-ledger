@@ -13,6 +13,7 @@ import {
   assertPrivateDir,
   assertTrustedAncestors,
   DEVICE_ID_RE,
+  deviceEmail,
   ensurePrivateDir,
   gitSigningArgs,
   isOwnedByMe,
@@ -584,8 +585,6 @@ export interface LedgerGitOptions {
   /** APPLY crash marker (`.hub/sync/inflight.json`). ALWAYS checked, sync on or off: while it exists the
    *  worktree may sit between two trees and `add -A` would commit a revert (T-B3-3). */
   inflightMarker?: string;
-  /** Called after every successful commit (the sync loop's `trigger('commit')`). Never throws into commit(). */
-  onCommitted?: () => void;
 }
 
 /** What `commit()` needs to sign as this device. `label` is a `labelSchema` value, `deviceId` a `DEVICE_ID_RE`
@@ -753,8 +752,16 @@ export class LedgerGit {
   private readonly exclusive = new AsyncLocalStorage<{ open: boolean }>();
   private markerLogged = false;
   private syncPushLogged = false;
+  /** Called after every successful commit (the sync loop's `trigger('commit')`). Never throws into commit()
+   *  (a throw is logged). Installed with `setOnCommitted` after construction (AL-51). */
+  private onCommitted: (() => void) | null = null;
   /** `:(exclude,icase)` accepted by this git? Flips to false once, on a pathspec-magic error (fallback below). */
   private icaseExclude = true;
+
+  /** Install (or, with `null`, remove) the after-commit hook. Replaces any previous hook. */
+  setOnCommitted(fn: (() => void) | null): void {
+    this.onCommitted = typeof fn === 'function' ? fn : null;
+  }
 
   constructor(opts: LedgerGitOptions) {
     this.opts = opts;
@@ -1534,7 +1541,7 @@ export class LedgerGit {
             '-c',
             `user.name=${who.label}`,
             '-c',
-            `user.email=${who.deviceId}@devices.agent-ledger.invalid`,
+            `user.email=${deviceEmail(who.deviceId)}`,
             ...gitSigningArgs(who.signing),
           ];
           signed = true;
@@ -1560,7 +1567,7 @@ export class LedgerGit {
     this.state.lastCommitAt = new Date().toISOString();
     try {
       // Outside the exclusive context: the hook may schedule work that calls runExclusive/flush later.
-      this.exclusive.exit(() => this.opts.onCommitted?.());
+      this.exclusive.exit(() => this.onCommitted?.());
     } catch (err) {
       this.opts.log(`ledger: onCommitted hook failed: ${logSafeErr(err)}`);
     }

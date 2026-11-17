@@ -164,13 +164,15 @@ export interface BuildEnvInput {
   emptyConfigFile: string;
   /** Network call: also keeps `SSH_AUTH_SOCK` and sets `GIT_SSH_COMMAND`. */
   sshCommand?: string;
+  /** With `sshCommand`: do NOT keep `SSH_AUTH_SOCK` (anonymous probe). */
+  noAgent?: boolean;
   extra?: Readonly<Partial<Record<ExtraGitEnvKey, string>>>;
 }
 
 /** Pure. The ONLY place a git child's environment is made. */
 export function buildGitEnv(i: BuildEnvInput): Record<string, string> {
   const out: Record<string, string> = {};
-  const wanted: readonly string[] = i.sshCommand !== undefined ? [...ENV_ALLOW, ...ENV_ALLOW_NET] : ENV_ALLOW;
+  const wanted: readonly string[] = i.sshCommand !== undefined && i.noAgent !== true ? [...ENV_ALLOW, ...ENV_ALLOW_NET] : ENV_ALLOW;
   const win = i.platform === 'win32';
   for (const [k, v] of Object.entries(i.source)) {
     if (typeof v !== 'string' || v.includes('\0')) continue;
@@ -204,6 +206,8 @@ export interface SshCommandInput {
   sshBin: string;
   knownHostsFile: string;
   keyFile?: string;
+  /** No credential of any kind: no `-i`, no public-key authentication, no agent (`lsRemoteAnonymous`). */
+  anonymous?: boolean;
   platform?: NodeJS.Platform;
 }
 
@@ -257,7 +261,10 @@ export function buildSshCommand(i: SshCommandInput): string {
     '-o',
     'ServerAliveCountMax=3',
   ];
-  if (i.keyFile !== undefined) argv.push('-i', path(i.keyFile));
+  if (i.anonymous === true) {
+    // `IdentitiesOnly` alone still offers the default `~/.ssh/id_*` files: switch public-key auth off outright.
+    argv.push('-o', 'PubkeyAuthentication=no', '-o', 'IdentityAgent=none');
+  } else if (i.keyFile !== undefined) argv.push('-i', path(i.keyFile));
   return argv.map(shQuote).join(' ');
 }
 
@@ -627,15 +634,34 @@ export class Gitx {
     );
   }
 
-  /** `clone --no-checkout --no-tags --no-recurse-submodules -- <url> <dest>` (join). `cwd` = existing parent of `dest`. */
-  async clone(cwd: string, url: string, dest: string, o: { timeoutMs?: number } = {}): Promise<GitxResult> {
+  /** `ls-remote -- <url> refs/heads/main` WITHOUT any credential: no `-i`, no `SSH_AUTH_SOCK`, no public-key
+   *  authentication at all. Enrol requires this to FAIL (a remote that answers anonymously is public). */
+  async lsRemoteAnonymous(cwd: string, url: string, o: { timeoutMs?: number } = {}): Promise<GitxResult> {
     const remote = this.remote(url);
-    requireAbsolute(dest, 'clone destination');
     return this.exec(
-      ['clone', '--no-checkout', '--no-tags', '--no-recurse-submodules', '--', remote.url, dest],
-      { cwd, timeoutMs: o.timeoutMs ?? 120_000 },
+      ['ls-remote', '--', remote.url, REF_MAIN],
+      { cwd, ...(o.timeoutMs !== undefined ? { timeoutMs: o.timeoutMs } : {}) },
       remote,
+      true,
     );
+  }
+
+  /** `git init --initial-branch=main` in `dir` (join). Writes no `remote.*`, copies no template (so no hooks).
+   *  git < 2.28 does not know `--initial-branch` (usage error, exit 129, nothing created): fall back to
+   *  `init` + `symbolic-ref HEAD refs/heads/main`. Refuses a directory that already is a repository.
+   *  `dir` must be an existing absolute directory. Throws `GitxError`, never raw git output. */
+  async initRepo(dir: string): Promise<void> {
+    requireAbsolute(dir, 'init directory');
+    const st = await lstat(nodePath.join(dir, '.git')).catch((err: unknown) => {
+      if ((err as NodeJS.ErrnoException).code === 'ENOENT') return null;
+      throw new GitxError('SPAWN', 'init directory could not be inspected');
+    });
+    if (st !== null) throw new GitxError('ARGS', 'init directory already contains a repository');
+    const first = await this.run(['init', '-q', '--template=', '--initial-branch=main'], { cwd: dir });
+    if (first.ok) return;
+    if (first.code !== 129) this.require(first, 'init');
+    this.require(await this.run(['init', '-q', '--template='], { cwd: dir }), 'init');
+    this.require(await this.run(['symbolic-ref', 'HEAD', REF_MAIN], { cwd: dir }), 'symbolic-ref');
   }
 
   /** The network methods return a result; this turns a failure into a typed throw. */
@@ -670,7 +696,7 @@ export class Gitx {
     return this.hooksDir;
   }
 
-  private async exec(args: readonly string[], o: RunOptions, net: ValidatedRemote | null): Promise<GitxResult> {
+  private async exec(args: readonly string[], o: RunOptions, net: ValidatedRemote | null, anonymous = false): Promise<GitxResult> {
     assertSafeArgv(args);
     const extraConfig = o.extraConfig ?? [];
     for (const kv of extraConfig) {
@@ -692,7 +718,8 @@ export class Gitx {
       sshCommand = buildSshCommand({
         sshBin: await this.resolveSsh(),
         knownHostsFile: this.knownHostsFile,
-        ...(this.keyFile !== undefined ? { keyFile: this.keyFile } : {}),
+        ...(this.keyFile !== undefined && !anonymous ? { keyFile: this.keyFile } : {}),
+        ...(anonymous ? { anonymous: true } : {}),
       });
     }
     const config = [
@@ -708,6 +735,7 @@ export class Gitx {
       platform: process.platform,
       emptyConfigFile: this.emptyConfig,
       ...(sshCommand !== undefined ? { sshCommand } : {}),
+      ...(anonymous ? { noAgent: true } : {}),
       ...(o.extraEnv !== undefined ? { extra: o.extraEnv } : {}),
     });
     // Git must not discover a repository above `cwd` (a ledger dir that lost its `.git` would

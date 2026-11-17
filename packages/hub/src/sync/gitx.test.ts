@@ -3,7 +3,7 @@
 import assert from 'node:assert/strict';
 import { execFile } from 'node:child_process';
 import { existsSync } from 'node:fs';
-import { chmod, mkdir, mkdtemp, readFile, realpath, rm, writeFile } from 'node:fs/promises';
+import { chmod, mkdir, mkdtemp, readdir, readFile, realpath, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import nodePath from 'node:path';
 import test from 'node:test';
@@ -17,6 +17,7 @@ import {
   parseGitConfig,
   validateRemoteUrl,
 } from './gitx.ts';
+import { gitCandidates, resolveTrustedBinary } from '../git.ts';
 import { makeKit } from './testkit-remote.ts';
 
 const posix = process.platform !== 'win32';
@@ -445,7 +446,6 @@ test('run() refuses network and unknown subcommands, global options, and non-all
     await assert.rejects(gitx.push(root, 'ssh://h/r', 'main'), GitxError);
     await assert.rejects(gitx.push(root, 'ssh://h/r', '--force'), GitxError);
     await assert.rejects(gitx.push(root, 'ssh://h/r', 'A'.repeat(40)), GitxError, 'uppercase hex refused');
-    await assert.rejects(gitx.clone(root, 'ssh://h/r', 'relative'), GitxError);
   } finally {
     await rm(root, { recursive: true, force: true });
   }
@@ -462,7 +462,7 @@ test('network methods never put force, a "+" on refs/heads/*, or a remote name i
       await gitx.fetch(root, url),
       await gitx.push(root, url, sha),
       await gitx.lsRemote(root, url),
-      await gitx.clone(root, url, nodePath.join(root, 'dest')),
+      await gitx.lsRemoteAnonymous(root, url),
     ];
     for (const r of runs) {
       const { args } = parseDump(r.stdout);
@@ -751,4 +751,152 @@ test('parseGitConfig: parsed values follow git semantics', () => {
   assert.deepEqual(entries[0], { section: 'core', subsection: null, key: 'filemode', value: 'true' });
   assert.deepEqual(entries[1], { section: 'remote', subsection: 'origin', key: 'url', value: 'ab' });
   assert.deepEqual(entries[2], { section: 'remote', subsection: 'origin', key: 'flag', value: null });
+});
+
+/* ---------------- B4a: initRepo (AL-52), anonymous probe, D3 matrix (AL-38) ---------------- */
+
+test('buildSshCommand / buildGitEnv: anonymous mode has no -i, no public-key auth, no agent', () => {
+  const named = buildSshCommand({ sshBin: '/usr/bin/ssh', knownHostsFile: '/x/kh', keyFile: '/x/key' });
+  assert.ok(named.includes("'-i' '/x/key'"));
+  assert.ok(!named.includes('PubkeyAuthentication'));
+  const anon = buildSshCommand({ sshBin: '/usr/bin/ssh', knownHostsFile: '/x/kh', keyFile: '/x/key', anonymous: true });
+  assert.ok(!anon.includes("'-i'") && !anon.includes('/x/key'), anon);
+  assert.ok(anon.includes("'PubkeyAuthentication=no'") && anon.includes("'IdentityAgent=none'"), anon);
+  const env = buildGitEnv({ source: HOSTILE_ENV, platform: 'linux', emptyConfigFile: '/e', sshCommand: 'x', noAgent: true });
+  assert.ok(!('SSH_AUTH_SOCK' in env));
+  assert.equal(env.GIT_SSH_COMMAND, 'x');
+});
+
+test('lsRemoteAnonymous: argv like lsRemote, but no -i, no SSH_AUTH_SOCK, no public-key auth', { skip: !posix }, async () => {
+  const root = await tmpRoot();
+  try {
+    const fake = await fakeBin(root, 'fakegit', DUMP);
+    const gitx = await Gitx.open({
+      syncDir: nodePath.join(root, 'sync'),
+      gitBin: fake,
+      sshBin: '/usr/bin/ssh',
+      keyFile: nodePath.join(root, 'key'),
+      env: { ...HOSTILE_ENV, PATH: process.env.PATH ?? '/usr/bin:/bin' },
+    });
+    const url = 'git@example.invalid:owner/repo.git';
+    const named = parseDump((await gitx.lsRemote(root, url)).stdout);
+    const anon = parseDump((await gitx.lsRemoteAnonymous(root, url)).stdout);
+    assert.ok((named.env.get('GIT_SSH_COMMAND') ?? '').includes("'-i'"));
+    assert.equal(named.env.get('SSH_AUTH_SOCK'), '/tmp/agent.sock');
+    const cmd = anon.env.get('GIT_SSH_COMMAND') ?? '';
+    assert.ok(cmd !== '' && !cmd.includes("'-i'") && !cmd.includes('/key'), cmd);
+    assert.ok(cmd.includes("'PubkeyAuthentication=no'"));
+    assert.ok(!anon.env.has('SSH_AUTH_SOCK'));
+    const dd = anon.args.indexOf('--');
+    assert.deepEqual(anon.args.slice(dd - 1), ['ls-remote', '--', url, 'refs/heads/main']);
+    assert.deepEqual(anon.args.slice(dd), named.args.slice(named.args.indexOf('--')));
+    await assert.rejects(gitx.lsRemoteAnonymous(root, '-oProxyCommand=x'), (e: unknown) => e instanceof GitxError && e.code === 'URL');
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('real git: initRepo makes a main repo whose config passes the allowlist, with no remote.* and no templates', { skip: !posix }, async () => {
+  const root = await tmpRoot();
+  try {
+    const gitx = await Gitx.open({ syncDir: nodePath.join(root, 'sync') });
+    const dir = nodePath.join(root, 'ledger');
+    await mkdir(dir, { mode: 0o700 });
+    await gitx.initRepo(dir);
+    const cfg = await readFile(nodePath.join(dir, '.git', 'config'), 'utf8');
+    assert.deepEqual(checkGitConfig(cfg), []);
+    assert.ok(!/\[remote/i.test(cfg) && !/tagOpt/i.test(cfg), 'init writes no remote.*');
+    assert.equal((await readFile(nodePath.join(dir, '.git', 'HEAD'), 'utf8')).trim(), 'ref: refs/heads/main');
+    const hooks = nodePath.join(dir, '.git', 'hooks');
+    assert.ok(!existsSync(hooks) || (await readdir(hooks)).length === 0, 'no template hooks copied');
+    // never reinitialises an existing repository
+    await assert.rejects(gitx.initRepo(dir), (e: unknown) => e instanceof GitxError && e.code === 'ARGS');
+    // relative / missing directories are typed errors
+    await assert.rejects(gitx.initRepo('relative/dir'), GitxError);
+    await assert.rejects(gitx.initRepo(nodePath.join(root, 'absent')), (e: unknown) => e instanceof GitxError && e.code === 'SPAWN');
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('real git: initRepo falls back to init + symbolic-ref when git does not know --initial-branch (exit 129)', { skip: !posix }, async () => {
+  const root = await tmpRoot();
+  try {
+    const real = await resolveTrustedBinary(gitCandidates(), 'git');
+    const old = await fakeBin(
+      root,
+      'oldgit',
+      `for a in "$@"; do if [ "$a" = "--initial-branch=main" ]; then echo "error: unknown option" >&2; exit 129; fi; done\nexec '${real}' "$@"`,
+    );
+    const gitx = await Gitx.open({ syncDir: nodePath.join(root, 'sync'), gitBin: old });
+    const dir = nodePath.join(root, 'ledger');
+    await mkdir(dir, { mode: 0o700 });
+    await gitx.initRepo(dir);
+    assert.equal((await readFile(nodePath.join(dir, '.git', 'HEAD'), 'utf8')).trim(), 'ref: refs/heads/main');
+    assert.deepEqual(checkGitConfig(await readFile(nodePath.join(dir, '.git', 'config'), 'utf8')), []);
+    // any other failure is NOT retried as a fallback
+    const broken = await fakeBin(root, 'brokengit', 'echo boom >&2; exit 1');
+    const g2 = await Gitx.open({ syncDir: nodePath.join(root, 'sync2'), gitBin: broken });
+    const d2 = nodePath.join(root, 'ledger2');
+    await mkdir(d2, { mode: 0o700 });
+    await assert.rejects(g2.initRepo(d2), (e: unknown) => e instanceof GitxError && e.code === 'EXIT');
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('AL-52: no code path spawns `clone` (the method is gone, run() refuses it, recorded argv never holds it)', { skip: !posix }, async () => {
+  const root = await tmpRoot();
+  try {
+    const log = nodePath.join(root, 'argv.log');
+    const rec = await fakeBin(root, 'recgit', `for a in "$@"; do printf '%s\\n' "$a" >> '${log}'; done`);
+    const gitx = await Gitx.open({ syncDir: nodePath.join(root, 'sync'), gitBin: rec, sshBin: '/usr/bin/ssh' });
+    assert.equal((gitx as unknown as Record<string, unknown>).clone, undefined);
+    await assert.rejects(gitx.run(['clone', '--', 'ssh://h/r', root], { cwd: root }), (e: unknown) => e instanceof GitxError && e.code === 'ARGS');
+    const url = 'git@example.invalid:owner/repo.git';
+    const dir = nodePath.join(root, 'work');
+    await mkdir(dir, { mode: 0o700 });
+    await gitx.initRepo(dir);
+    await gitx.fetch(root, url);
+    await gitx.push(root, url, 'c'.repeat(40));
+    await gitx.lsRemote(root, url);
+    await gitx.lsRemoteAnonymous(root, url);
+    const args = (await readFile(log, 'utf8')).split('\n');
+    assert.ok(args.includes('init') && args.includes('fetch') && args.includes('ls-remote'));
+    assert.ok(!args.includes('clone'));
+    const src = await readFile(new URL('./gitx.ts', import.meta.url), 'utf8');
+    assert.ok(!/['"`]clone['"`]/.test(src), 'gitx.ts must not name a clone subcommand');
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('AL-38 D3: a legacy `remote.origin.url` is tolerated only as a clean absolute path or a valid ssh URL', () => {
+  // git writes a backslash in a config value as `\\` (a raw `\b` is a backspace escape)
+  const cfg = (url: string): string => `${BASE}[remote "origin"]\n\turl = ${url.replace(/\\/g, '\\\\')}\n`;
+  const ok = (url: string): boolean => checkGitConfig(cfg(url)).length === 0;
+  const posixOk = process.platform === 'win32' ? [] : ['/abs/path/to/backup.git', '/srv/git/ledger'];
+  for (const u of [...posixOk, 'C:\\backup\\ledger.git', 'C:/backup/ledger.git', 'git@host.example:o/r.git', 'ssh://git@host.example/o/r.git']) {
+    assert.ok(ok(u), `${u} must be tolerated`);
+  }
+  for (const u of [
+    'relative/path',
+    './rel',
+    '../up',
+    'file:///abs/path',
+    'https://host.example/o/r.git',
+    'http://host.example/o/r.git',
+    'git://host.example/o/r.git',
+    'ext::sh -c id',
+    'fd::3',
+    '-oProxyCommand=x',
+    '--upload-pack=x',
+    '/abs/with\u0001control',
+    '/abs/with\u007fdel',
+    'C:\\x\u0007bell',
+  ]) {
+    const problems = checkGitConfig(cfg(u));
+    assert.ok(problems.length > 0, `${JSON.stringify(u)} must be refused`);
+    assert.ok(!JSON.stringify(problems).includes(u.slice(0, 5)) || u.length <= 5, 'the value is never echoed');
+  }
 });

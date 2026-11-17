@@ -83,16 +83,15 @@ async function world(): Promise<World> {
   const c0 = await git(gitxA, dirA, ['rev-parse', REF_MAIN]);
   const pushed = await gitxA.push(dirA, remote, c0);
   assert.equal(pushed.ok, true, 'base pushed');
-  // ---- B: a clone of the base, its own key
+  // ---- B: init + fetch of the base (AL-52: no `clone`), its own key
+  await rm(dirB, { recursive: true, force: true });
   await mkdir(dirB, { mode: 0o700 });
   const gitxB0 = await Gitx.open({ syncDir: nodePath.join(rootTmp, 'b-clone-sync'), testLocalRemotes: [remote] });
-  await rm(dirB, { recursive: true });
-  assert.equal((await gitxB0.clone(rootTmp, remote, dirB)).ok, true);
-  await chmod(dirB, 0o700);
+  await gitxB0.initRepo(dirB);
+  assert.equal((await gitxB0.fetch(dirB, remote)).ok, true);
+  const f0 = await git(gitxB0, dirB, ['rev-parse', '--verify', 'refs/ledger-sync/incoming']);
+  await git(gitxB0, dirB, ['update-ref', REF_MAIN, f0, '0'.repeat(40)]);
   await git(gitxB0, dirB, ['read-tree', '--reset', '-u', REF_MAIN]);
-  // TODO(B4/B5): `Gitx.clone --no-tags` leaves `remote.origin.tagOpt`, which `checkGitConfig` refuses (`key`).
-  const cfgPath = nodePath.join(dirB, '.git', 'config');
-  await writeFile(cfgPath, (await readFile(cfgPath, 'utf8')).split('\n').filter((l) => !/tagOpt/i.test(l)).join('\n'));
   const gitxB = await Gitx.open({ syncDir: nodePath.join(dirB, '.hub', 'sync'), testLocalRemotes: [remote] });
   const initB = await initDevice(dirB, { label: 'b' });
   const pubB = (await readFile(deviceLayout(dirB).pubFile, 'utf8')).trim().split(' ').slice(0, 2).join(' ');

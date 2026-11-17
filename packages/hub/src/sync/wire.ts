@@ -12,7 +12,7 @@
 
 import { lstat } from 'node:fs/promises';
 import nodePath from 'node:path';
-import { deviceLayout, readSigners, resolveSshKeygen } from '@agent-ledger/shared';
+import { deviceEmail, deviceLayout, readSigners, resolveSshKeygen } from '@agent-ledger/shared';
 import type { HubConfig } from '../config.ts';
 import type { RuntimeStore } from '../db/store.ts';
 import type { Ledger } from '../ledger/ledger.ts';
@@ -159,7 +159,7 @@ export async function startSync(o: {
     const deps: CycleDeps = {
       ledgerDir: ledger.paths.root,
       ...core,
-      identity: { name: device.label, email: `${device.device_id}@devices.agent-ledger.invalid` },
+      identity: { name: device.label, email: deviceEmail(device.device_id) },
       signing,
       localDevice: device.device_id,
       maxFormat: LEDGER_FORMAT,
@@ -171,10 +171,8 @@ export async function startSync(o: {
       ...(o.testLocalRemotes === undefined ? {} : { testLocalRemotes: o.testLocalRemotes }),
     };
     const loop = new SyncLoop({ deps, intervalMs: config.syncIntervalMs });
-    // A commit by the local ledger asks for a cycle (debounced by the loop). `LedgerGit` takes the hook at
-    // construction only; until `Ledger` forwards it, patch the option object it already holds (typed guard).
-    const git = ledger.git as unknown as { opts?: { onCommitted?: () => void } };
-    if (git.opts !== undefined) git.opts.onCommitted = () => loop.trigger('commit');
+    // A commit by the local ledger asks for a cycle (debounced by the loop).
+    ledger.git.setOnCommitted(() => loop.trigger('commit'));
     if (o.start) loop.start();
     log(`sync: enabled (verify ${config.syncVerify}, every ${String(Math.round(config.syncIntervalMs / 1000))} s)`);
     return loop;

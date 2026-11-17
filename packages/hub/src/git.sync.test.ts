@@ -313,7 +313,8 @@ test('a timer armed INSIDE runExclusive still fires its flush afterwards', async
 });
 
 test('a continuation born inside runExclusive may call runExclusive/flush after the section ended (B3-M2)', async (t) => {
-  const fx = await fixture(t, { onCommitted: () => undefined });
+  const fx = await fixture(t);
+  fx.lg.setOnCommitted(() => undefined);
   await seed(fx);
   let later!: Promise<unknown>;
   await fx.lg.runExclusive(async () => {
@@ -330,11 +331,11 @@ test('onCommitted runs outside the exclusive context: work it schedules may use 
   let later: Promise<unknown> = Promise.resolve();
   let hooked = 0;
   const fx = await fixture(t);
-  fx.opts.onCommitted = () => {
+  fx.lg.setOnCommitted(() => {
     hooked += 1;
     assert.doesNotThrow(() => void fx.lg.flush().catch(() => undefined));
     later = new Promise<void>((resolve) => setTimeout(resolve, 20)).then(() => fx.lg.runExclusive(async () => 1));
-  };
+  });
   await writeTracked(fx);
   assert.equal(await fx.commit(), 'committed');
   assert.equal(hooked, 1);
@@ -641,11 +642,10 @@ test('sync off: commits stay unsigned and use the repo identity', async (t) => {
 
 test('onCommitted fires once per commit, never on clean; a throwing hook cannot fail the commit', async (t) => {
   let n = 0;
-  const fx = await fixture(t, {
-    onCommitted: () => {
-      n += 1;
-      throw new Error('hook bug');
-    },
+  const fx = await fixture(t);
+  fx.lg.setOnCommitted(() => {
+    n += 1;
+    throw new Error('hook bug');
   });
   assert.equal(await fx.commit(), 'committed', 'the fixture .gitignore is the first commit');
   assert.equal(n, 1);
@@ -655,6 +655,31 @@ test('onCommitted fires once per commit, never on clean; a throwing hook cannot 
   assert.equal(await fx.commit(), 'committed');
   assert.equal(n, 2);
   assert.ok(fx.logs.some((l) => /onCommitted hook failed/.test(l)));
+});
+
+test('AL-51 setOnCommitted: replaces the previous hook, null removes it, a non-function is treated as null', async (t) => {
+  let a = 0;
+  let b = 0;
+  const fx = await fixture(t);
+  fx.lg.setOnCommitted(() => {
+    a += 1;
+  });
+  assert.equal(await fx.commit(), 'committed', 'the fixture .gitignore is the first commit');
+  assert.equal(a, 1);
+  fx.lg.setOnCommitted(() => {
+    b += 1;
+  });
+  await writeTracked(fx);
+  assert.equal(await fx.commit(), 'committed');
+  assert.deepEqual([a, b], [1, 1]);
+  fx.lg.setOnCommitted(null);
+  await writeFile(join(fx.dir, 'tracked2.txt'), 'two\n');
+  assert.equal(await fx.commit(), 'committed');
+  assert.deepEqual([a, b], [1, 1]);
+  fx.lg.setOnCommitted('nope' as unknown as () => void);
+  await writeFile(join(fx.dir, 'tracked3.txt'), 'three\n');
+  assert.equal(await fx.commit(), 'committed');
+  assert.deepEqual([a, b], [1, 1]);
 });
 
 /* ---------------- maybePush ---------------- */

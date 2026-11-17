@@ -7,8 +7,12 @@ import test from 'node:test';
 import {
   DEVICES_MAX_ENTRIES,
   DEVICES_TIME_BOUND_MS,
+  DEVICE_EMAIL_DOMAIN,
   DevicesError,
   acceptDevicesChange,
+  deviceEmail,
+  deviceIdFromEmail,
+  planAddDevice,
   devicesInvariantProblem,
   safeOutput,
   parseAllowedSigners,
@@ -18,6 +22,7 @@ import {
   type DeviceEntry,
   type DevicesFile,
 } from './devices.ts';
+import { SLOT_LETTERS } from './snowflake.ts';
 import { parseEd25519Pub } from './sshkey.ts';
 
 const WIRE = Buffer.from([0, 0, 0, 11, ...Buffer.from('ssh-ed25519'), 0, 0, 0, 32]);
@@ -355,4 +360,64 @@ test('D2/F-11: last_seen may change only on the signer\'s own entry; a new entry
 test('D2: root with a commit time is bound too; without one (local init) it is accepted', () => {
   assert.equal(reason(acceptDevicesChange(null, base(), A.pub, trust(), { allowRoot: true, commitTimeMs: T0_MS })), 'ok:root');
   assert.equal(reason(acceptDevicesChange(null, base(), A.pub, trust(), { allowRoot: true, commitTimeMs: T0_MS + 2 * DEVICES_TIME_BOUND_MS })), 'time-unbound');
+});
+
+/* ---------------- B4a: deviceEmail, planAddDevice ---------------- */
+
+test('deviceEmail / deviceIdFromEmail: one producer, one strict parser, fixed domain', () => {
+  assert.equal(DEVICE_EMAIL_DOMAIN, 'devices.agent-ledger.invalid');
+  assert.equal(deviceEmail(A.id), `${A.id}@devices.agent-ledger.invalid`);
+  assert.equal(deviceIdFromEmail(deviceEmail(A.id)), A.id);
+  for (const bad of ['', 'd_short', 'D_ABCDEFGHIJ', `${A.id}\n`, 'x@y', `${A.id}@evil.invalid`, `${A.id.toUpperCase()}`, 'd_abcdefghi1', `../${A.id}`, 5, null, undefined]) {
+    assert.throws(() => deviceEmail(bad as string), (e: unknown) => e instanceof DevicesError && e.code === 'ID_INVALID', String(bad));
+  }
+  for (const bad of [
+    `${A.id}@devices.agent-ledger.invalid.evil`, `x${A.id}@devices.agent-ledger.invalid`, ` ${A.id}@devices.agent-ledger.invalid`,
+    `${A.id}@devices.agent-ledger.invalid\n`, `${A.id}@devicesXagent-ledger.invalid`, `${A.id}@DEVICES.agent-ledger.invalid`,
+    `${A.id}@devices.agent-ledger.invalid>`, 'd_abcdefghi1@devices.agent-ledger.invalid', '', null, 5, {}, undefined,
+  ]) {
+    assert.equal(deviceIdFromEmail(bad), null, String(bad));
+  }
+});
+
+test('planAddDevice: pure; lowest never-used slot; retired slots stay retired; `added` is the given commit time', () => {
+  const root = base();
+  const frozen = JSON.stringify(root);
+  const p1 = planAddDevice(root, A.id, parseEd25519Pub(B.pub) as NonNullable<ReturnType<typeof parseEd25519Pub>>, 'win', T0_MS);
+  assert.equal(JSON.stringify(root), frozen, 'input is not mutated');
+  assert.equal(p1.entry.slot, SLOT_LETTERS[0]);
+  assert.equal(p1.entry.id, B.id);
+  assert.equal(p1.entry.added, T0);
+  assert.equal(p1.entry.added_by, A.id);
+  assert.equal(p1.entry.revoked, null);
+  assert.equal(p1.entry.role, 'owner');
+  assert.deepEqual(p1.next.devices, [...root.devices, p1.entry]);
+  assert.equal(devicesInvariantProblem(p1.next), null);
+  assert.equal(reason(acceptDevicesChange(root, p1.next, A.pub, trust(A), AT)), 'ok:update', 'a peer accepts exactly this change');
+  // a revoked entry keeps its slot forever: the next device gets the next letter
+  const withRevoked: DevicesFile = {
+    devices: [entry(A), { ...p1.entry, revoked: { at: T0, by: A.id, reason: 'lost' } }],
+  };
+  const p2 = planAddDevice(withRevoked, A.id, parseEd25519Pub(C.pub) as NonNullable<ReturnType<typeof parseEd25519Pub>>, 'tab', T0_MS);
+  assert.equal(p2.entry.slot, SLOT_LETTERS[1]);
+  // same input, same output
+  assert.deepEqual(planAddDevice(root, A.id, parseEd25519Pub(B.pub) as NonNullable<ReturnType<typeof parseEd25519Pub>>, 'win', T0_MS), p1);
+});
+
+test('planAddDevice: DEVICE_EXISTS (id or key), SLOTS_EXHAUSTED, LABEL_INVALID, bad time', () => {
+  const pubB = parseEd25519Pub(B.pub) as NonNullable<ReturnType<typeof parseEd25519Pub>>;
+  const err = (c: string) => (e: unknown): boolean => e instanceof DevicesError && e.code === c;
+  assert.throws(() => planAddDevice(base(), A.id, parseEd25519Pub(A.pub) as typeof pubB, 'x', T0_MS), err('DEVICE_EXISTS'));
+  assert.throws(() => planAddDevice({ devices: [entry(A), asB()] }, A.id, pubB, 'again', T0_MS), err('DEVICE_EXISTS'));
+  for (const label of ['', 'Upper', 'has space', '-lead', 'a'.repeat(33), 'x\ny', 'ünï']) {
+    assert.throws(() => planAddDevice(base(), A.id, pubB, label, T0_MS), err('LABEL_INVALID'), JSON.stringify(label));
+  }
+  const full: DeviceEntry[] = [entry(A)];
+  for (const slot of SLOT_LETTERS) {
+    const k = fakeKey();
+    full.push(entry(k, { slot, label: `d-${slot.toLowerCase()}`, added_by: A.id }));
+  }
+  assert.equal(devicesInvariantProblem({ devices: full }), null);
+  assert.throws(() => planAddDevice({ devices: full }, A.id, pubB, 'late', T0_MS), err('SLOTS_EXHAUSTED'));
+  assert.throws(() => planAddDevice(base(), A.id, pubB, 'win', Number.NaN), err('ADD_REFUSED'));
 });
