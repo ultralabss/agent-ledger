@@ -12,9 +12,11 @@
  * embedded in a remote URL are never printed.
  */
 
-import { readFile, stat } from 'node:fs/promises';
+import { constants as fsc } from 'node:fs';
+import { lstat, open, readFile, stat } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { SLOT_LETTERS } from '@agent-ledger/shared';
 
 export type CheckStatus = 'ok' | 'warn' | 'fail' | 'info';
 
@@ -26,9 +28,164 @@ export interface Check {
   detail: string;
 }
 
-/** No on-disk format marker exists yet, so nothing is read or invented. */
-export function formatCheck(): Check {
-  return { id: 'ledger_format', status: 'info', detail: 'ledger_format: not defined yet' };
+/** Highest `ledger.format` this CLI knows (`hub/ledger/device.ts` `LEDGER_FORMAT`; the CLI has no runtime
+ *  dependency on the hub, so the number is mirrored and only ever used for a "newer than I know" note). */
+const KNOWN_LEDGER_FORMAT = 2;
+
+/** `ledger.format` marker of the ledger: absent = format 1 (legacy, pre-sync layout). Reads one tiny file, never
+ *  follows a symlink, never fails the run (a broken marker is a warn: the hub itself refuses to start on it). */
+export async function formatCheck(ledgerDir: string): Promise<Check> {
+  const id = 'ledger_format';
+  const file = join(ledgerDir, 'ledger.format');
+  let text: string;
+  try {
+    const st = await lstat(file);
+    if (!st.isFile() || st.size > 64) return { id, status: 'warn', detail: 'ledger_format: the marker is not a small regular file' };
+    text = await readFile(file, 'utf8');
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === 'ENOENT') return { id, status: 'info', detail: 'ledger_format: 1 (legacy layout, no marker)' };
+    return { id, status: 'warn', detail: 'ledger_format: the marker could not be read' };
+  }
+  const t = text.trim();
+  if (!/^[0-9]{1,6}$/.test(t) || Number(t) < 1) return { id, status: 'warn', detail: 'ledger_format: the marker is unreadable (the hub will refuse to start)' };
+  const n = Number(t);
+  return n > KNOWN_LEDGER_FORMAT
+    ? { id, status: 'warn', detail: `ledger_format: ${String(n)} is newer than this install understands (${String(KNOWN_LEDGER_FORMAT)}): upgrade` }
+    : { id, status: 'info', detail: `ledger_format: ${String(n)}${n < KNOWN_LEDGER_FORMAT ? ' (older layout; the hub migrates it on start)' : ''}` };
+}
+
+/* ---------------- sync (enrolled ledgers): offline, read-only ---------------- */
+// Texts never carry a URL, a key or git output: only fixed words, whitelisted tokens and counts.
+
+/** `LEDGER_SYNC_VERIFY` as seen by THIS process (the hub's own service environment may differ). */
+export function syncVerifyCheck(raw: string | undefined, loop: string | undefined): Check {
+  const id = 'sync_verify_mode';
+  const v = raw === undefined || raw.trim() === '' ? 'warn' : raw.trim();
+  const loopOn = loop?.trim() === '1';
+  if (v !== 'warn' && v !== 'enforce') return { id, status: 'fail', detail: 'sync: LEDGER_SYNC_VERIFY must be "warn" or "enforce" (the hub refuses to start)' };
+  const loopNote = loopOn ? '' : '; the sync loop is off in this shell (LEDGER_SYNC is not 1)';
+  return v === 'enforce'
+    ? { id, status: 'ok', detail: `sync: verify mode enforce (unsigned or unapproved commits are quarantined)${loopNote}` }
+    : { id, status: 'warn', detail: `sync: verify mode warn: unsigned or unapproved commits are only reported, not blocked; set LEDGER_SYNC_VERIFY=enforce once every device is approved${loopNote}` };
+}
+
+const STATE_MAX_BYTES = 512 * 1024;
+const HALT_REASON_RE = /^[a-z][a-z0-9:-]{0,39}$/;
+const HALT_CLASSES = new Set(['no-contact', 'sticky', 'probe', 'd2', 'local', 'terminal']);
+
+/** Read a small regular file without following a symlink (`O_NOFOLLOW`; `lstat` first for platforms without it).
+ *  `null` = absent; throws on anything else (symlink, too large, unreadable). */
+async function readSmallNoFollow(path: string, maxBytes: number): Promise<string | null> {
+  let st;
+  try {
+    st = await lstat(path);
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === 'ENOENT') return null;
+    throw err;
+  }
+  if (!st.isFile() || st.size > maxBytes) throw new Error('not a small regular file');
+  const fh = await open(path, fsc.O_RDONLY | (fsc.O_NOFOLLOW ?? 0));
+  try {
+    const st2 = await fh.stat();
+    if (!st2.isFile() || st2.size > maxBytes || st2.ino !== st.ino || st2.dev !== st.dev) throw new Error('changed under us');
+    return await fh.readFile('utf8');
+  } finally {
+    await fh.close().catch(() => undefined);
+  }
+}
+
+/** Halt state of the sync loop (`.hub/sync/state.json`). Transient classes (`no-contact`, `probe`) are a warn;
+ *  anything that needs a human is a fail. Only whitelisted tokens are printed, never the free-text `detail`. */
+export async function syncHaltCheck(ledgerDir: string): Promise<Check> {
+  const id = 'sync_halt';
+  let text: string | null;
+  try {
+    text = await readSmallNoFollow(join(ledgerDir, '.hub', 'sync', 'state.json'), STATE_MAX_BYTES);
+  } catch {
+    return { id, status: 'warn', detail: 'sync: the sync state file is unreadable (ledger sync status)' };
+  }
+  if (text === null) return { id, status: 'info', detail: 'sync: no sync state yet (the loop has not run)' };
+  let halt: unknown;
+  try {
+    halt = (JSON.parse(text) as { halt?: unknown }).halt;
+  } catch {
+    return { id, status: 'warn', detail: 'sync: the sync state file is not valid (ledger sync status)' };
+  }
+  if (halt === null || halt === undefined) return { id, status: 'ok', detail: 'sync: not halted' };
+  const h = halt as { reason?: unknown; cls?: unknown; since?: unknown };
+  const reason = typeof h.reason === 'string' && HALT_REASON_RE.test(h.reason) ? h.reason : 'unknown';
+  const cls = typeof h.cls === 'string' && HALT_CLASSES.has(h.cls) ? h.cls : 'unknown';
+  const since = typeof h.since === 'string' && /^\d{4}-\d{2}-\d{2}/.test(h.since) ? h.since.slice(0, 10) : '?';
+  return {
+    id,
+    status: cls === 'no-contact' || cls === 'probe' ? 'warn' : 'fail',
+    detail: `sync: HALTED (${reason}, ${cls}) since ${since}: remote changes are not being applied; see: ledger sync status`,
+  };
+}
+
+/** Slot letters are never reused (a revoked device keeps its slot), so the count is every registry entry with a
+ *  letter. `>= 20` of 24 warns; all taken means no further `device add` can succeed. */
+export function syncSlotsCheck(rows: readonly { slot: string }[]): Check {
+  const id = 'sync_slots';
+  const total = SLOT_LETTERS.length;
+  const used = rows.filter((r) => r.slot !== '').length;
+  if (used >= total) return { id, status: 'fail', detail: `sync: all ${String(total)} device slots are used (revoked devices keep theirs): no further device can be added` };
+  if (used >= 20) return { id, status: 'warn', detail: `sync: ${String(used)} of ${String(total)} device slots used (revoked devices keep theirs, slots are never reused)` };
+  return { id, status: 'ok', detail: `sync: ${String(used)} of ${String(total)} device slots used` };
+}
+
+const PINNED_FILES: readonly { name: string; text: string }[] = [
+  { name: '.gitignore', text: '.hub/\n*.tmp\n' },
+  { name: '.gitattributes', text: '* text eol=lf\n' },
+];
+
+/** Byte-exact pinned files: peers' ingress rejects any other text, so a hand-edit makes every commit of this ledger
+ *  unacceptable to them (and a `.gitignore` without `.hub/` would stage the device key). */
+export async function syncPinnedFilesCheck(ledgerDir: string): Promise<Check> {
+  const id = 'sync_pinned_files';
+  const bad: string[] = [];
+  for (const f of PINNED_FILES) {
+    try {
+      if ((await readSmallNoFollow(join(ledgerDir, f.name), 4096)) !== f.text) bad.push(f.name);
+    } catch {
+      bad.push(f.name);
+    }
+  }
+  return bad.length > 0
+    ? { id, status: 'fail', detail: `sync: ${bad.join(' and ')} differ${bad.length === 1 ? 's' : ''} from the pinned text (peers reject the commits; restore it, see docs/multi-device-spec.md 7.3)` }
+    : { id, status: 'ok', detail: 'sync: .gitignore and .gitattributes match the pinned text' };
+}
+
+/** `git version 2.39.5 (Apple Git-154)` -> [2, 39]; `null` when it does not look like that. */
+export function parseGitVersion(out: string): [number, number] | null {
+  const m = /^git version (\d{1,4})\.(\d{1,4})(?:[.\s]|$)/.exec(out.trim());
+  return m === null ? null : [Number(m[1]), Number(m[2])];
+}
+
+const GIT_CANDIDATES_POSIX = ['/usr/bin/git', '/opt/homebrew/bin/git', '/usr/local/bin/git'];
+const GIT_CANDIDATES_WIN32 = ['C:\\Program Files\\Git\\cmd\\git.exe'];
+
+/** SSH commit signing and `gpg.ssh.allowedSignersFile` need git >= 2.34. Absolute path, constant argv, no shell. */
+export async function syncGitVersionCheck(d: {
+  platform: string;
+  exists: (p: string) => Promise<boolean>;
+  capture: (command: string, args: readonly string[], timeoutMs: number) => Promise<{ code: number | null; stdout: string }>;
+}): Promise<Check> {
+  const id = 'sync_git_version';
+  let bin: string | null = null;
+  for (const c of d.platform === 'win32' ? GIT_CANDIDATES_WIN32 : GIT_CANDIDATES_POSIX) {
+    if (await d.exists(c).catch(() => false)) {
+      bin = c;
+      break;
+    }
+  }
+  if (bin === null) return { id, status: 'info', detail: 'sync: git was not found at a standard path (version not checked)' };
+  const r = await d.capture(bin, ['--version'], 3000);
+  const v = r.code === 0 ? parseGitVersion(r.stdout) : null;
+  if (v === null) return { id, status: 'info', detail: 'sync: the git version could not be read' };
+  return v[0] > 2 || (v[0] === 2 && v[1] >= 34)
+    ? { id, status: 'ok', detail: `sync: git ${String(v[0])}.${String(v[1])} (>= 2.34 for ssh signing)` }
+    : { id, status: 'fail', detail: `sync: git ${String(v[0])}.${String(v[1])} is too old: ssh commit signing needs >= 2.34` };
 }
 
 export interface RemoteUrl {

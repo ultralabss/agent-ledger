@@ -38,7 +38,19 @@ import {
 } from '@agent-ledger/shared';
 import { bool, type Args } from './args.ts';
 import type { CliEnvConfig } from './client.ts';
-import { defaultCodeRepoDir, formatCheck, readGitRemotes, remoteCheck, type Check, type CheckStatus } from './doctor-checks.ts';
+import {
+  defaultCodeRepoDir,
+  formatCheck,
+  readGitRemotes,
+  remoteCheck,
+  syncGitVersionCheck,
+  syncHaltCheck,
+  syncPinnedFilesCheck,
+  syncSlotsCheck,
+  syncVerifyCheck,
+  type Check,
+  type CheckStatus,
+} from './doctor-checks.ts';
 import { linuxChecks } from './doctor-linux.ts';
 import { win32Checks, wslChecks } from './doctor-win32.ts';
 import { hubIdentityVerdict, hubServesLedger, type IdentityVerdict } from './identity.ts';
@@ -143,14 +155,14 @@ async function defaultLoadRemoteChecks(): Promise<SyncRemoteChecksFn | null> {
 /** Sync section: only on an enrolled ledger (`.hub/sync.yml`) or one with an enrolment marker. Offline facts come
  *  from the shared device store; the remote / git-config / marker checks from `remoteChecks` (network only with
  *  `--online`). A missing module is ONE warn, never a crash. Every line passes `safeOutput`; no URL is printed. */
-export async function syncChecks(ledgerDir: string, online: boolean, deps: DoctorDeps = {}): Promise<Check[]> {
+export async function syncChecks(ledgerDir: string, online: boolean, deps: DoctorDeps = {}, env: NodeJS.ProcessEnv = process.env): Promise<Check[]> {
   const enrolled = await exists(join(ledgerDir, '.hub', 'sync.yml'));
   const marker = await exists(join(ledgerDir, '.hub', 'sync', 'enrol.json'));
   if (!enrolled && !marker) return [];
   const out: Check[] = [];
   const seen = new Set<string>();
   const push = (c: Check): void => {
-    if (seen.has(c.id) || out.length >= 12) return;
+    if (seen.has(c.id) || out.length >= 40) return;
     seen.add(c.id);
     out.push({ id: c.id, status: c.status, detail: safeOutput(c.detail, 300) });
   };
@@ -164,15 +176,23 @@ export async function syncChecks(ledgerDir: string, online: boolean, deps: Docto
         push({
           id: 'sync_devices_unapproved',
           status: 'warn',
-          detail: `sync: ${String(unapproved.length)} device(s) registered by a peer are not trusted here yet: ${unapproved.map((d) => `ledger device approve ${d.id} --fp ${d.fingerprint}`).slice(0, 3).join(' · ')}`,
+          // No fingerprint in the hint (audit B4C-3): the owner must read it off the OTHER device, not copy it from here.
+          detail: `sync: ${String(unapproved.length)} device(s) registered by a peer are not trusted here yet (${unapproved.map((d) => d.id).slice(0, 3).join(' · ')}): compare the fingerprint shown on that device, then ledger device approve <id> --fp <SHA256:…>`,
         });
       }
+      push(syncSlotsCheck(rows));
       if (active.filter((d) => d.trusted).length <= 1) {
         push({ id: 'sync_single_trusted_device', status: 'warn', detail: 'sync: only one trusted device — losing it loses write access to the remote history; add a second (ledger device add)' });
       }
     } catch {
       push({ id: 'sync_devices_unreadable', status: 'warn', detail: 'sync: the device registry could not be read' });
     }
+  }
+  if (enrolled) {
+    push(syncVerifyCheck(env.LEDGER_SYNC_VERIFY, env.LEDGER_SYNC));
+    push(await syncHaltCheck(ledgerDir));
+    push(await syncPinnedFilesCheck(ledgerDir));
+    push(await syncGitVersionCheck({ platform: deps.platform ?? process.platform, exists: deps.exists ?? exists, capture: deps.capture ?? runCapture }));
   }
   const load = deps.loadRemoteChecks ?? defaultLoadRemoteChecks;
   let fn: SyncRemoteChecksFn | null = null;
@@ -557,7 +577,7 @@ export async function cmdDoctor(
   checks.push(await pathCheck(searchPath, join(io.env.SHIM_DIR ?? join(home, '.local', 'bin'), 'ledger')));
 
   /* ---- ledger format + ledger remote (privacy) ---- */
-  checks.push(formatCheck());
+  checks.push(await formatCheck(cfg.ledgerDir));
   checks.push(
     await remoteCheck({
       ledgerDir: cfg.ledgerDir,
@@ -574,7 +594,7 @@ export async function cmdDoctor(
   }
 
   /* ---- sync (enrolled ledgers only) ---- */
-  for (const c of await syncChecks(cfg.ledgerDir, bool(args, 'online'), deps)) {
+  for (const c of await syncChecks(cfg.ledgerDir, bool(args, 'online'), deps, io.env)) {
     checks.push(c);
     if (c.status === 'fail') problems.push(c.detail.slice(0, 120));
   }

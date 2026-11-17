@@ -67,9 +67,31 @@ export interface BriefOptions {
   lean?: boolean | undefined;
   /** Item ages and the single `Stale:` line. */
   stale?: BriefStale | undefined;
+  /** Sync halt facts; one `Sync:` line right under the header while halted. */
+  sync?: BriefSync | undefined;
 }
 
 const MAX_LINES = 30;
+
+/** Sync state for the brief (F3b B5, spec §7.3: "brief says so"). The caller passes only the halt facts it read
+ *  from `.hub/sync/state.json`; free text (`detail`) is deliberately NOT part of it. */
+export interface BriefSync {
+  halt: { reason: string; cls: string; since: string } | null | undefined;
+}
+
+const SYNC_REASON_RE = /^[a-z][a-z0-9:-]{0,39}$/;
+const SYNC_CLASSES = new Set(['no-contact', 'sticky', 'probe', 'd2', 'local', 'terminal']);
+
+/** One line, or `null` when sync is healthy / unknown. Fields are whitelisted by shape, so a hostile or corrupt
+ *  state file cannot put free text (or an instruction) into an agent's context. */
+export function syncLine(sync: BriefSync | undefined): string | null {
+  const h = sync?.halt;
+  if (h === null || h === undefined) return null;
+  const reason = SYNC_REASON_RE.test(h.reason) ? h.reason : 'unknown';
+  const cls = SYNC_CLASSES.has(h.cls) ? h.cls : 'unknown';
+  const since = /^\d{4}-\d{2}-\d{2}/.test(h.since) ? h.since.slice(0, 10) : '?';
+  return `Sync: HALTED (${reason}, ${cls}) since ${since} — remote changes are not being applied; owner: ledger sync status`;
+}
 
 /** Rows of `Up next` in a lean (startup) brief. The full list is one
  *  `ledger brief --full` away, and it was the single biggest block in the
@@ -361,6 +383,8 @@ export async function buildBrief(ledger: Ledger, opts: BriefOptions = {}): Promi
         stale: opts.stale,
       })
     : globalBrief(ledger, full, opts.live, opts.stale);
+  const sl = syncLine(opts.sync);
+  if (sl !== null) lines.splice(1, 0, sl);
   const footer = 'More: ledger brief --full · ledger history --since 14d';
   const body = full ? lines : lines.slice(0, MAX_LINES - 1);
   if (!full && lines.length > MAX_LINES - 1) {
