@@ -172,3 +172,22 @@ test('a secret in the middle of an md block is found and the range matches exact
   assert.equal(f.length, 1);
   assert.equal(text.slice(f[0].start, f[0].end), secret);
 });
+
+test('F3A-1: whitespace runs are linear, a real secret after a short run is still found', () => {
+  for (const ch of ['\n', ' ']) {
+    const big = ch.repeat(250_000);
+    const t0 = performance.now();
+    assert.deepEqual(scanSecrets(big), []);
+    assert.deepEqual(scanSecrets(`token${big}`), []);
+    assert.deepEqual(scanSecrets(`token:${big}x`), []);
+    const ms = performance.now() - t0;
+    assert.ok(ms < 200, `250K ${JSON.stringify(ch)} took ${ms.toFixed(0)} ms`);
+  }
+  const secret = 'Zx9fQ2mK7pLw4Rt8';
+  const text = `${' '.repeat(250_000)}\npassword  =  ${secret}\n`;
+  const t0 = performance.now();
+  const f = scanSecrets(text);
+  assert.ok(performance.now() - t0 < 200);
+  assert.equal(f.length, 1);
+  assert.equal(text.slice(f[0].start, f[0].end), secret);
+});

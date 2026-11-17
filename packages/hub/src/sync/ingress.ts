@@ -39,6 +39,9 @@ export const MAX_PATH_CHARS = 512;
 export const MAX_CLAIM_GLOBS = 32;
 export const MAX_CLAIM_GLOB_CHARS = 256;
 const MAX_SLUG_CHARS = 100;
+/** Pathological-text guards, checked BEFORE any scan/parse (F3A-1). */
+export const MAX_WHITESPACE_RUN = 4096;
+export const MAX_FILE_LINES = 20000;
 
 /** One path of the incoming diff. `mode`/`type` are git's (`100644`, `blob`). */
 export interface IncomingChange {
@@ -69,6 +72,7 @@ export type IngressRule =
   | 'delete-protected'
   | 'hub-path'
   | 'size'
+  | 'whitespace-run'
   | 'push-size'
   | 'push-count'
   | 'content-missing'
@@ -277,6 +281,25 @@ function reposProblem(text: string): boolean {
 }
 
 /** Content verdict for one live file. `null` = fine. */
+/** Whitespace run > MAX_WHITESPACE_RUN chars or > MAX_FILE_LINES lines. Single linear pass. */
+function pathologicalText(text: string): boolean {
+  let run = 0;
+  let lines = 1;
+  for (let i = 0; i < text.length; i += 1) {
+    const c = text.charCodeAt(i);
+    if (c === 10) {
+      lines += 1;
+      if (lines > MAX_FILE_LINES) return true;
+    }
+    // space, \t, \n, \v, \f, \r, NBSP and the other Unicode spaces `\s` matches
+    if (c === 32 || (c >= 9 && c <= 13) || c === 0xa0 || c === 0xfeff || c === 0x1680 || (c >= 0x2000 && c <= 0x200a) || c === 0x2028 || c === 0x2029 || c === 0x202f || c === 0x205f || c === 0x3000) {
+      run += 1;
+      if (run > MAX_WHITESPACE_RUN) return true;
+    } else run = 0;
+  }
+  return false;
+}
+
 function contentProblem(
   cls: Classified,
   path: string,
@@ -285,6 +308,8 @@ function contentProblem(
   baseFormat: number | undefined,
   scan: (text: string) => readonly unknown[],
 ): IngressRule | null {
+  // Cheap linear guard first: no scanner/parser ever sees a pathological text.
+  if (pathologicalText(text)) return 'whitespace-run';
   // Secrets first: whatever else is wrong, a secret hit is the headline.
   // devices.yml carries PUBLIC keys, which look like high-entropy tokens: validate
   // the file first, then scan it with the (structurally verified) keys removed.

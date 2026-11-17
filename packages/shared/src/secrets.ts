@@ -14,10 +14,12 @@
 
 export type SecretFinding = { rule: string; start: number; end: number };
 
-type Rule = { name: string; re: RegExp; check?: (value: string) => boolean };
+/** `group`: the finding is capture group N (needs the `d` flag), not the whole match. */
+type Rule = { name: string; re: RegExp; group?: number; check?: (value: string) => boolean };
 
 const KEY = '(?:password|passwd|pwd|secret|token|api[_-]?key|apikey|access[_-]?key)';
-const SEP = '["\']?\\s*(?:=|:)\\s*';
+// Bounded whitespace, no lookbehind: `\s*` inside a lookbehind was quadratic on whitespace runs (F3A-1).
+const SEP = '["\']?\\s{0,8}(?:=|:)\\s{0,8}';
 
 /** Placeholders, not secrets. */
 const PLACEHOLDER_RE =
@@ -125,12 +127,14 @@ const RULES: Rule[] = [
   },
   {
     name: 'secret-assignment',
-    re: new RegExp(`(?<=${KEY}${SEP}")[^"\\n]{8,}(?=")`, 'gi'),
+    re: new RegExp(`${KEY}${SEP}"([^"\\n]{8,})(?=")`, 'gid'),
+    group: 1,
     check: (v) => !isPlaceholder(v.trim()),
   },
   {
     name: 'secret-assignment',
-    re: new RegExp(`(?<=${KEY}${SEP})[^\\s"'\`;,)\\]}]{8,}`, 'gi'),
+    re: new RegExp(`${KEY}${SEP}([^\\s"'\`;,)\\]}]{8,})`, 'gid'),
+    group: 1,
     check: looksSecretish,
   },
   { name: GENERIC_RULE, re: /[A-Za-z0-9+=_-]{28,}/g, check: looksHighEntropy },
@@ -173,13 +177,20 @@ export function scanSecrets(text: string): SecretFinding[] {
     const re = new RegExp(rule.re.source, rule.re.flags);
     let m: RegExpExecArray | null;
     while ((m = re.exec(text)) !== null) {
-      const value = m[0];
+      let value = m[0];
+      let start = m.index;
+      if (rule.group !== undefined) {
+        const idx = m.indices?.[rule.group];
+        if (!idx) continue;
+        start = idx[0];
+        value = m[rule.group] ?? '';
+      }
       if (value.length === 0) {
         re.lastIndex += 1;
         continue;
       }
       if (rule.check && !rule.check(value)) continue;
-      raw.push({ rule: rule.name, start: m.index, end: m.index + value.length });
+      raw.push({ rule: rule.name, start, end: start + value.length });
     }
   }
   return merge(raw);

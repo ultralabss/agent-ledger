@@ -522,3 +522,18 @@ test('rejections never carry content and cap/sanitise the path', () => {
   assert.equal(/[\u0000-\u001f\u007f]/.test(p), false);
   assert.deepEqual(Object.keys(res.rejected[0] ?? {}).sort(), ['path', 'rule']);
 });
+
+test('F3A-1: whitespace-run / line-count bombs rejected fast, before the secret scan', () => {
+  let called = 0;
+  const scan = (): never[] => { called += 1; return []; };
+  const t0 = performance.now();
+  const bomb = rulesOf([blob('acme/CONTEXT.md', '\n'.repeat(250_000))], { scan });
+  const spaces = rulesOf([blob('acme/CONTEXT.md', ' '.repeat(5000))], { scan });
+  const lines = rulesOf([blob('acme/CONTEXT.md', 'a\n'.repeat(20_001))], { scan });
+  assert.ok(performance.now() - t0 < 1000);
+  assert.equal(bomb.get('acme/CONTEXT.md'), 'whitespace-run');
+  assert.equal(spaces.get('acme/CONTEXT.md'), 'whitespace-run');
+  assert.equal(lines.get('acme/CONTEXT.md'), 'whitespace-run');
+  assert.equal(called, 0, 'scanner never ran');
+  assert.equal(rulesOf([blob('acme/CONTEXT.md', `a${' '.repeat(4096)}b\n`)], { scan }).size, 0);
+});
