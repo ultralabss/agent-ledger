@@ -83,3 +83,12 @@ test('B3: CRLF journal text parses every event (no `\\r` drops the line)', () =>
 test('B3: writers emit LF only', () => {
   assert.equal(journalLine({ session: '61e0', type: 'commit', fields: ['a'] }).includes('\r'), false);
 });
+
+test('F3b sync notes are known journal types: a forged `·` in the session column cannot shift them', () => {
+  for (const t of ['sync.conflict', 'sync.reject', 'sync.secret', 'sync.unverified', 'sync.warning']) {
+    const ev = parseJournalLine(`- 2026-11-16 10:00 · sync · ${t} · rule=x · path=a`, 'r');
+    assert.equal(ev?.type, t);
+    assert.equal(ev?.session, 'sync');
+    assert.deepEqual(ev?.fields, ['rule=x', 'path=a']);
+  }
+});

@@ -32,6 +32,12 @@ export const KNOWN_TYPES: readonly string[] = [
   'intake.triaged',
   // An intake record marked by `ledger add --intake`, without an explicit triage.
   'intake.linked',
+  // F3b sync notes (hub/sync/notes.ts), journal-only, never trusted as input.
+  'sync.conflict',
+  'sync.reject',
+  'sync.secret',
+  'sync.unverified',
+  'sync.warning',
 ];
 
 /** F-1: the sink sanitises. A `\n` in any field would otherwise append a

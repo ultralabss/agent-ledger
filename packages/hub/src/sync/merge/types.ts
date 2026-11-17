@@ -15,7 +15,15 @@ export type SyncNoteType =
   /** Same decision id, diverging bodies — both kept. */
   | 'sync.decision-conflict'
   /** CONTEXT.md diverged — local kept, the other version goes to a `proposed` item. */
-  | 'sync.context-conflict';
+  | 'sync.context-conflict'
+  /** An incoming change was refused (ingress rule, gate rule) or a delete was reverted. */
+  | 'sync.reject'
+  /** Secret scanner hit: rule + path only, never the matched text. */
+  | 'sync.secret'
+  /** Accepted in warn mode from a registered key this device has not approved. */
+  | 'sync.unverified'
+  /** Accepted in warn mode without a verifiable approved signature. */
+  | 'sync.warning';
 
 export interface SyncNote {
   type: SyncNoteType;
@@ -25,6 +33,12 @@ export interface SyncNote {
   /** Device whose value lost / whose claim was dropped. */
   device?: string;
   session?: string;
+  /** Repo slug the note is about (`[a-z0-9-]+`), when the path has one. */
+  repo?: string;
+  /** Repo-relative path (attacker-controlled name: `notes.ts` sanitises it). */
+  path?: string;
+  /** Machine token of the rule that fired (`delete`, `secret`, `revoked-signer`, …). */
+  rule?: string;
   /** Single line, no secrets (field names and short value excerpts only). */
   detail: string;
 }
