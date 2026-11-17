@@ -825,6 +825,70 @@ export interface WhyView {
   truncated: boolean;
 }
 
+/* ---------------- F3b sync routes (`/v1/sync`, docs/f3b-b4-plan.md §1.4) ---------------- */
+
+/** A halt of the sync loop. `detail` is one sanitised line: never a URL, stderr or content. */
+export interface SyncHaltView {
+  reason: string;
+  cls: 'no-contact' | 'sticky' | 'probe' | 'd2' | 'local' | 'terminal';
+  since: string;
+  tip: string | null;
+  rule: string | null;
+  detail: string;
+  d2: { commit: string; deviceIds: string[]; kind: 'root' | 'self' } | null;
+}
+
+export interface SyncDeviceView {
+  id: string;
+  slot: string;
+  label: string;
+  fingerprint: string;
+  status: 'active' | 'revoked';
+  trusted: boolean;
+  self: boolean;
+}
+
+/** `GET /v1/sync/status`. 409 `SYNC_OFF` when sync is off. The remote URL is never part of it. */
+export interface SyncStatusResponse {
+  enabled: true;
+  /** Host token only (`[A-Za-z0-9.-]`), or `local` / `null`. */
+  remote_host: string | null;
+  loop: {
+    started: boolean;
+    running: boolean;
+    pending: boolean;
+    halt: SyncHaltView | null;
+    backoff: { failures: number; nextAt: string | null; lastError: string | null } | null;
+    accepted: string | null;
+    lastCycle: { at: string; outcome: string; ms: number } | null;
+    pushBlocked: { rule: string; tip: string; since: string } | null;
+    stateError: boolean;
+  };
+  /** The decision routes are locked after repeated refusals until `resume`. */
+  locked: boolean;
+  devices: SyncDeviceView[];
+  /** Registered by a peer but not trusted on this machine yet (`ledger device approve <id> --fp …`). */
+  unapproved: { id: string; slot: string; label: string; fingerprint: string }[];
+  single_trusted_device: boolean;
+}
+
+/** `POST /v1/sync/confirm-revocation` and `/accept`: ONE refusal for every failure (no oracle). */
+export interface SyncDecisionResponse {
+  answer: 'ok' | 'refused';
+}
+
+/** `POST /v1/sync/device-add` success. Failures are 409/422 with `error` = a fixed code. */
+export interface SyncDeviceAddResponse {
+  ok: true;
+  id: string;
+  slot: string;
+  fp: string;
+  commit: string | null;
+  applied: boolean;
+  approved: boolean;
+  existing: boolean;
+}
+
 /* ---------------- helpers shared with the UI ---------------- */
 
 export const OPEN_ITEM_STATUSES: readonly ItemStatus[] = ['proposed', 'open', 'doing', 'blocked'];

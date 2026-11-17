@@ -127,7 +127,9 @@ import {
 } from '../tidy.ts';
 import type { Summarizer } from '../summary.ts';
 import { whyOfPath } from '../why.ts';
+import type { SyncLoop } from '../sync/loop.ts';
 import { authPathOf, guard, isCookieCaller, type GuardConfig } from './guard.ts';
+import { syncRoutes } from './sync-routes.ts';
 import { uiHandler } from './ui.ts';
 
 /** `CONTEXT.md` served to the UI (SPEC F2 bod 12). */
@@ -201,6 +203,9 @@ export interface AppDeps {
   /** Runtime diagnostics for `/v1/healthz` (authenticated only).
    *  Absent → the `diag` object is omitted from the response. */
   diag?: () => HubDiag;
+  /** F3b sync loop accessor (`null` / absent = sync off: the `/v1/sync/*` routes answer 409 `SYNC_OFF`). A getter
+   *  because the loop starts after the app exists. */
+  sync?: () => SyncLoop | null;
 }
 
 /** Fixed shape, the CLI codes against it. */
@@ -2065,6 +2070,9 @@ export function createApp(deps: AppDeps) {
       }
     });
   });
+
+  // F3b B4c: loopback sync routes (human-only gate = `requireOwner`; no route takes a URL or a path).
+  v1.route('/sync', syncRoutes({ ledger, loop: () => deps.sync?.() ?? null, requireOwner }));
 
   app.route('/v1', v1);
 

@@ -2,13 +2,14 @@
  *  doctor wiring. Real ssh-keygen; POSIX modes (win32 skipped, NOT verified there). */
 
 import assert from 'node:assert/strict';
-import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
 import { deviceLayout, readDevices, renderDevicesYaml, type DevicesFile } from '@agent-ledger/shared';
 import { skipOnWin32 } from '@agent-ledger/shared/testing';
 import { parseArgs } from './args.ts';
+import type { HubResponse } from './client.ts';
 import { cmdDoctor } from './doctor.ts';
 import { run, type Io } from './index.ts';
 
@@ -171,4 +172,125 @@ test('DK-2: hostile devices.yml → clean one-line CLI error (no ANSI / bidi / e
       assert.equal(r.err.length, 1, 'one line');
     }
   }
+});
+
+/* ---------------- F3b B4c: `device add` (docs/f3b-b4-plan.md §1.3, §2.5; T-B4-9, T-B4-12) ---------------- */
+
+async function ledgerCliIo(dir: string, argv: string[], extra: Partial<Io> & { hub?: { post(path: string, payload?: unknown): Promise<HubResponse> } }): Promise<{ code: number; out: string[]; err: string[] }> {
+  const out: string[] = [];
+  const err: string[] = [];
+  const io = { out: (l: string) => out.push(l), err: (l: string) => err.push(l), env: { LEDGER_DIR: dir, LEDGER_HUB_URL: 'http://127.0.0.1:9', LEDGER_SESSION: 'human1111' }, cwd: dir, ...extra } as Io;
+  const code = await run(argv, io);
+  return { code, out, err };
+}
+
+/** A root ledger (`dir`) and a joining machine (`dir2`): the joiner's canonical key line + fingerprint + id. */
+async function pair(t: { after: (fn: () => unknown) => void }): Promise<{ dir: string; selfId: string; pub: string; fp: string; joinId: string }> {
+  const dir = await ledger(t);
+  const init = await ledgerCli(dir, ['device', 'init', '--root']);
+  assert.equal(init.code, 0, init.err.join('\n'));
+  const dir2 = await ledger(t);
+  const other = await ledgerCli(dir2, ['device', 'init', '--label', 'win']);
+  const pub = (await readFile(deviceLayout(dir2).pubFile, 'utf8')).trim().split(' ').slice(0, 2).join(' ');
+  return { dir, selfId: id(init.out), pub, fp: other.out[1]?.match(/SHA256:\S{43}/)?.[0] ?? '', joinId: id(other.out) };
+}
+
+test('B4c device add (not enrolled): registers in devices.yml and approves with the SAME fingerprint; a repeat is idempotent', { skip }, async (t) => {
+  const { dir, pub, fp, joinId } = await pair(t);
+  const noFp = await ledgerCli(dir, ['device', 'add', pub, '--label', 'win']);
+  assert.equal(noFp.code, 4);
+  assert.match(noFp.err.join('\n'), /usage: ledger device add/);
+  const wrong = await ledgerCli(dir, ['device', 'add', pub, '--label', 'win', '--fp', `SHA256:${'A'.repeat(43)}`]);
+  assert.equal(wrong.code, 4);
+  assert.match(wrong.err.join('\n'), /does not match/);
+  assert.equal(((await readDevices(deviceLayout(dir))) as DevicesFile).devices.length, 1, 'nothing registered on a wrong fingerprint');
+  assert.equal((await ledgerCli(dir, ['device', 'add', `${pub} me@host`, '--label', 'win', '--fp', fp])).code, 4, 'comment in the key');
+  assert.equal((await ledgerCli(dir, ['device', 'add', pub, '--label', 'Bad Label', '--fp', fp])).code, 4);
+
+  const add = await ledgerCli(dir, ['device', 'add', pub, '--label', 'win', '--fp', fp]);
+  assert.equal(add.code, 0, add.err.join('\n'));
+  assert.match(add.out[0] ?? '', new RegExp(`^registered ${joinId} slot A \\(win\\) ${fp.replace(/[+/]/g, '\\$&')}$`));
+  assert.match(add.out[1] ?? '', /now trusted on this machine/);
+  assert.match((await ledgerCli(dir, ['device', 'list'])).out.join('\n'), new RegExp(`${joinId} slot A win active trusted`));
+  assert.ok(![...add.out, ...add.err].join('\n').includes(pub), 'no key material echoed');
+
+  const again = await ledgerCli(dir, ['device', 'add', pub, '--label', 'win', '--fp', fp]);
+  assert.equal(again.code, 0, again.err.join('\n'));
+  assert.match(again.out[0] ?? '', /already registered/);
+  assert.match(again.out[1] ?? '', /already approved/);
+  assert.equal(((await readDevices(deviceLayout(dir))) as DevicesFile).devices.length, 2);
+
+  // a crash between add and approve: the entry exists, the key is not trusted yet -> the re-run approves
+  const dirB = await ledger(t);
+  await ledgerCli(dirB, ['device', 'init', '--root']);
+  const { addDevice } = await import('@agent-ledger/shared');
+  await addDevice(dirB, pub, 'win', fp);
+  assert.match((await ledgerCli(dirB, ['device', 'list'])).out.join('\n'), /NOT-APPROVED/);
+  const fix = await ledgerCli(dirB, ['device', 'add', pub, '--label', 'win', '--fp', fp]);
+  assert.equal(fix.code, 0, fix.err.join('\n'));
+  assert.match(fix.out[1] ?? '', /now trusted/);
+});
+
+async function enrol(dir: string): Promise<void> {
+  const hub = join(dir, '.hub');
+  await mkdir(hub, { recursive: true, mode: 0o700 });
+  await writeFile(join(hub, 'sync.yml'), 'v: 1\nremote: git@example.com:me/ledger.git\n', { mode: 0o600 });
+}
+
+test('B4c device add (enrolled): hub route only, terminal + retyped fingerprint required, hub down = exit 3 and the file path is never used (T-B4-12)', { skip }, async (t) => {
+  const { dir, pub, fp, joinId } = await pair(t);
+  await enrol(dir);
+  const calls: { path: string; payload: unknown }[] = [];
+  const hub = {
+    post: async (path: string, payload?: unknown): Promise<HubResponse> => {
+      calls.push({ path, payload });
+      return { status: 200, text: '', json: { ok: true, id: joinId, slot: 'A', fp, commit: 'c'.repeat(40), applied: true, approved: true, existing: false } };
+    },
+  };
+  const argv = ['device', 'add', pub, '--label', 'win', '--fp', fp];
+  const before = await readFile(deviceLayout(dir).devicesYml, 'utf8');
+
+  // no terminal (an agent, a pipe): refused before anything is sent
+  const noTty = await ledgerCliIo(dir, argv, { hub });
+  assert.equal(noTty.code, 4);
+  assert.match(noTty.err.join('\n'), /interactive terminal/);
+  // a terminal but the wrong retype
+  const wrong = await ledgerCliIo(dir, argv, { hub, tty: { stdin: true, stdout: true }, ask: async () => 'SHA256:nope' });
+  assert.equal(wrong.code, 4);
+  assert.deepEqual(calls, []);
+  // right retype: one POST with exactly the three values and the session
+  const prompts: string[] = [];
+  const ok = await ledgerCliIo(dir, argv, { hub, tty: { stdin: true, stdout: true }, ask: async (p) => (prompts.push(p), fp) });
+  assert.equal(ok.code, 0, ok.err.join('\n'));
+  assert.deepEqual(calls, [{ path: '/v1/sync/device-add', payload: { pubkey: pub, label: 'win', fp, session: 'human1111' } }]);
+  assert.match(prompts[0] ?? '', /retype the fingerprint/);
+  assert.match(ok.out.join('\n'), new RegExp(`registered ${joinId} slot A \\(win\\)`));
+  assert.match(ok.out.join('\n'), /approved .*now trusted/);
+  assert.match(ok.out.join('\n'), new RegExp(`ledger sync join --continue --add-commit ${'c'.repeat(40)}`));
+  assert.equal(await readFile(deviceLayout(dir).devicesYml, 'utf8'), before, 'the file path was not used');
+
+  // hub down: exit 3, still no file write
+  const { CliError } = await import('./client.ts');
+  const down = await ledgerCliIo(dir, argv, {
+    hub: { post: async () => { throw new CliError(3, 'hub is not running at http://127.0.0.1:9 (refused)', true); } },
+    tty: { stdin: true, stdout: true },
+    ask: async () => fp,
+  });
+  assert.equal(down.code, 3);
+  assert.equal(await readFile(deviceLayout(dir).devicesYml, 'utf8'), before);
+
+  // a refusal from the hub (conflict) = exit 2 with the hub's fixed text; applied-but-not-approved is said out loud
+  const busy = await ledgerCliIo(dir, argv, {
+    hub: { post: async () => { throw new CliError(2, 'another device add won the slot race three times — try again', false, null, 409); } },
+    tty: { stdin: true, stdout: true },
+    ask: async () => fp,
+  });
+  assert.equal(busy.code, 2);
+  const pending = await ledgerCliIo(dir, argv, {
+    hub: { post: async () => ({ status: 200, text: '', json: { ok: true, id: joinId, slot: 'A', fp, commit: 'd'.repeat(40), applied: true, approved: false, existing: false } }) },
+    tty: { stdin: true, stdout: true },
+    ask: async () => fp,
+  });
+  assert.equal(pending.code, 0);
+  assert.match(pending.out.join('\n'), /NOT approved yet/);
 });

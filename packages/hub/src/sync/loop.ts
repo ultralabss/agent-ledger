@@ -12,6 +12,14 @@
  *     that needs a human (it only clears `no-contact` and `sticky`).
  *   - Stance: the loop owns no git. Every state change goes through `StateStore`; nothing from a caller is
  *     written except validated tokens (sha, device id, `SHA256:` fingerprint).
+ *
+ *  B4c additions (docs/f3b-b4-plan.md §2.5, T-B4-1/7):
+ *   - `exclusiveOp` takes the single-flight slot for ONE operation (a device add): it waits for a running cycle,
+ *     blocks new ones (they coalesce into one rerun after the release), has a 90 s budget and a second op is
+ *     refused, never queued. It does NOT change `gate()`: the cycle an op runs goes through the same gate as a
+ *     manual trigger, and the op itself decides what a halt means for it.
+ *   - `RouteLimiter` / `MinGap` throttle the human routes (failure lockout until `resume`, trigger spacing).
+ *     Clock jumps are handled by `Math.abs` distances.
  */
 
 import { parseDevicesYaml, parseEd25519Pub } from '@agent-ledger/shared';
@@ -65,6 +73,86 @@ export interface LoopStatus {
 
 export type LoopAnswer = { ok: true } | { ok: false; reason: string };
 
+/** What an exclusive operation gets besides the cycle deps. */
+export interface ExclusiveCtx {
+  /** One cycle through the loop's own cycle function and the SAME halt gate as a manual trigger. A gate that says
+   *  skip (halt without contact) yields `outcome: 'gate-skip'`. */
+  cycle(): Promise<CycleResult>;
+  /** True once the op's budget ran out (the slot is already released): stop before the next mutation. */
+  expired(): boolean;
+}
+
+export type ExclusiveErrorCode = 'BUSY' | 'TIMEOUT' | 'STOPPED';
+
+/** Thrown by `exclusiveOp` itself (never by the operation): fixed code, no detail. */
+export class ExclusiveOpError extends Error {
+  readonly code: ExclusiveErrorCode;
+  constructor(code: ExclusiveErrorCode) {
+    super(`exclusive operation refused: ${code}`);
+    this.name = 'ExclusiveOpError';
+    this.code = code;
+  }
+}
+
+export const EXCLUSIVE_BUDGET_MS = 90_000;
+
+/** Failure lockout for the human routes: `maxFailures` inside `windowMs` lock the routes until `reset()` (the
+ *  operator's `resume`). `maxTotal` failures since boot lock them for good (until a hub restart), so a caller that
+ *  can reach `resume` cannot grind through unlimited attempts. */
+export class RouteLimiter {
+  private readonly maxFailures: number;
+  private readonly windowMs: number;
+  private readonly maxTotal: number;
+  private readonly now: () => number;
+  private stamps: number[] = [];
+  private total = 0;
+  private lockedFlag = false;
+
+  constructor(o: { maxFailures?: number; windowMs?: number; maxTotal?: number; now?: () => number } = {}) {
+    this.maxFailures = o.maxFailures ?? 5;
+    this.windowMs = o.windowMs ?? 10 * 60_000;
+    this.maxTotal = o.maxTotal ?? 50;
+    this.now = o.now ?? (() => Date.now());
+  }
+
+  get locked(): boolean {
+    return this.lockedFlag;
+  }
+
+  fail(): void {
+    const t = this.now();
+    this.total += 1;
+    this.stamps = this.stamps.filter((x) => Math.abs(t - x) <= this.windowMs);
+    this.stamps.push(t);
+    if (this.stamps.length >= this.maxFailures || this.total >= this.maxTotal) this.lockedFlag = true;
+  }
+
+  /** `resume`: clears the window lock, never the lifetime cap. */
+  reset(): void {
+    this.stamps = [];
+    this.lockedFlag = this.total >= this.maxTotal;
+  }
+}
+
+/** At most one `take()` per `gapMs` (a backwards clock jump counts as elapsed: `Math.abs`). */
+export class MinGap {
+  private last: number | null = null;
+  private readonly gapMs: number;
+  private readonly now: () => number;
+
+  constructor(gapMs: number, now: () => number = () => Date.now()) {
+    this.gapMs = gapMs;
+    this.now = now;
+  }
+
+  take(): boolean {
+    const t = this.now();
+    if (this.last !== null && Math.abs(t - this.last) < this.gapMs) return false;
+    this.last = t;
+    return true;
+  }
+}
+
 const MAX_BACKOFF_FUTURE_MS = 20 * 60_000;
 const MAX_COALESCED_RERUNS = 3;
 const FP_RE = /^SHA256:[A-Za-z0-9+/]{43}$/;
@@ -85,6 +173,8 @@ export class SyncLoop {
   private tick: unknown = null;
   private debounce: unknown = null;
   private lastContact: number | null = null;
+  private exclusive = false;
+  private opDone: Promise<void> | null = null;
 
   constructor(o: SyncLoopOptions) {
     this.deps = o.deps;
@@ -111,7 +201,7 @@ export class SyncLoop {
     this.tick = null;
     this.debounce = null;
     this.rerun = false;
-    while (this.running !== null) await this.running;
+    while (this.running !== null || this.opDone !== null) await (this.running ?? this.opDone);
   }
 
   /** Ask for a cycle. `commit` triggers are debounced; everything else coalesces into at most one rerun. */
@@ -139,7 +229,7 @@ export class SyncLoop {
 
   private kick(force: boolean): void {
     if (this.stopped) return;
-    if (this.running !== null) {
+    if (this.running !== null || this.exclusive) {
       this.rerun = true;
       this.rerunForce ||= force;
       return;
@@ -208,6 +298,68 @@ export class SyncLoop {
       if (Number.isFinite(d) && d > 0 && d <= MAX_BACKOFF_FUTURE_MS) return 'skip'; // far-future = the clock jumped: run
     }
     return 'run';
+  }
+
+  /** Host token of the remote for status output: `[A-Za-z0-9.-]` only, never a user, path or the URL. */
+  remoteHost(): string | null {
+    const url = this.deps.remote;
+    const m = /^ssh:\/\/(?:[^@/]+@)?(\[[0-9A-Fa-f:]+\]|[A-Za-z0-9.-]+)(?::\d+)?\//.exec(url) ?? /^(?:[^@:/]+@)?([A-Za-z0-9.-]+):[^/]/.exec(url);
+    const host = m?.[1];
+    if (host !== undefined && /^[A-Za-z0-9.-]{1,253}$/.test(host)) return host;
+    return this.deps.testLocalRemotes?.includes(url) === true ? 'local' : null;
+  }
+
+  /** Run ONE operation with the single-flight slot (SF) held (device add). Waits for a running cycle, blocks new
+   *  ones (a kick coalesces into one rerun after the release), refuses a second concurrent op (`BUSY`) and gives
+   *  up after `budgetMs` (`TIMEOUT`: the slot is released and `ctx.expired()` turns true so the op stops before
+   *  its next mutation; the op's promise itself is not killed). Lock order is unchanged: SF here, then R -> Q -> D
+   *  inside whatever the op calls. */
+  async exclusiveOp<T>(fn: (deps: CycleDeps, ctx: ExclusiveCtx) => Promise<T>, o: { budgetMs?: number } = {}): Promise<T> {
+    if (this.stopped) throw new ExclusiveOpError('STOPPED');
+    if (this.exclusive) throw new ExclusiveOpError('BUSY');
+    const budgetMs = o.budgetMs ?? EXCLUSIVE_BUDGET_MS;
+    let expired = false;
+    let timer: unknown = null;
+    const expiry = new Promise<never>((_, reject) => {
+      timer = this.clock.setTimeout(() => {
+        expired = true;
+        reject(new ExclusiveOpError('TIMEOUT'));
+      }, budgetMs);
+    });
+    expiry.catch(() => undefined); // an unobserved rejection must never crash the hub
+    this.exclusive = true; // claimed synchronously: a concurrent exclusiveOp sees BUSY, kicks coalesce
+    let release!: () => void;
+    this.opDone = new Promise<void>((r) => {
+      release = r;
+    });
+    try {
+      while (this.running !== null) await Promise.race([this.running, expiry]); // a running cycle is never killed
+      if (this.stopped) throw new ExclusiveOpError('STOPPED');
+      const ctx: ExclusiveCtx = {
+        expired: () => expired,
+        cycle: async () => {
+          if (expired) throw new ExclusiveOpError('TIMEOUT');
+          if ((await this.gate(true)) !== 'run') return { outcome: 'gate-skip', refetches: 0, ms: 0 };
+          this.lastContact = this.clock.now();
+          return this.cycleFn(this.deps);
+        },
+      };
+      const work = fn(this.deps, ctx);
+      work.catch(() => undefined); // after a timeout the op's late failure has no reader
+      return await Promise.race([work, expiry]);
+    } finally {
+      if (timer !== null) this.clock.clearTimeout(timer);
+      expired = true;
+      this.exclusive = false;
+      this.opDone = null;
+      release();
+      if (this.rerun && !this.stopped) {
+        const force = this.rerunForce;
+        this.rerun = false;
+        this.rerunForce = false;
+        this.kick(force);
+      }
+    }
   }
 
   async status(): Promise<LoopStatus> {

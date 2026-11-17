@@ -27,10 +27,26 @@ import { cachedSpoolStats, sweepSpool } from './spool-sweep.ts';
 import { Sessions } from './sessions.ts';
 import { PendingMarks } from './pendingmark.ts';
 import { Summarizer } from './summary.ts';
-import { bootReplayGit, bootReplayNotes, startSync } from './sync/wire.ts';
+import { bootReplayGit, bootReplayNotes, enrolMarkerPresent, startSync } from './sync/wire.ts';
 import type { SyncLoop } from './sync/loop.ts';
 import { StallMonitor, WakeMonitor } from './wake.ts';
 import { startWatcher, type Watcher } from './watcher.ts';
+
+/** Exit code for a hub kept down by an enrolment marker (EX_TEMPFAIL: try again after the enrolment). `bin.ts` maps
+ *  `EnrolInProgressError` to it. */
+export const ENROL_EXIT_CODE = 75;
+/** The one line a refused start prints, in every mode. Fixed text: no path, URL or marker content. */
+export const ENROL_REFUSAL =
+  'agent-ledger: an enrolment (ledger sync init|join) is in progress or was interrupted — the hub does not start until it is finished or aborted (ledger sync init|join --continue | --abort)';
+
+/** Thrown by `startHub` while an enrol marker exists (T-B4-5). */
+export class EnrolInProgressError extends Error {
+  readonly exitCode = ENROL_EXIT_CODE;
+  constructor() {
+    super(ENROL_REFUSAL);
+    this.name = 'EnrolInProgressError';
+  }
+}
 
 export interface HubHandle {
   port: number;
@@ -105,6 +121,16 @@ export async function startHub(opts: StartOptions = {}): Promise<HubHandle> {
   // F3b: an APPLY that died half-way is rolled forward/back BEFORE anything can write or commit (in every mode,
   // also LEDGER_SYNC=0). No marker = no effect. The notes of the replay are delivered once the store is up.
   const bootReplay = await bootReplayGit(ledger, log);
+  // B4: `sync init|join` change identity / slot / worktree OFFLINE. While their marker exists this hub must not
+  // serve (it caches identity and slot, and a joiner before adoption holds the primary's slot: one minted item id
+  // would be a duplicate). Checked in EVERY mode (also LEDGER_SYNC=0), AFTER the crash replay above and BEFORE
+  // anything can write: the replay only rolls an interrupted APPLY forward or back (it mints and commits nothing,
+  // and an enrolment refuses to start over an inflight marker), so running it first costs nothing and keeps a
+  // half-moved worktree from being handed to the enrolment, while `ledger.init()` is the first step that can mint.
+  if ((await enrolMarkerPresent(ledger)) !== 'absent') {
+    log(ENROL_REFUSAL);
+    throw new EnrolInProgressError();
+  }
   await ledger.init();
   // Items whose `done.version` held prose were parsed leniently by the
   // reindex above (and flagged); fix the files once, atomically, through the
@@ -328,7 +354,10 @@ export async function startHub(opts: StartOptions = {}): Promise<HubHandle> {
   await repoWatcher.start();
   if (opts.periodic !== false) gitCache.start();
 
+  // The loop starts after the app exists; the sync routes read it lazily.
+  let syncLoop: SyncLoop | null = null;
   const app = createApp({
+    sync: () => syncLoop,
     ledger,
     guard: guardCfg,
     store,
@@ -542,6 +571,7 @@ export async function startHub(opts: StartOptions = {}): Promise<HubHandle> {
 
   // F3b: the loop starts last (the hub already serves), only with LEDGER_SYNC=1 and an enrolled ledger.
   const sync = await startSync({ ledger, store, config, log, start: opts.periodic !== false });
+  syncLoop = sync;
 
   log(`agent-ledger on http://127.0.0.1:${guardCfg.port} · ledger ${ledger.paths.root} · fts ${store.engine}`);
 

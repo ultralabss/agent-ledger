@@ -21,21 +21,24 @@
 
 import { access, constants, open, readFile, stat } from 'node:fs/promises';
 import { homedir } from 'node:os';
-import { delimiter, join } from 'node:path';
+import { delimiter, dirname, join, resolve } from 'node:path';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import {
   TrustError,
   createTrustDeps,
   detectMachinePlatform,
   deviceHealth,
+  listDevices,
   probeFs,
   probeFsStatOnly,
+  safeOutput,
   spoolDir,
   spoolStats,
   type FsCaps,
 } from '@agent-ledger/shared';
 import { bool, type Args } from './args.ts';
 import type { CliEnvConfig } from './client.ts';
-import { formatCheck, remoteCheck, type Check, type CheckStatus } from './doctor-checks.ts';
+import { defaultCodeRepoDir, formatCheck, readGitRemotes, remoteCheck, type Check, type CheckStatus } from './doctor-checks.ts';
 import { linuxChecks } from './doctor-linux.ts';
 import { win32Checks, wslChecks } from './doctor-win32.ts';
 import { hubIdentityVerdict, hubServesLedger, type IdentityVerdict } from './identity.ts';
@@ -101,6 +104,95 @@ export interface DoctorDeps {
   wsl?: boolean;
   /** Entries of `/mnt/c/Users` for the WSL dual-ledger check (default: read the directory). */
   listWinUsers?: () => Promise<string[]>;
+  /** Loader of the sync remote checks (`hub/src/sync/remotecheck.ts`, B4b). `null` = module unavailable. */
+  loadRemoteChecks?: () => Promise<SyncRemoteChecksFn | null>;
+}
+
+/** What the adapter below hands to the hub's `remoteChecks` (docs/f3b-b4-plan.md §2.4). */
+export type SyncRemoteChecksFn = (deps: { ledgerDir: string; online: boolean; codeRepoDir?: string }) => Promise<Check[]>;
+
+const CHECK_STATUSES = new Set<string>(['ok', 'warn', 'fail', 'info']);
+
+/** The sync remote checks live in the hub package (they share `Gitx` / `checkGitConfig` with enrolment). The CLI has
+ *  no runtime dependency on the hub, so the modules are loaded from the repository checkout this file sits in, by
+ *  absolute paths derived from `import.meta.url` (never from env or input); any failure = `null` (one warn line).
+ *  The adapter opens `Gitx` only for `--online` (network checks) and reads the code repo's `origin` for the
+ *  "remote differs from the code repository" check. */
+async function defaultLoadRemoteChecks(): Promise<SyncRemoteChecksFn | null> {
+  try {
+    const here = dirname(fileURLToPath(import.meta.url));
+    const href = (...p: string[]): string => pathToFileURL(resolve(here, '..', '..', 'hub', 'src', 'sync', ...p)).href;
+    const rc = (await import(href('remotecheck.ts'))) as { remoteChecks?: unknown };
+    if (typeof rc.remoteChecks !== 'function') return null;
+    const run = rc.remoteChecks as (d: Record<string, unknown>) => Promise<Check[]>;
+    return async ({ ledgerDir, online, codeRepoDir }) => {
+      let gitx: unknown;
+      if (online) {
+        const gx = (await import(href('gitx.ts'))) as { Gitx?: { open(o: { syncDir: string }): Promise<unknown> } };
+        gitx = await gx.Gitx?.open({ syncDir: join(ledgerDir, '.hub', 'sync') });
+      }
+      const remotes = await readGitRemotes(codeRepoDir ?? defaultCodeRepoDir());
+      const codeRepoRemote = remotes?.find((r) => r.name === 'origin')?.url ?? null;
+      return run({ ledgerDir, online, codeRepoRemote, ...(gitx === undefined ? {} : { gitx }) });
+    };
+  } catch {
+    return null;
+  }
+}
+
+/** Sync section: only on an enrolled ledger (`.hub/sync.yml`) or one with an enrolment marker. Offline facts come
+ *  from the shared device store; the remote / git-config / marker checks from `remoteChecks` (network only with
+ *  `--online`). A missing module is ONE warn, never a crash. Every line passes `safeOutput`; no URL is printed. */
+export async function syncChecks(ledgerDir: string, online: boolean, deps: DoctorDeps = {}): Promise<Check[]> {
+  const enrolled = await exists(join(ledgerDir, '.hub', 'sync.yml'));
+  const marker = await exists(join(ledgerDir, '.hub', 'sync', 'enrol.json'));
+  if (!enrolled && !marker) return [];
+  const out: Check[] = [];
+  const seen = new Set<string>();
+  const push = (c: Check): void => {
+    if (seen.has(c.id) || out.length >= 12) return;
+    seen.add(c.id);
+    out.push({ id: c.id, status: c.status, detail: safeOutput(c.detail, 300) });
+  };
+  if (marker) push({ id: 'sync_enrol_marker', status: 'warn', detail: 'sync: an enrolment is in progress or was interrupted (the hub stays down): ledger sync init|join --continue, or --abort' });
+  if (enrolled) {
+    try {
+      const rows = await listDevices(ledgerDir);
+      const active = rows.filter((d) => d.status === 'active');
+      const unapproved = active.filter((d) => !d.trusted && !d.self);
+      if (unapproved.length > 0) {
+        push({
+          id: 'sync_devices_unapproved',
+          status: 'warn',
+          detail: `sync: ${String(unapproved.length)} device(s) registered by a peer are not trusted here yet: ${unapproved.map((d) => `ledger device approve ${d.id} --fp ${d.fingerprint}`).slice(0, 3).join(' · ')}`,
+        });
+      }
+      if (active.filter((d) => d.trusted).length <= 1) {
+        push({ id: 'sync_single_trusted_device', status: 'warn', detail: 'sync: only one trusted device — losing it loses write access to the remote history; add a second (ledger device add)' });
+      }
+    } catch {
+      push({ id: 'sync_devices_unreadable', status: 'warn', detail: 'sync: the device registry could not be read' });
+    }
+  }
+  const load = deps.loadRemoteChecks ?? defaultLoadRemoteChecks;
+  let fn: SyncRemoteChecksFn | null = null;
+  try {
+    fn = await load();
+  } catch {
+    fn = null;
+  }
+  if (fn === null) {
+    push({ id: 'sync_remote_checks', status: 'warn', detail: 'sync: remote checks are not available in this install (skipped)' });
+    return out;
+  }
+  try {
+    for (const c of await fn({ ledgerDir, online, ...(deps.codeRepoDir !== undefined ? { codeRepoDir: deps.codeRepoDir } : {}) })) {
+      if (c !== null && typeof c === 'object' && typeof c.id === 'string' && /^[a-z0-9_]{1,40}$/.test(c.id) && CHECK_STATUSES.has(c.status) && typeof c.detail === 'string') push(c);
+    }
+  } catch {
+    push({ id: 'sync_remote_checks', status: 'warn', detail: 'sync: the remote checks failed to run (skipped)' });
+  }
+  return out;
 }
 
 const WEAK_FS_FIX =
@@ -477,6 +569,12 @@ export async function cmdDoctor(
 
   /* ---- device key / signers / stale devices (only once device identity exists) ---- */
   for (const c of await deviceHealth(cfg.ledgerDir)) {
+    checks.push(c);
+    if (c.status === 'fail') problems.push(c.detail.slice(0, 120));
+  }
+
+  /* ---- sync (enrolled ledgers only) ---- */
+  for (const c of await syncChecks(cfg.ledgerDir, bool(args, 'online'), deps)) {
     checks.push(c);
     if (c.status === 'fail') problems.push(c.detail.slice(0, 120));
   }

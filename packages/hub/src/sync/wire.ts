@@ -24,7 +24,7 @@ import { SyncLoop } from './loop.ts';
 import type { ProposedItem } from './merge/tree.ts';
 import { cleanText } from './notes.ts';
 import { ObjectStore } from './objects.ts';
-import { StateStore, readSyncConfig, type Inflight } from './state.ts';
+import { StateStore, readEnrolMarker, readSyncConfig, type Inflight } from './state.ts';
 import { TreeBuilder } from './treebuild.ts';
 
 export interface BootReplay {
@@ -57,6 +57,18 @@ export async function bootReplayGit(ledger: Ledger, log: (line: string) => void)
   } catch {
     log('sync: boot replay failed — commits stay paused, the sync cycle halts `inflight`');
     return { result: null, deps: null };
+  }
+}
+
+/** Enrolment marker check (`.hub/sync/enrol.json`, B4c, docs/f3b-b4-plan.md §2.5): `sync init|join` write it while
+ *  they change identity / slot / worktree, and a hub that serves meanwhile could mint item ids under a slot that
+ *  the accepted history does not assign to this key (T-B4-5). `present` = a valid marker, `unreadable` = the file
+ *  exists but is oversize / invalid / unsafe (fail closed: treated like present). Never throws, logs nothing. */
+export async function enrolMarkerPresent(ledger: Ledger): Promise<'absent' | 'present' | 'unreadable'> {
+  try {
+    return (await readEnrolMarker(ledger.paths.root)) === null ? 'absent' : 'present';
+  } catch {
+    return 'unreadable';
   }
 }
 

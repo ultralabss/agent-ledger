@@ -6,7 +6,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import type { CycleDeps, CycleResult } from './cycle.ts';
 import { runCycle } from './cycle.ts';
-import { SyncLoop, type LoopClock } from './loop.ts';
+import { ExclusiveOpError, MinGap, RouteLimiter, SyncLoop, type LoopClock } from './loop.ts';
 import type { HaltState } from './state.ts';
 import { cycleDeps, makeFleet, makeKit, type LedgerHub } from './testkit-remote.ts';
 
@@ -369,4 +369,165 @@ test('with the REAL cycle: an unsigned tip is accepted after `sync accept`, appl
     assert.equal(await c.lh.hub.main(), tip);
     await loop.stop();
   });
+});
+
+/* ---------------- B4c: exclusiveOp, RouteLimiter, MinGap (docs/f3b-b4-plan.md §2.5; T-B4-7) ---------------- */
+
+test('exclusiveOp waits for the running cycle, holds the slot, and kicks during it coalesce into ONE rerun', { skip: !posix }, async () => {
+  await withCtx(async (c) => {
+    let release: () => void = () => undefined;
+    let running = 0;
+    let maxRunning = 0;
+    let blockFirst = true;
+    const loop = c.loop({
+      cycle: async () => {
+        running += 1;
+        maxRunning = Math.max(maxRunning, running);
+        c.calls.push(c.clock.now());
+        if (blockFirst) {
+          blockFirst = false;
+          await new Promise<void>((r) => { release = r; });
+        }
+        running -= 1;
+        return result();
+      },
+    });
+    loop.start();
+    await until(() => c.calls.length === 1);
+    let opStarted = false;
+    const events: string[] = [];
+    const op = loop.exclusiveOp(async () => {
+      opStarted = true;
+      events.push(`op sees ${String(running)} running`);
+      await new Promise((r) => setTimeout(r, 40));
+      for (let i = 0; i < 5; i += 1) loop.trigger('manual'); // while the op holds SF
+      await new Promise((r) => setTimeout(r, 30));
+      events.push(`calls during op ${String(c.calls.length)}`);
+      return 'done';
+    });
+    await new Promise((r) => setTimeout(r, 30));
+    assert.equal(opStarted, false, 'the running cycle is waited for, never killed');
+    release();
+    assert.equal(await op, 'done');
+    assert.deepEqual(events, ['op sees 0 running', 'calls during op 1']);
+    await until(() => c.calls.length === 2); // the coalesced kicks run once, after the release
+    await new Promise((r) => setTimeout(r, 40));
+    assert.equal(c.calls.length, 2, 'exactly one rerun');
+    assert.equal(maxRunning, 1, 'never two cycles at once');
+    await loop.stop();
+  });
+});
+
+test('exclusiveOp: a second concurrent op is BUSY (never queued); stopped loop = STOPPED', { skip: !posix }, async () => {
+  await withCtx(async (c) => {
+    const loop = c.loop();
+    let release: () => void = () => undefined;
+    const first = loop.exclusiveOp(() => new Promise<string>((r) => { release = () => r('one'); }));
+    await assert.rejects(loop.exclusiveOp(async () => 'two'), (e: unknown) => e instanceof ExclusiveOpError && e.code === 'BUSY');
+    release();
+    assert.equal(await first, 'one');
+    assert.equal(await loop.exclusiveOp(async () => 'again'), 'again', 'the slot is free again');
+    await loop.stop();
+    await assert.rejects(loop.exclusiveOp(async () => 'x'), (e: unknown) => e instanceof ExclusiveOpError && e.code === 'STOPPED');
+  });
+});
+
+test('exclusiveOp: the 90 s budget releases the slot, expired() turns true, the op is not killed', { skip: !posix }, async () => {
+  await withCtx(async (c) => {
+    const loop = c.loop();
+    let sawExpired: boolean | null = null;
+    let finish: () => void = () => undefined;
+    const op = loop.exclusiveOp(async (_d, ctx) => {
+      await new Promise<void>((r) => { finish = r; });
+      sawExpired = ctx.expired();
+      await assert.rejects(ctx.cycle(), (e: unknown) => e instanceof ExclusiveOpError && e.code === 'TIMEOUT');
+      return 'late';
+    });
+    const settled = assert.rejects(op, (e: unknown) => e instanceof ExclusiveOpError && e.code === 'TIMEOUT');
+    await c.clock.advance(90_001);
+    await settled;
+    // SF is free: another op runs and a trigger starts a cycle although the first op is still pending
+    assert.equal(await loop.exclusiveOp(async () => 'next'), 'next');
+    loop.trigger('manual');
+    await until(() => c.calls.length === 1);
+    finish();
+    await new Promise((r) => setTimeout(r, 20));
+    assert.equal(sawExpired, true);
+    await loop.stop();
+  });
+});
+
+test('exclusiveOp does not change halt gating: ctx.cycle() honours the same gate as a manual trigger', { skip: !posix }, async () => {
+  await withCtx(async (c) => {
+    const loop = c.loop();
+    await c.setHalt(halt({ reason: 'auth', cls: 'no-contact' }));
+    const skipped = await loop.exclusiveOp((_d, ctx) => ctx.cycle());
+    assert.equal(skipped.outcome, 'gate-skip');
+    assert.equal(c.calls.length, 0, 'no remote contact in a no-contact halt');
+    await c.setHalt(null);
+    const ran = await loop.exclusiveOp((_d, ctx) => ctx.cycle());
+    assert.equal(ran.outcome, 'up-to-date');
+    assert.equal(c.calls.length, 1);
+    await c.setHalt(halt({ reason: 'detached', cls: 'terminal' }));
+    assert.equal((await loop.exclusiveOp((_d, ctx) => ctx.cycle())).outcome, 'gate-skip');
+    assert.equal(c.calls.length, 1);
+    await loop.stop();
+  });
+});
+
+test('stop() waits for a running exclusive op', { skip: !posix }, async () => {
+  await withCtx(async (c) => {
+    const loop = c.loop();
+    let release: () => void = () => undefined;
+    let done = false;
+    const op = loop.exclusiveOp(async () => {
+      await new Promise<void>((r) => { release = r; });
+      done = true;
+      return 1;
+    });
+    const stopped = loop.stop();
+    await new Promise((r) => setTimeout(r, 30));
+    assert.equal(done, false);
+    release();
+    await stopped;
+    assert.equal(done, true);
+    assert.equal(await op, 1);
+  });
+});
+
+test('RouteLimiter: 5 failures in the window lock until reset; the lifetime cap survives reset; clock jumps are distances', () => {
+  let t = 1_000_000;
+  const lim = new RouteLimiter({ now: () => t });
+  for (let i = 0; i < 4; i += 1) lim.fail();
+  assert.equal(lim.locked, false);
+  t += 11 * 60_000; // outside the window: the first four no longer count
+  lim.fail();
+  assert.equal(lim.locked, false);
+  for (let i = 0; i < 4; i += 1) lim.fail();
+  assert.equal(lim.locked, true);
+  lim.reset();
+  assert.equal(lim.locked, false);
+  const jumpy = new RouteLimiter({ now: () => t, maxTotal: 7 });
+  for (let i = 0; i < 4; i += 1) jumpy.fail();
+  t -= 365 * 24 * 3600_000; // clock jumps a year back: old stamps are far away (Math.abs), never frozen forever
+  jumpy.fail();
+  assert.equal(jumpy.locked, false);
+  jumpy.fail();
+  jumpy.fail(); // total 7
+  assert.equal(jumpy.locked, true);
+  jumpy.reset();
+  assert.equal(jumpy.locked, true, 'resume cannot grind past the lifetime cap');
+});
+
+test('MinGap: one take per gap, a clock jump counts as elapsed', () => {
+  let t = 5_000_000;
+  const gap = new MinGap(5000, () => t);
+  assert.equal(gap.take(), true);
+  assert.equal(gap.take(), false);
+  t += 4999;
+  assert.equal(gap.take(), false);
+  t += 2;
+  assert.equal(gap.take(), true);
+  t -= 3_600_000;
+  assert.equal(gap.take(), true);
 });

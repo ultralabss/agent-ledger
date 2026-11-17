@@ -89,8 +89,11 @@ const USAGE = `ledger — shared ledger and intake for parallel AI agent session
   ledger reply <ID> "<text>" [--mode auto|session|worker]
   ledger wait [--timeout 600]               wait for the hub to come up and flush the queue
   ledger doctor [--fix] [--json] [--online] hub diagnostics (service, healthz, identity, ledger remote)
-  ledger device init|list|approve|revoke    this machine's device key and the device registry (local, no hub needed)
-                                          init [--label <x>] [--root] · approve <id> · revoke <id> --reason "<why>"
+  ledger device init|list|add|approve|revoke  this machine's device key and the device registry (local, no hub needed)
+                                          init [--label <x>] [--root] · add '<pubkey>' --label <x> --fp <fp>
+                                          approve <id> --fp <fp> · revoke <id> --reason "<why>"
+  ledger sync [status|resume|accept <sha>|confirm-revocation <id> --fp <fp>]   git sync of the ledger (hub)
+  ledger sync init --remote <url> | join <url> [--continue]   enrol this ledger for sync (offline: hub stopped)
   ledger spool failed                       failed spool records (method, path, time, body)
   ledger spool retry <file> --confirm       re-sign and resend the records of one failed file
   ledger hook <event>                       hook transport (Claude Code adapter protocol, §10)
@@ -126,6 +129,19 @@ export async function run(argv: string[], io: Io): Promise<number> {
   if (cmd === 'device') {
     const { cmdDevice } = await import('./device.ts');
     return cmdDevice(args, io);
+  }
+  // `ledger sync init|join` enrol OFFLINE (the hub must be stopped): no hub client, no spool drain. The other
+  // `ledger sync` commands talk to the hub through the plain client (never the spooling one: a decision that could
+  // not be delivered must not be queued and replayed later).
+  if (cmd === 'sync') {
+    const sub = args.positional[1];
+    if (sub === 'init' || sub === 'join') {
+      // @ts-ignore -- `sync-enrol.ts` (B4b) lands in the same release; typed through the cast below
+      const mod = (await import('./sync-enrol.ts')) as unknown as { cmdSyncEnrol: (a: Args, i: Io) => Promise<number> };
+      return mod.cmdSyncEnrol(args, io);
+    }
+    const { cmdSync } = await import('./sync.ts');
+    return cmdSync(args, io);
   }
   // `cfg` is needed by the offline fallback in `catch`, but `readEnvConfig`
   // itself throws on a bad `LEDGER_HUB_URL` (S2) and that must stay a plain exit 4
