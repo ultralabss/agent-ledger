@@ -41,6 +41,17 @@ export class LedgerPaths {
     return join(this.root, 'ledger.format');
   }
 
+  /** Sync state directory (local, gitignored via `.hub/`). */
+  get syncDir(): string {
+    return join(this.hubDir, 'sync');
+  }
+
+  /** APPLY crash marker (F3b B3, docs/f3b-b3-plan.md §2). While it exists `LedgerGit.commit()` must not
+   *  `add -A`: the worktree may be half-way between two trees. Basename fixed here, written by `sync/apply.ts`. */
+  get inflightMarker(): string {
+    return join(this.syncDir, 'inflight.json');
+  }
+
   /** This machine's identity — local, gitignored (`.hub/`). */
   get deviceYml(): string {
     return join(this.hubDir, 'device.yml');

@@ -1,6 +1,7 @@
 /** Git via `spawn(<resolved absolute path>, [...])` — never a shell string,
  *  never a PATH-resolved `git` (SPEC §6.1, S6). */
 
+import { AsyncLocalStorage } from 'node:async_hooks';
 import { spawn } from 'node:child_process';
 import { createHash, randomBytes } from 'node:crypto';
 import type { Stats } from 'node:fs';
@@ -11,10 +12,14 @@ import { dirname, isAbsolute, join, resolve as resolvePath, win32 as winPath } f
 import {
   assertPrivateDir,
   assertTrustedAncestors,
+  DEVICE_ID_RE,
   ensurePrivateDir,
+  gitSigningArgs,
   isOwnedByMe,
+  labelSchema,
   resolveTrustedExecutable,
   TrustError,
+  type GitSigningInput,
 } from '@agent-ledger/shared';
 
 export interface GitResult {
@@ -568,6 +573,42 @@ export interface LedgerGitOptions {
   heavyAllowed?: () => boolean;
   /** Ms until `heavyAllowed()` opens again. */
   heavyRetryInMs?: () => number;
+  /** `LEDGER_SYNC=1` (F3b). The only push is then `Gitx.push` from the sync cycle: `maybePush` never
+   *  spawns, and a commit is signed with the device key or not made at all. */
+  sync?: boolean;
+  /** Who signs a sync-mode commit. `null` = this ledger is not enrolled yet → commit as before
+   *  (unsigned, global identity). Anything else is signed or the commit is NOT made (no unsigned
+   *  fallback). May throw: treated as an error outcome, never as "not enrolled". */
+  syncCommit?: () => SyncCommitIdentity | null | Promise<SyncCommitIdentity | null>;
+  /** APPLY crash marker (`.hub/sync/inflight.json`). ALWAYS checked, sync on or off: while it exists the
+   *  worktree may sit between two trees and `add -A` would commit a revert (T-B3-3). */
+  inflightMarker?: string;
+  /** Called after every successful commit (the sync loop's `trigger('commit')`). Never throws into commit(). */
+  onCommitted?: () => void;
+}
+
+/** What `commit()` needs to sign as this device. `label` is a `labelSchema` value, `deviceId` a `DEVICE_ID_RE`
+ *  value; both are re-validated before they reach an argv. */
+export interface SyncCommitIdentity {
+  label: string;
+  deviceId: string;
+  signing: GitSigningInput;
+}
+
+/** Result of one commit attempt. Anything but `clean`/`committed` means "the worktree may still hold
+ *  uncommitted changes": the sync APPLY must not proceed (docs/f3b-b3-plan.md P-2).
+ *  - `clean`     nothing to commit
+ *  - `committed` a commit was made
+ *  - `held`      S1 hold, scanner finding, or the git branch is disabled
+ *  - `deferred`  wake gate / inconclusive scan: will retry on its own
+ *  - `inflight`  an APPLY marker exists
+ *  - `error`     git could not answer, or the (signed) commit failed */
+export type CommitOutcome = 'clean' | 'committed' | 'held' | 'deferred' | 'inflight' | 'error';
+
+/** Handed to `runExclusive`'s fn: `commitNow` runs `commit()` INLINE. `flush()` inside would chain onto the
+ *  very promise that is waiting for fn → deadlock (P-1). */
+export interface ExclusiveHandle {
+  commitNow(): Promise<CommitOutcome>;
 }
 
 /** Credentials embedded in a remote URL (`https://user:token@host/…`) must
@@ -588,6 +629,19 @@ const TOKEN_REL_PATH_LOWER = TOKEN_REL_PATH.toLowerCase();
  *  though it is the exact same file on disk as the real token. */
 function isTokenPath(line: string): boolean {
   return line.trim().toLowerCase() === TOKEN_REL_PATH_LOWER;
+}
+
+/**
+ * F3b: anything under `.hub/` is local trust material (device key, token, allowed_signers, sync state).
+ * Wider than {@link isTokenPath}: the first path segment, lower-cased with trailing dots/spaces stripped
+ * (NTFS/APFS alias `.Hub`, `.hub.`, `.hub `), equals `.hub`. `git ls-files` without `-z` quotes unusual
+ * names (`".hub/\303\251"`), so a leading quote is dropped first.
+ */
+export function isHubPath(line: string): boolean {
+  let p = line.trim();
+  if (p.startsWith('"')) p = p.slice(1);
+  const first = p.split('/')[0] ?? '';
+  return first.toLowerCase().replace(/[. ]+$/, '') === '.hub';
 }
 
 /** How many consecutive inconclusive S1 checks before we stop being
@@ -612,11 +666,37 @@ export function scanRetryDelayMs(streak: number): number {
   return SCAN_RETRY_DELAYS_MS[i]!;
 }
 
+const HUB_SUBJECT = '.hub/**';
+const HUB_EXCLUDE_ICASE = ':(exclude,icase).hub';
+const HUB_EXCLUDE = ':(exclude).hub';
+
+/** True iff `stderr` is git's "paths are ignored" notice and every path listed in it is under `.hub`. */
+export function onlyHubIgnoredNotice(stderr: string): boolean {
+  let header = false;
+  for (const raw of stderr.split('\n')) {
+    const line = raw.trim();
+    if (line === '' || line.startsWith('hint:')) continue;
+    if (line === 'The following paths are ignored by one of your .gitignore files:') {
+      header = true;
+      continue;
+    }
+    if (!header || !isHubPath(line)) return false;
+  }
+  return header;
+}
+
+/** One-line, bounded error text for a log (never a stack, never a URL credential). */
+function logSafeErr(err: unknown): string {
+  const text = err instanceof Error ? err.message : String(err);
+  return redactUrlCredentials(text.replace(/[\r\n\t]+/g, ' ')).slice(0, 200);
+}
+const HUB_TRACKED_REASON = 'content under .hub/ is tracked or staged by git — commit paused until it is removed from the index';
+
 /** Outcome of the S1 check. Only `leak` is proof. */
 type TokenInvariant =
   | { kind: 'ok' }
   | { kind: 'leak'; reason: string }
-  | { kind: 'unsafe'; reason: string }
+  | { kind: 'unsafe'; reason: string; subject?: string }
   | { kind: 'unknown'; reason: string };
 
 /** Readable one-liner for a git call that produced no usable answer. */
@@ -668,6 +748,12 @@ export class LedgerGit {
   /** Consecutive inconclusive gitleaks scans. Drives the backoff and
    *  keeps the SECURITY line to one per streak instead of one per attempt. */
   private scanStreak = 0;
+  /** True only while an `runExclusive` fn runs: nested `flush()/close()/runExclusive()` would deadlock. */
+  private readonly exclusive = new AsyncLocalStorage<true>();
+  private markerLogged = false;
+  private syncPushLogged = false;
+  /** `:(exclude,icase)` accepted by this git? Flips to false once, on a pathspec-magic error (fallback below). */
+  private icaseExclude = true;
 
   constructor(opts: LedgerGitOptions) {
     this.opts = opts;
@@ -823,17 +909,63 @@ export class LedgerGit {
     if (this.timer) clearTimeout(this.timer);
     this.timer = setTimeout(() => {
       this.timer = null;
-      void this.flush();
+      // The timer may have been armed from inside `runExclusive` (commit() re-arms); it inherits that async
+      // context, but it fires outside the exclusive section and must simply queue behind it.
+      void this.exclusive.exit(() => this.flush());
     }, delayMs);
     this.timer.unref?.();
   }
 
   /** Commit now (used by tests and on shutdown). */
   flush(): Promise<void> {
-    this.running = this.running.then(() => this.commit()).catch((err: unknown) => {
-      this.opts.log(`ledger commit error: ${String(err)}`);
-    });
+    this.assertNotExclusive('flush');
+    this.running = this.running.then(() => this.commit()).then(
+      () => undefined,
+      (err: unknown) => {
+        this.opts.log(`ledger commit error: ${String(err)}`);
+      },
+    );
     return this.running;
+  }
+
+  /**
+   * Run `fn` with the commit chain held (`running`), serialised against the timer flush, `retrySecurityHold`
+   * and `close()`. The sync APPLY needs this: a `commit()` between `read-tree` and `update-ref` would `add -A`
+   * tree M onto L and drop the remote parent (docs/f3b-b3-plan.md §3).
+   *
+   * Lock order: R (this) -> Q (`Ledger.queue`). `fn` may take the queue; nothing inside the queue may call
+   * `flush()/close()/runExclusive()` (a source-scan test pins that) — here a nested call throws instead of
+   * deadlocking. A rejecting `fn` rejects the returned promise but never breaks the chain.
+   */
+  runExclusive<T>(fn: (x: ExclusiveHandle) => Promise<T>): Promise<T> {
+    this.assertNotExclusive('runExclusive');
+    const job = this.running.then(() => {
+      let open = true;
+      const handle: ExclusiveHandle = {
+        commitNow: async () => {
+          if (!open) throw new Error('ledger git: commitNow used after the exclusive section ended');
+          return this.commit();
+        },
+      };
+      return this.exclusive.run(true, async () => {
+        try {
+          return await fn(handle);
+        } finally {
+          open = false;
+        }
+      });
+    });
+    this.running = job.then(
+      () => undefined,
+      () => undefined,
+    );
+    return job;
+  }
+
+  private assertNotExclusive(op: string): void {
+    if (this.exclusive.getStore() === true) {
+      throw new Error(`ledger git: ${op}() inside runExclusive would deadlock — use commitNow()`);
+    }
   }
 
   private summary(): string {
@@ -886,6 +1018,14 @@ export class LedgerGit {
     if (staged.code !== 0) return { kind: 'unknown', reason: `diff --cached: ${gitFailureNote(staged)}` };
     if (staged.stdout.split('\n').some(isTokenPath)) {
       return { kind: 'leak', reason: 'is staged' };
+    }
+
+    // F3b widening: the token is not the only secret under `.hub/` (device key, allowed_signers, sync
+    // state). Anything else tracked or staged there is an `unsafe` hold — NOT a leak: no rotation (the
+    // token is not involved), and it lifts itself once the index is clean again. Placed AFTER both token
+    // checks so a tracked/staged token keeps the `leak` flow.
+    if (tracked.stdout.split('\n').some(isHubPath) || staged.stdout.split('\n').some(isHubPath)) {
+      return { kind: 'unsafe', reason: HUB_TRACKED_REASON, subject: HUB_SUBJECT };
     }
 
     // `check-ignore -q`: 0 = ignored, 1 = not ignored, 128 = error.
@@ -1060,6 +1200,7 @@ export class LedgerGit {
    * same `running` chain as every other git operation so it cannot interleave.
    */
   retrySecurityHold(): Promise<void> {
+    this.assertNotExclusive('retrySecurityHold');
     if (this.hold?.kind !== 'leak' || this.hold.rotationOk) return Promise.resolve();
     this.running = this.running
       .then(async () => {
@@ -1095,10 +1236,10 @@ export class LedgerGit {
 
   /** Pause without rotating — `.hub/token` is not ignored but has not
    *  reached git. Lifted automatically by the next clean check. */
-  private holdUnsafe(reason: string): void {
+  private holdUnsafe(reason: string, subject: string = TOKEN_REL_PATH): void {
     if (this.hold?.reason !== reason) {
-      this.opts.log(`SECURITY: ${TOKEN_REL_PATH} ${reason}`);
-      void this.journal('security', ['s1.hold', TOKEN_REL_PATH, reason]);
+      this.opts.log(`SECURITY: ${subject} ${reason}`);
+      void this.journal('security', ['s1.hold', subject, reason]);
     }
     // A8-8: no `lastPushError` write here — the hold reason lives on
     // `this.hold.reason` / `status.securityHold`, kept separate so a real,
@@ -1185,8 +1326,16 @@ export class LedgerGit {
     }
   }
 
-  private async commit(): Promise<void> {
-    if (!this.enabled) return;
+  private async commit(): Promise<CommitOutcome> {
+    if (!this.enabled) return 'held';
+    // F3b T-B3-3: FIRST thing after the enabled check, before ANY git call and unconditional (sync on or
+    // off). While an APPLY marker exists the worktree may sit between two trees (L and M); `add -A` would
+    // commit the revert of the remote work. Summaries stay pending, the timer retries.
+    if (await this.applyInFlight()) {
+      this.rearm(LedgerGit.INFLIGHT_RETRY_MS);
+      return 'inflight';
+    }
+    this.markerLogged = false;
     // Evaluated on EVERY cycle, including while a hold is active — that
     // is what makes the hold recoverable instead of a permanent state.
     const invariant = await this.tokenInvariant();
@@ -1201,16 +1350,18 @@ export class LedgerGit {
           // beyond what `lockdown()` already does when it fails again.
           await this.lockdown(invariant.reason);
         }
-        return;
+        return 'held';
       case 'unsafe':
         this.clearCheckErrors();
-        this.holdUnsafe(invariant.reason);
-        return;
+        // A `leak` hold carries proof of rotation; a non-token `.hub` finding must not replace it.
+        if (invariant.subject !== undefined && this.hold?.kind === 'leak') return 'held';
+        this.holdUnsafe(invariant.reason, invariant.subject);
+        return 'held';
       case 'unknown':
         // Deliberately NOT a lockdown and NOT a rotation. `summaries` is kept,
         // so the next flush commits everything this cycle would have.
         this.noteCheckError(invariant.reason);
-        return;
+        return 'error';
       case 'ok':
         this.clearCheckErrors();
         // A8-1: a `leak` hold does not clear just because the working tree
@@ -1219,7 +1370,7 @@ export class LedgerGit {
         // `checkLeakRelease()` (rotation confirmed + absent from all history)
         // may lift it.
         if (this.hold?.kind === 'leak') {
-          if (!(await this.checkLeakRelease())) return;
+          if (!(await this.checkLeakRelease())) return 'held';
         }
         this.releaseHold();
         break;
@@ -1233,17 +1384,27 @@ export class LedgerGit {
     // point and the timer is re-armed for the moment the gate opens.
     if (this.opts.heavyAllowed && !this.opts.heavyAllowed()) {
       this.rearm(Math.max(1_000, this.opts.heavyRetryInMs?.() ?? 5_000));
-      return;
+      return 'deferred';
     }
     const summary = this.summary() || 'changes';
     this.summaries = [];
-    const add = await git(this.opts.root, ['add', '-A']).catch(
-      (err: unknown) => ({ code: -2, stdout: '', stderr: String(err) }),
-    );
-    if (add.code !== 0) {
+    // F3b: `.hub` is never staged, whatever `.gitignore` says. `icase` because APFS/NTFS fold case
+    // (`.HUB/x` is the same directory). UNVERIFIED on every git >= 2.34: if this git refuses the magic we
+    // fall back to the case-sensitive form; the staged check below then catches a differently-cased path.
+    let add = await this.stageAll(this.icaseExclude ? HUB_EXCLUDE_ICASE : HUB_EXCLUDE);
+    if (add.code !== 0 && this.icaseExclude && /pathspec|magic/i.test(add.stderr)) {
+      this.icaseExclude = false;
+      this.opts.log('ledger: git rejected the icase pathspec magic — using the case-sensitive .hub exclude');
+      add = await this.stageAll(HUB_EXCLUDE);
+    }
+    // With ANY exclude pathspec git (2.54 measured) stages everything and then exits 1 with only
+    // "The following paths are ignored by one of your .gitignore files: .hub" — the ignored `.hub/` it was
+    // told to exclude. That exact message is not a failure; anything else on stderr still is.
+    const benignIgnored = add.code === 1 && onlyHubIgnoredNotice(add.stderr);
+    if (add.code !== 0 && !benignIgnored) {
       this.summaries = summary === 'changes' ? [] : [summary];
       this.opts.log(`git add failed: ${gitFailureNote(add)}`);
-      return;
+      return 'error';
     }
     const staged = await git(this.opts.root, ['diff', '--cached', '--name-only']).catch(
       (err: unknown) => ({ code: -2, stdout: '', stderr: String(err) }),
@@ -1256,16 +1417,37 @@ export class LedgerGit {
     if (staged.code !== 0) {
       this.summaries = summary === 'changes' ? [] : [summary];
       this.noteCheckError(`diff --cached po add -A: ${gitFailureNote(staged)}`);
-      return;
+      return 'error';
     }
     // `add -A` just ran. Closes the window between the pre-flight check
     // and the add (a session could have un-ignored or force-added the token in
     // between). Seeing it here IS proof, so it locks down and rotates.
     if (staged.stdout.split('\n').some(isTokenPath)) {
       await this.lockdown('was staged by `add -A`');
-      return;
+      return 'held';
     }
-    if (staged.stdout.trim() === '') return;
+    // F3b: any other `.hub/**` path in the index (case variants, a pathspec fallback, a concurrent
+    // `git add -f`) stops the commit. Unsafe hold: no rotation, the staged state is left for a human.
+    if (staged.stdout.split('\n').some(isHubPath)) {
+      this.summaries = summary === 'changes' ? [] : [summary];
+      this.holdUnsafe(HUB_TRACKED_REASON, HUB_SUBJECT);
+      return 'held';
+    }
+    if (staged.stdout.trim() === '') {
+      // Never report `clean` on the strength of a tolerated exit 1 alone: confirm the worktree really is
+      // clean (the APPLY treats `clean` as "nothing uncommitted").
+      if (benignIgnored) {
+        const dirty = await git(this.opts.root, ['status', '--porcelain=v1', '--untracked-files=all']).catch(
+          (err: unknown) => ({ code: -2, stdout: '', stderr: String(err) }),
+        );
+        if (dirty.code !== 0 || dirty.stdout.trim() !== '') {
+          this.summaries = summary === 'changes' ? [] : [summary];
+          this.noteCheckError('add exited 1 and the worktree is still dirty');
+          return 'error';
+        }
+      }
+      return 'clean';
+    }
 
     // Second line of defence, on what is actually staged. A finding
     // stops the commit and LEAVES the staged changes in place on purpose —
@@ -1304,7 +1486,7 @@ export class LedgerGit {
           );
         }
         this.rearm(scanRetryDelayMs(this.scanStreak));
-        return;
+        return 'deferred';
       }
       this.opts.log(
         // H6-1: `blocked` now also covers gitleaks itself erroring (fail-closed)
@@ -1312,7 +1494,7 @@ export class LedgerGit {
         // choked; `scan.note` carries the actual reason either way.
         `SECURITY: gitleaks blocked the commit of the ledger's staged changes (${scan.note ?? 'no detail'})`,
       );
-      return;
+      return 'held';
     }
     // A streak that ends leaves a line too — "the scanner is working
     // again" is exactly what a human reading the SECURITY line above needs.
@@ -1324,19 +1506,89 @@ export class LedgerGit {
     }
     if (scan.scanner === null && scan.note !== null) this.opts.log(scan.note);
 
-    const res = await git(this.opts.root, ['commit', '--no-verify', '-m', `ledger: ${summary}`]);
+    // F3b: sync-mode commits are made as THIS device and signed, or not made. No unsigned retry, ever.
+    let signedArgs: string[] = [];
+    let signed = false;
+    if (this.opts.sync === true && this.opts.syncCommit !== undefined) {
+      try {
+        const who = await this.opts.syncCommit();
+        if (who !== null) {
+          if (!DEVICE_ID_RE.test(who.deviceId) || !labelSchema.safeParse(who.label).success) {
+            throw new Error('device identity is not valid');
+          }
+          signedArgs = [
+            '-c',
+            `user.name=${who.label}`,
+            '-c',
+            `user.email=${who.deviceId}@devices.agent-ledger.invalid`,
+            ...gitSigningArgs(who.signing),
+          ];
+          signed = true;
+        }
+      } catch (err) {
+        this.summaries = summary === 'changes' ? [] : [summary];
+        this.opts.log(`ledger: sync commit refused — no signing identity (${logSafeErr(err)}); nothing committed`);
+        return 'error';
+      }
+    }
+    const message = `ledger: ${summary}`;
+    const commitArgs = signed
+      ? ['commit', '--no-verify', '-S', '-m', message]
+      : ['commit', '--no-verify', '-m', message];
+    const res = await git(this.opts.root, [...signedArgs, ...commitArgs]);
     if (res.code !== 0) {
-      this.opts.log(`git commit failed: ${res.stderr.trim()}`);
-      return;
+      if (signed) this.summaries = summary === 'changes' ? [] : [summary];
+      this.opts.log(`git commit failed: ${redactUrlCredentials(res.stderr.trim())}`);
+      return 'error';
     }
     const head = await git(this.opts.root, ['rev-parse', '--short', 'HEAD']);
     this.state.lastCommit = head.stdout.trim() || null;
     this.state.lastCommitAt = new Date().toISOString();
+    try {
+      this.opts.onCommitted?.();
+    } catch (err) {
+      this.opts.log(`ledger: onCommitted hook failed: ${logSafeErr(err)}`);
+    }
     await this.maybePush();
+    return 'committed';
+  }
+
+  /** `git add -A -- . <exclude>` (an exclude-only pathspec needs the `.` positive). */
+  private stageAll(exclude: string): Promise<GitResult> {
+    return git(this.opts.root, ['add', '-A', '--', '.', exclude]).catch(
+      (err: unknown) => ({ code: -2, stdout: '', stderr: String(err) }),
+    );
+  }
+
+  static readonly INFLIGHT_RETRY_MS = 30_000;
+
+  /** Fail-closed: only ENOENT means "no marker". Any other answer (EACCES, ELOOP, ...) pauses commits. */
+  private async applyInFlight(): Promise<boolean> {
+    const marker = this.opts.inflightMarker;
+    if (marker === undefined) return false;
+    try {
+      await lstat(marker);
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code === 'ENOENT') return false;
+    }
+    if (!this.markerLogged) {
+      this.markerLogged = true;
+      this.opts.log('ledger: a sync apply is in flight (or its marker is unreadable) — commits paused');
+    }
+    return true;
   }
 
   private async maybePush(): Promise<void> {
     if (!this.opts.push) return;
+    if (this.opts.sync === true) {
+      // T-B3-11: with sync on the ONLY push is `Gitx.push(url, sha)` from the sync cycle (validated, by sha,
+      // never forced). A legacy `git push origin HEAD` here would bypass every gate.
+      if (!this.syncPushLogged) {
+        this.syncPushLogged = true;
+        this.opts.log('ledger: LEDGER_SYNC=1 — legacy push disabled, the sync cycle pushes');
+      }
+      return;
+    }
     const remotes = await git(this.opts.root, ['remote']);
     if (!remotes.stdout.split('\n').some((r) => r.trim() === 'origin')) return;
     const now = Date.now();
@@ -1360,6 +1612,7 @@ export class LedgerGit {
   }
 
   async close(): Promise<void> {
+    this.assertNotExclusive('close');
     if (this.timer) {
       clearTimeout(this.timer);
       this.timer = null;

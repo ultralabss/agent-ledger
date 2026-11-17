@@ -11,7 +11,7 @@
  */
 
 import { createHash } from 'node:crypto';
-import { mkdir, readdir, realpath, stat } from 'node:fs/promises';
+import { lstat, mkdir, readdir, realpath, stat } from 'node:fs/promises';
 import { basename, join } from 'node:path';
 import { parse as parseYaml, stringify as stringifyYaml } from 'yaml';
 import {
@@ -61,18 +61,21 @@ import {
 import {
   configureSnowflakeWorker,
   day,
+  deviceLayout,
   ensurePrivateDir,
   isOwnedByMe,
   isoLocal,
   month,
   renameRetry,
+  resolveSshKeygen,
   sanitizeLine,
   shortSession,
+  slugSchema,
   stamp,
 } from '@agent-ledger/shared';
 import { expandHome, type HubConfig } from '../config.ts';
 import { conflict, invalid, notFound, LedgerError } from '../errors.ts';
-import { gitToplevel, LedgerGit } from '../git.ts';
+import { gitToplevel, LedgerGit, type SyncCommitIdentity } from '../git.ts';
 import { normalizeGitPath, samePathGit } from '../gitpath.ts';
 import { readOriginHint, readRootSha } from '../gitreader.ts';
 import { MemoryIndex, type ItemFilter, type LedgerIndex, type StoredItem } from '../index-store.ts';
@@ -217,7 +220,30 @@ export class Ledger {
       },
       ...(deps.heavyAllowed === undefined ? {} : { heavyAllowed: deps.heavyAllowed }),
       ...(deps.heavyRetryInMs === undefined ? {} : { heavyRetryInMs: deps.heavyRetryInMs }),
+      // F3b: with LEDGER_SYNC=1 commits are signed by this device and the legacy push is off; the APPLY
+      // marker pauses commits in every mode.
+      sync: deps.config.sync,
+      inflightMarker: this.paths.inflightMarker,
+      syncCommit: () => this.syncCommitIdentity(),
     });
+  }
+
+  /**
+   * Who signs a sync-mode commit; lazy because the device identity only exists after `init()`.
+   * `null` = this ledger is not enrolled (no `devices.yml`, no device key) → commits stay as before.
+   * "Enrolled" is deliberately NOT "the key file exists": a deleted key under an existing `devices.yml`
+   * must end in a refused commit (`syncCommit` throws on the missing key via git), never in an unsigned one.
+   */
+  private async syncCommitIdentity(): Promise<SyncCommitIdentity | null> {
+    const l = deviceLayout(this.paths.root);
+    const present = async (p: string): Promise<boolean> => (await lstat(p).catch(() => null)) !== null;
+    if (!(await present(l.devicesYml)) && !(await present(l.keyFile))) return null;
+    const id = this.device;
+    return {
+      label: id.label,
+      deviceId: id.device_id,
+      signing: { sshKeygenBin: await resolveSshKeygen(), keyFile: l.keyFile, allowedSignersFile: l.allowedSigners },
+    };
   }
 
   log(line: string): void {
@@ -890,7 +916,67 @@ export class Ledger {
   /** Set by the server so the SQLite search index follows every reindex. */
   onReindex: (() => void) | null = null;
 
-  private async loadItems(slug: string): Promise<void> {
+  /**
+   * Targeted reindex after a sync APPLY moved files under a running hub (`paths` = ledger-relative,
+   * forward slashes, from the validated APPLY marker). THE CALLER MUST HOLD `queue` — this entry point does
+   * not take it (`SerialQueue` is not re-entrant) and nothing in here may call `flush()/runExclusive()`.
+   *
+   * Differences from the 60 s `reindex()`: the content-hash skip is cleared for every changed file (the
+   * in-memory record may be older than the bytes although the hash matches — e.g. an item this hub wrote
+   * and a remote edit reverted), and an item file that no longer parses DROPS its index record
+   * (`loadItems(slug, strict)`), so a stale record can never overwrite remote work on the next mutation.
+   * `counters/<own>.yml` re-read keeps max(memory, disk): a counter never goes down.
+   */
+  async reindexPaths(paths: readonly string[]): Promise<void> {
+    const slugs = new Set<string>();
+    let repos = false;
+    let counters = false;
+    let intake = false;
+    const ownCounter = `counters/${this.device.device_id}.yml`;
+    const removedItems: string[] = [];
+    for (const raw of paths) {
+      if (typeof raw !== 'string' || raw === '' || raw.includes('\0') || raw.includes('\\')) continue;
+      const seg = raw.split('/');
+      if (seg.some((x) => x === '' || x === '.' || x === '..')) continue;
+      const first = seg[0] as string;
+      if (first.startsWith('.')) continue;
+      this.parsedHash.delete(join(this.paths.root, ...seg));
+      if (raw === 'repos.yml') repos = true;
+      else if (raw === ownCounter) counters = true;
+      else if (first === 'counters') continue;
+      else if (first === 'intake') intake = true;
+      else if (seg.length >= 2 && slugSchema.safeParse(first).success) {
+        slugs.add(first);
+        if (seg.length === 3 && seg[1] === 'items') removedItems.push(raw);
+      }
+    }
+    if (repos) await this.loadRepos();
+    if (counters) await this.loadCounters();
+    // Item files deleted by the apply: nothing on disk to parse, so drop the record that points at them.
+    for (const rel of removedItems) {
+      const file = join(this.paths.root, ...rel.split('/'));
+      if ((await safeStat(file)) !== null) continue;
+      for (const rec of this.index.listItems()) {
+        if (rec.file === file) this.index.dropItem(rec.item.fm.id);
+      }
+    }
+    for (const slug of slugs) {
+      await this.loadItems(slug, true);
+      await this.loadJournalFiles(slug);
+      await this.loadDecisions(slug);
+      if (this.hasRepo(slug)) await this.detectOnboarded(slug);
+    }
+    if (intake) await this.loadIntake();
+    this.onReindex?.();
+  }
+
+  /**
+   * `strict` is for `reindexPaths` only (post-APPLY): an item file that no longer parses means the index
+   * record is OLDER than what is on disk (a remote edit, a hostile one that slipped past ingress), and the
+   * 60 s backstop's "keep the last good version" would keep serving — and the next mutation would write
+   * back — the stale record over the remote work (T-B3-4). So the record is dropped instead.
+   */
+  private async loadItems(slug: string, strict = false): Promise<void> {
     const dir = this.paths.itemsDir(slug);
     for (const name of await safeReaddir(dir)) {
       if (!name.endsWith('.md')) continue;
@@ -932,6 +1018,14 @@ export class Ledger {
         this.repaired.set(file, { id: item.fm.id, repairs });
         await this.logOnce(file, `reindex: ${basename(file)} — ${detail} blanked in the index`);
       } catch (err) {
+        if (strict) {
+          for (const rec of this.index.listItems()) {
+            if (rec.file === file) {
+              this.index.dropItem(rec.item.fm.id);
+              this.logFn(logSafe(`reindex: ${basename(file)} no longer parses after a sync apply — dropped from the index`));
+            }
+          }
+        }
         // Keep the last good version in the index; warn in /v1/healthz.
         this.warnings.set(file, logSafe(err instanceof Error ? err.message : String(err)));
         // Once per (path, mtime), not once a minute forever.
