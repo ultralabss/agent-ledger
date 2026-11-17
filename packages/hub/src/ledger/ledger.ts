@@ -966,7 +966,7 @@ export class Ledger {
       await this.loadDecisions(slug);
       if (this.hasRepo(slug)) await this.detectOnboarded(slug);
     }
-    if (intake) await this.loadIntake();
+    if (intake) await this.loadIntake(true);
     this.onReindex?.();
   }
 
@@ -1125,7 +1125,14 @@ export class Ledger {
     this.index.setDecisions(slug, text === null ? [] : parseDecisions(text, slug));
   }
 
-  private async loadIntake(): Promise<void> {
+  /** `strict` (reindexPaths only, like `loadItems`): a record whose intake file is gone or no longer parses
+   *  is DROPPED, so a later triage cannot resurrect (and rewrite) an old document over the remote state. */
+  private async loadIntake(strict = false): Promise<void> {
+    if (strict) {
+      for (const rec of this.index.listIntake()) {
+        if ((await safeStat(rec.file)) === null) this.index.dropIntake(rec.rec.id);
+      }
+    }
     for (const monthDir of await safeReaddir(this.paths.intakeRoot)) {
       const dir = this.paths.intakeDir(monthDir);
       for (const name of await safeReaddir(dir)) {
@@ -1139,6 +1146,11 @@ export class Ledger {
           this.index.putIntake({ rec, doc, file });
           this.warnings.delete(file);
         } catch (err) {
+          if (strict) {
+            for (const rec of this.index.listIntake()) {
+              if (rec.file === file) this.index.dropIntake(rec.rec.id);
+            }
+          }
           this.warnings.set(file, err instanceof Error ? err.message : String(err));
         }
       }

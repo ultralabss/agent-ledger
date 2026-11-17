@@ -116,6 +116,29 @@ test('reindexPaths: an item file deleted by the apply leaves the index', async (
   assert.throws(() => ledger.getItem(id), { status: 404 });
 });
 
+test('reindexPaths: an intake file deleted or made unparseable by the apply leaves the index (no triage resurrection)', async (t) => {
+  const fx = await open();
+  t.after(fx.cleanup);
+  const { ledger } = fx;
+  const a = await ledger.createIntake({ text: 'will be deleted', channel: 'chat' });
+  const b = await ledger.createIntake({ text: 'will rot', channel: 'chat' });
+  const c = await ledger.createIntake({ text: 'untouched', channel: 'chat' });
+  const fileOf = (id: string): string => (ledger as unknown as { index: { getIntake(i: string): { file: string } } }).index.getIntake(id).file;
+  const relOf = (id: string): string => fileOf(id).slice(ledger.paths.root.length + 1).split('\\').join('/');
+  const fa = fileOf(a.id);
+  const fb = fileOf(b.id);
+  const rels = [relOf(a.id), relOf(b.id)];
+  await rm(fa);
+  await writeFile(fb, '---\nid: [unterminated\n  : : :\n---\nbody\n');
+  await run(ledger, () => ledger.reindexPaths(rels));
+  for (const id of [a.id, b.id]) {
+    assert.throws(() => ledger.getIntake(id), { status: 404 });
+    await assert.rejects(ledger.triage(id, { items: [], dropped: [], session: null }), { status: 404 });
+  }
+  assert.equal(ledger.getIntake(c.id).text, 'untouched');
+  assert.equal(await readFile(fb, 'utf8'), '---\nid: [unterminated\n  : : :\n---\nbody\n', 'not rewritten');
+});
+
 test('reindexPaths: repos.yml reload; counters reload never decreases the counter; other devices ignored', async (t) => {
   const fx = await open();
   t.after(fx.cleanup);

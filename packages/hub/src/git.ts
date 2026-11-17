@@ -320,7 +320,8 @@ export async function git(cwd: string, args: string[], timeoutMs = 20_000): Prom
   return new Promise((resolvePromise, reject) => {
     const child = spawn(bin, [...buildGitGlobalArgs(hooksDir), ...args], {
       cwd,
-      env: { ...process.env, GIT_TERMINAL_PROMPT: '0', GIT_OPTIONAL_LOCKS: '0' },
+      // LC_ALL/LANGUAGE=C: stderr notices we match on (`onlyHubIgnoredNotice`) must be English.
+      env: { ...process.env, GIT_TERMINAL_PROMPT: '0', GIT_OPTIONAL_LOCKS: '0', LC_ALL: 'C', LANGUAGE: 'C' },
       stdio: ['ignore', 'pipe', 'pipe'],
       shell: false,
       windowsHide: true,
@@ -749,7 +750,7 @@ export class LedgerGit {
    *  keeps the SECURITY line to one per streak instead of one per attempt. */
   private scanStreak = 0;
   /** True only while an `runExclusive` fn runs: nested `flush()/close()/runExclusive()` would deadlock. */
-  private readonly exclusive = new AsyncLocalStorage<true>();
+  private readonly exclusive = new AsyncLocalStorage<{ open: boolean }>();
   private markerLogged = false;
   private syncPushLogged = false;
   /** `:(exclude,icase)` accepted by this git? Flips to false once, on a pathspec-magic error (fallback below). */
@@ -940,18 +941,20 @@ export class LedgerGit {
   runExclusive<T>(fn: (x: ExclusiveHandle) => Promise<T>): Promise<T> {
     this.assertNotExclusive('runExclusive');
     const job = this.running.then(() => {
-      let open = true;
+      // The store is invalidated when the section ends: continuations born inside (timers, promises, hooks)
+      // keep inheriting this object, and must not see a section that is over (B3-M2).
+      const store = { open: true };
       const handle: ExclusiveHandle = {
         commitNow: async () => {
-          if (!open) throw new Error('ledger git: commitNow used after the exclusive section ended');
+          if (!store.open) throw new Error('ledger git: commitNow used after the exclusive section ended');
           return this.commit();
         },
       };
-      return this.exclusive.run(true, async () => {
+      return this.exclusive.run(store, async () => {
         try {
           return await fn(handle);
         } finally {
-          open = false;
+          store.open = false;
         }
       });
     });
@@ -963,7 +966,7 @@ export class LedgerGit {
   }
 
   private assertNotExclusive(op: string): void {
-    if (this.exclusive.getStore() === true) {
+    if (this.exclusive.getStore()?.open === true) {
       throw new Error(`ledger git: ${op}() inside runExclusive would deadlock — use commitNow()`);
     }
   }
@@ -1399,9 +1402,16 @@ export class LedgerGit {
     }
     // With ANY exclude pathspec git (2.54 measured) stages everything and then exits 1 with only
     // "The following paths are ignored by one of your .gitignore files: .hub" — the ignored `.hub/` it was
-    // told to exclude. That exact message is not a failure; anything else on stderr still is.
-    const benignIgnored = add.code === 1 && onlyHubIgnoredNotice(add.stderr);
-    if (add.code !== 0 && !benignIgnored) {
+    // told to exclude. Exit 1 is tolerated only when the stderr has no `fatal:`/`error:` line AND the
+    // worktree is verifiably settled (nothing unstaged/untracked outside `.hub`) — judged from
+    // `status --porcelain -z`, not from English stderr text alone, so an extra warning line (embedded repo,
+    // CRLF, a localised or newer git message) is not a permanent 'error' while a partial add still is.
+    let tolerated = false;
+    if (add.code === 1 && !/^(fatal|error):/im.test(add.stderr)) {
+      const entries = await this.statusEntries();
+      tolerated = entries !== null && entries.every((e) => e.y === ' ' || isHubPath(e.path));
+    }
+    if (add.code !== 0 && !tolerated) {
       this.summaries = summary === 'changes' ? [] : [summary];
       this.opts.log(`git add failed: ${gitFailureNote(add)}`);
       return 'error';
@@ -1436,11 +1446,9 @@ export class LedgerGit {
     if (staged.stdout.trim() === '') {
       // Never report `clean` on the strength of a tolerated exit 1 alone: confirm the worktree really is
       // clean (the APPLY treats `clean` as "nothing uncommitted").
-      if (benignIgnored) {
-        const dirty = await git(this.opts.root, ['status', '--porcelain=v1', '--untracked-files=all']).catch(
-          (err: unknown) => ({ code: -2, stdout: '', stderr: String(err) }),
-        );
-        if (dirty.code !== 0 || dirty.stdout.trim() !== '') {
+      if (tolerated) {
+        const entries = await this.statusEntries();
+        if (entries === null || entries.some((e) => !isHubPath(e.path))) {
           this.summaries = summary === 'changes' ? [] : [summary];
           this.noteCheckError('add exited 1 and the worktree is still dirty');
           return 'error';
@@ -1509,6 +1517,12 @@ export class LedgerGit {
     // F3b: sync-mode commits are made as THIS device and signed, or not made. No unsigned retry, ever.
     let signedArgs: string[] = [];
     let signed = false;
+    if (this.opts.sync === true && this.opts.syncCommit === undefined) {
+      // Sync mode without an identity provider is a wiring bug: never fall back to an unsigned commit.
+      this.summaries = summary === 'changes' ? [] : [summary];
+      this.opts.log('ledger: sync commit refused — no signing identity provider; nothing committed');
+      return 'error';
+    }
     if (this.opts.sync === true && this.opts.syncCommit !== undefined) {
       try {
         const who = await this.opts.syncCommit();
@@ -1545,12 +1559,32 @@ export class LedgerGit {
     this.state.lastCommit = head.stdout.trim() || null;
     this.state.lastCommitAt = new Date().toISOString();
     try {
-      this.opts.onCommitted?.();
+      // Outside the exclusive context: the hook may schedule work that calls runExclusive/flush later.
+      this.exclusive.exit(() => this.opts.onCommitted?.());
     } catch (err) {
       this.opts.log(`ledger: onCommitted hook failed: ${logSafeErr(err)}`);
     }
     await this.maybePush();
     return 'committed';
+  }
+
+  /** `status --porcelain=v1 -z --untracked-files=all` parsed to `{x,y,path}`; null when git cannot answer. */
+  private async statusEntries(): Promise<{ x: string; y: string; path: string }[] | null> {
+    const res = await git(this.opts.root, ['status', '--porcelain=v1', '-z', '--untracked-files=all']).catch(
+      (err: unknown) => ({ code: -2, stdout: '', stderr: String(err) }),
+    );
+    if (res.code !== 0) return null;
+    const out: { x: string; y: string; path: string }[] = [];
+    const tok = res.stdout.split('\0');
+    for (let i = 0; i < tok.length; i += 1) {
+      const t = tok[i] as string;
+      if (t.length < 4) continue;
+      const x = t[0] as string;
+      const y = t[1] as string;
+      out.push({ x, y, path: t.slice(3) });
+      if (x === 'R' || x === 'C' || y === 'R' || y === 'C') i += 1; // the original path follows as its own token
+    }
+    return out;
   }
 
   /** `git add -A -- . <exclude>` (an exclude-only pathspec needs the `.` positive). */

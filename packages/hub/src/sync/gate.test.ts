@@ -458,6 +458,34 @@ test('AL-46: the commit sha must be a real object id (a D2 halt binds to it)', (
   assert.equal(run('enforce', { sha: 'a'.repeat(64) }).action, 'accept');
 });
 
+test('B3-L1: localDevice must be a valid device id (else the self-revocation check would be silently dead)', () => {
+  for (const mode of ['warn', 'enforce'] as const) {
+    for (const bad of [undefined, null, '', 'd_bad', 'D_AAAAAAAAAA', 5, {}, `${KB.id}\n`] as unknown[]) {
+      const v = run(mode, { localDevice: bad as never });
+      assert.equal(v.action, 'quarantine', `${mode} ${String(bad)}`);
+      assert.equal(v.rule, 'malformed-input');
+    }
+    assert.equal(run(mode, { localDevice: KB.id }).action, 'accept');
+  }
+});
+
+test('B3-L2: an owner derived from the unauthenticated e-mail must not be revoked (counters / new item ids -> unowned)', () => {
+  for (const mode of ['warn', 'enforce'] as const) {
+    for (const changes of [
+      [{ path: `counters/${KR.id}.yml`, status: 'M' }],
+      [{ path: 'acme/items/ACME-R7.md', status: 'A' }],
+    ]) {
+      const v = run(mode, { signature: sig(null), claimedDevice: KR.id, changes });
+      assert.equal(v.action, 'quarantine', `${mode} ${JSON.stringify(changes)}`);
+      assert.equal(v.rule, 'unowned');
+    }
+    // control: the same shape for a LIVE device keeps its own-slot behaviour
+    const ok = run(mode, { signature: sig(null), claimedDevice: KB.id, changes: [{ path: `counters/${KB.id}.yml`, status: 'M' }] });
+    assert.notEqual(ok.rule, 'unowned');
+    assert.notEqual(ok.rule, 'counters-foreign');
+  }
+});
+
 test('AL-46: side-branch stolen key — a merge signed by a key revoked at the local tip is quarantined (revoked-current), both modes', () => {
   // the key is active in BOTH parents (a side branch that predates the revocation) and the merge keeps the registry equal
   const PRE = dev(eA(), eB(), eU(), eR({ revoked: null }));

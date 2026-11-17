@@ -312,6 +312,82 @@ test('a timer armed INSIDE runExclusive still fires its flush afterwards', async
   await until(async () => (await fx.head()) !== before);
 });
 
+test('a continuation born inside runExclusive may call runExclusive/flush after the section ended (B3-M2)', async (t) => {
+  const fx = await fixture(t, { onCommitted: () => undefined });
+  await seed(fx);
+  let later!: Promise<unknown>;
+  await fx.lg.runExclusive(async () => {
+    later = new Promise<void>((resolve) => setTimeout(resolve, 20)).then(async () => {
+      await fx.lg.runExclusive(async () => 'ok');
+      await fx.lg.flush();
+      return 'survived';
+    });
+  });
+  assert.equal(await later, 'survived');
+});
+
+test('onCommitted runs outside the exclusive context: work it schedules may use flush()/runExclusive() later', async (t) => {
+  let later: Promise<unknown> = Promise.resolve();
+  let hooked = 0;
+  const fx = await fixture(t);
+  fx.opts.onCommitted = () => {
+    hooked += 1;
+    assert.doesNotThrow(() => void fx.lg.flush().catch(() => undefined));
+    later = new Promise<void>((resolve) => setTimeout(resolve, 20)).then(() => fx.lg.runExclusive(async () => 1));
+  };
+  await writeTracked(fx);
+  assert.equal(await fx.commit(), 'committed');
+  assert.equal(hooked, 1);
+  assert.equal(await later, 1);
+});
+
+/* ---------------- add exit 1: judged by status, not by English stderr ---------------- */
+
+type Stage = { code: number; stdout: string; stderr: string };
+function stubStageAll(fx: Fx, wrap: (real: Stage) => Stage, skipReal = false): void {
+  const lg = fx.lg as unknown as { stageAll(ex: string): Promise<Stage> };
+  const real = lg.stageAll.bind(lg);
+  lg.stageAll = async (ex: string) => (skipReal ? wrap({ code: 0, stdout: '', stderr: '' }) : wrap(await real(ex)));
+}
+
+test('add exit 1 + the .hub notice + an EXTRA warning line, worktree settled → committed (not a permanent error)', async (t) => {
+  const fx = await fixture(t);
+  await seed(fx);
+  await writeFile(join(fx.dir, '.hub', 'sync', 'x'), 'k\n');
+  await writeTracked(fx);
+  stubStageAll(fx, (r) => ({
+    code: 1,
+    stdout: r.stdout,
+    stderr: `warning: adding embedded git repository: sub\nThe following paths are ignored by one of your .gitignore files:\n.hub\nhint: Use -f.\n`,
+  }));
+  assert.equal(await fx.commit(), 'committed');
+  const files = (await git(fx.dir, ['ls-files'])).stdout.split('\n').filter((l) => l !== '');
+  assert.deepEqual(files.filter(isHubPath), []);
+  assert.ok(files.includes('a.md'));
+});
+
+test('add exit 1 with a settled clean worktree → clean; with `error:`/`fatal:` or an unstaged file → error, never clean', async (t) => {
+  const fx = await fixture(t);
+  await seed(fx);
+  stubStageAll(fx, (r) => ({ ...r, code: 1, stderr: 'warning: something new\n' }));
+  assert.equal(await fx.commit(), 'clean', 'nothing to commit and status settled');
+
+  await writeTracked(fx);
+  stubStageAll(fx, () => ({ code: 1, stdout: '', stderr: 'warning: partial\n' }), true); // add staged NOTHING
+  assert.equal(await fx.commit(), 'error', 'untracked file still outside the index');
+
+  stubStageAll(fx, (r) => ({ ...r, code: 1, stderr: 'error: unable to index file x\n' }));
+  assert.equal(await fx.commit(), 'error');
+});
+
+test('git() runs with LC_ALL=C / LANGUAGE=C (stderr notices are English)', async (t) => {
+  const fx = await fixture(t);
+  const r = await git(fx.dir, ['-c', 'alias.envdump=!env', 'envdump']);
+  assert.equal(r.code, 0, r.stderr);
+  assert.match(r.stdout, /^LC_ALL=C$/m);
+  assert.match(r.stdout, /^LANGUAGE=C$/m);
+});
+
 /* ---------------- widened S1: other .hub paths ---------------- */
 
 test('isHubPath: case, dots/spaces, quoting; not token-only; not look-alikes', () => {
@@ -526,14 +602,34 @@ test('sync: identity provider throws or returns garbage → error, nothing commi
   assert.equal(await fx.head(), before);
 });
 
-test('sync but not enrolled (syncCommit null or absent) → commits as before, unsigned', async (t) => {
-  for (const provider of [(): null => null, undefined]) {
-    const fx = await fixture(t, { sync: true, ...(provider === undefined ? {} : { syncCommit: provider }) });
-    await writeTracked(fx);
-    assert.equal(await fx.commit(), 'committed');
-    assert.doesNotMatch((await headRaw(fx.dir)).toString('utf8'), /gpgsig/);
-  }
+test('sync but not enrolled (syncCommit returns null) → commits as before, unsigned', async (t) => {
+  const fx = await fixture(t, { sync: true, syncCommit: () => null });
+  await writeTracked(fx);
+  assert.equal(await fx.commit(), 'committed');
+  assert.doesNotMatch((await headRaw(fx.dir)).toString('utf8'), /gpgsig/);
 });
+
+test('sync true WITHOUT a syncCommit provider → error, nothing committed (never unsigned); sync false still commits', async (t) => {
+  const fx = await fixture(t, { sync: true });
+  const before = await seed0(fx);
+  await writeTracked(fx);
+  fx.lg.touch('needs identity');
+  assert.equal(await fx.commit(), 'error');
+  assert.equal(await fx.head(), before);
+  assert.equal(fx.lg.status.pendingSummaries, 1);
+  assert.ok(fx.logs.some((l) => /no signing identity provider/.test(l)));
+  fx.opts.sync = false;
+  assert.equal(await fx.commit(), 'committed', 'control: sync off commits');
+});
+
+/** HEAD of a fixture that has no commit yet (the sync fixture cannot commit before the provider exists). */
+async function seed0(fx: Fx): Promise<string> {
+  fx.opts.sync = false;
+  await writeTracked(fx, 'seed.md', 'seed\n');
+  assert.equal(await fx.commit(), 'committed');
+  fx.opts.sync = true;
+  return fx.head();
+}
 
 test('sync off: commits stay unsigned and use the repo identity', async (t) => {
   const fx = await fixture(t);

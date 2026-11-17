@@ -38,6 +38,7 @@ export interface LedgerIndex {
   dropItem(id: string): void;
 
   putIntake(rec: StoredIntake): void;
+  dropIntake(id: string): void;
   getIntake(id: string): StoredIntake | undefined;
   listIntake(status?: string): StoredIntake[];
 
@@ -93,6 +94,10 @@ export class MemoryIndex implements LedgerIndex {
 
   putIntake(rec: StoredIntake): void {
     this.intake.set(rec.rec.id, rec);
+  }
+
+  dropIntake(id: string): void {
+    this.intake.delete(id);
   }
 
   getIntake(id: string): StoredIntake | undefined {

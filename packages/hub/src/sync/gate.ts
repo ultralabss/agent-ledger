@@ -241,6 +241,11 @@ export function gateCommit(input: GateInput): GateVerdict {
       return quarantine('malformed-input', 'currentDevices is required (string or null)');
     }
     if (typeof input.sha !== 'string' || !SHA_RE.test(input.sha)) return quarantine('malformed-input', 'commit sha malformed');
+    // B3-L1: the D2 self-revocation check compares against this id; a non-string / malformed one must not
+    // silently disable it.
+    if (typeof input.localDevice !== 'string' || !DEVICE_ID_RE.test(input.localDevice)) {
+      return quarantine('malformed-input', 'local device id malformed');
+    }
     if (parents.length > 2) return quarantine('merge-octopus', 'merge commit with more than two parents');
 
     /* rows 1-3: content */
@@ -292,7 +297,10 @@ export function gateCommit(input: GateInput): GateVerdict {
 
     /* row 7: ownership (merge commits are covered by the per-key max rule + `merge-item-new`) */
     if (!isMerge) {
-      const owner = signer.entry ?? (claimed === null ? null : (parsedParents[0]?.devices.find((d) => d.id === claimed) ?? null));
+      // B3-L2: an owner taken from the (unauthenticated) committer e-mail must be a live device — a revoked
+      // slot must not own counters / new item ids.
+      const emailOwner = claimed === null ? null : (parsedParents[0]?.devices.find((d) => d.id === claimed) ?? null);
+      const owner = signer.entry ?? (emailOwner !== null && emailOwner.revoked === null ? emailOwner : null);
       for (const c of input.changes) {
         const path = typeof c?.path === 'string' ? c.path : null;
         const m = path === null ? null : COUNTER_RE.exec(path);
