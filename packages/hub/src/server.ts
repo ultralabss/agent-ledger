@@ -27,6 +27,8 @@ import { cachedSpoolStats, sweepSpool } from './spool-sweep.ts';
 import { Sessions } from './sessions.ts';
 import { PendingMarks } from './pendingmark.ts';
 import { Summarizer } from './summary.ts';
+import { bootReplayGit, bootReplayNotes, startSync } from './sync/wire.ts';
+import type { SyncLoop } from './sync/loop.ts';
 import { StallMonitor, WakeMonitor } from './wake.ts';
 import { startWatcher, type Watcher } from './watcher.ts';
 
@@ -63,6 +65,8 @@ export interface HubHandle {
   wake: WakeMonitor;
   /** Event-loop drift monitor behind `healthz.diag.loopDelayMaxMs`. */
   stalls: StallMonitor;
+  /** F3b sync loop (`LEDGER_SYNC=1` and enrolled), else `null`. B4 routes drive it. */
+  sync: SyncLoop | null;
   /** Run the periodic jobs once, synchronously (tests). */
   sweep(): Promise<void>;
   close(): Promise<void>;
@@ -98,6 +102,9 @@ export async function startHub(opts: StartOptions = {}): Promise<HubHandle> {
   const heavyAllowed = (): boolean => wake.heavyAllowed();
   const heavyRetryInMs = (): number => wake.retryInMs();
   const ledger = new Ledger({ config, log, heavyAllowed, heavyRetryInMs });
+  // F3b: an APPLY that died half-way is rolled forward/back BEFORE anything can write or commit (in every mode,
+  // also LEDGER_SYNC=0). No marker = no effect. The notes of the replay are delivered once the store is up.
+  const bootReplay = await bootReplayGit(ledger, log);
   await ledger.init();
   // Items whose `done.version` held prose were parsed leniently by the
   // reindex above (and flagged); fix the files once, atomically, through the
@@ -147,6 +154,7 @@ export async function startHub(opts: StartOptions = {}): Promise<HubHandle> {
   // Runtime state. `.hub/` is already 0700 and git-ignored (S1), so the DB and
   // its WAL siblings inherit that protection.
   const store = new RuntimeStore(join(ledger.paths.hubDir, 'hub.sqlite'));
+  await bootReplayNotes(bootReplay, store, log);
   const bus = new EventBus();
   const sessions = new Sessions({ ledger, store, bus });
   const gitCache = new GitCache({ ledger, store, bus, heavyAllowed });
@@ -532,6 +540,9 @@ export async function startHub(opts: StartOptions = {}): Promise<HubHandle> {
     }
   }
 
+  // F3b: the loop starts last (the hub already serves), only with LEDGER_SYNC=1 and an enrolled ledger.
+  const sync = await startSync({ ledger, store, config, log, start: opts.periodic !== false });
+
   log(`agent-ledger on http://127.0.0.1:${guardCfg.port} · ledger ${ledger.paths.root} · fts ${store.engine}`);
 
   return {
@@ -557,6 +568,7 @@ export async function startHub(opts: StartOptions = {}): Promise<HubHandle> {
     pending,
     wake,
     stalls,
+    sync,
     sweep,
     async close(): Promise<void> {
       for (const t of timers) clearInterval(t);
@@ -569,6 +581,8 @@ export async function startHub(opts: StartOptions = {}): Promise<HubHandle> {
       // A worker run holds a child process; closing under it would leak it.
       await replies.background.catch(() => undefined);
       await Promise.all(servers.map(closeOne));
+      // waits for a running cycle (never kills one mid-APPLY) BEFORE the ledger goes away
+      await sync?.stop();
       await ledger.close();
       store.close();
     },

@@ -9,11 +9,16 @@
  *  symlinks and exec bits, `.hub/x`, and history rewrites (`update-ref` without an old value).
  */
 
-import { chmod, mkdir, mkdtemp, realpath, rm } from 'node:fs/promises';
+import { chmod, mkdir, mkdtemp, realpath, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import nodePath from 'node:path';
 import {
+  deviceLayout,
   generateKeyPair,
+  readSigners,
+  renderAllowedSigners,
+  renderDevicesYaml,
+  type DeviceEntry,
   gitSigningArgs,
   publicKeyOf,
   resolveSshKeygen,
@@ -21,8 +26,13 @@ import {
   type Ed25519Pub,
   type GitSigningInput,
 } from '@agent-ledger/shared';
-import { Gitx, REF_MAIN, isSha } from './gitx.ts';
+import type { CommitOutcome } from '../git.ts';
+import type { ApplyDeps, ApplyHost, DeliverNotes } from './apply.ts';
+import type { CycleDeps } from './cycle.ts';
+import { Gitx, REF_ACCEPTED, REF_MAIN, isSha, type GitxResult } from './gitx.ts';
+import type { ProposedItem } from './merge/tree.ts';
 import { ObjectStore } from './objects.ts';
+import { StateStore } from './state.ts';
 import { TreeBuilder, type CommitIdentity, type TreeChange } from './treebuild.ts';
 
 export interface RawFile {
@@ -273,4 +283,327 @@ export async function makeKit(): Promise<Kit> {
 /** Raw plumbing commit inside a hub's own repository (hostile local objects: a symlink, `.hub/x`, an unsigned commit). */
 export function hubRawCommit(hub: TestHub, spec: RawCommitSpec): Promise<string> {
   return rawCommit({ gitx: hub.gitx, cwd: hub.dir, tmpRoot: nodePath.join(hub.syncDir, 'tmp'), currentMain: hub.main }, spec);
+}
+
+/* ---------------- B3c additions: ledger-like hubs, fake host, scripted remote ---------------- */
+
+/** A kit hub plus what the apply/cycle layers need: a `.hub/sync` state store, a worktree that follows `main`,
+ *  and the deps bundle. Test-only. */
+export interface LedgerHub {
+  hub: TestHub;
+  /** Ledger root = the hub's working repository. */
+  dir: string;
+  state: StateStore;
+  /** An honest signed local commit (plumbing) AND the worktree/index brought to it (what a real commit leaves). */
+  commitLocal(changes: readonly TreeChange[], o?: { message?: string; date?: Date }): Promise<string>;
+  /** Point `main`, index and worktree at `sha` (a commit already in the object store); `main` may be unborn. */
+  adopt(sha: string): Promise<void>;
+  /** Dirty/untracked paths (porcelain), empty = clean. */
+  dirty(): Promise<string[]>;
+  /** `refs/ledger-sync/accepted` + its state mirror (what `sync init` / `join` do in B4). */
+  seedAccepted(sha: string): Promise<void>;
+  applyDeps(over?: Partial<ApplyDeps>): ApplyDeps;
+}
+
+export const PINNED_GITIGNORE = '.hub/\n*.tmp\n';
+export const PINNED_GITATTRIBUTES = '* text eol=lf\n';
+
+export async function makeLedgerHub(kit: Kit, n: number): Promise<LedgerHub> {
+  const hub = await kit.makeHub(n);
+  const state = await StateStore.open(hub.dir);
+  const sshKeygenBin = hub.signing.sshKeygenBin;
+  void sshKeygenBin;
+  const lh: LedgerHub = {
+    hub,
+    dir: hub.dir,
+    state,
+    async commitLocal(changes, o = {}) {
+      const sha = await hub.commit(changes, o);
+      await hub.gitx.mustRun(['read-tree', '--reset', '-u', sha], { cwd: hub.dir });
+      return sha;
+    },
+    async adopt(sha) {
+      const old = await hub.main();
+      if (old === null) await hub.gitx.mustRun(['update-ref', '--no-deref', REF_MAIN, sha, '0'.repeat(sha.length)], { cwd: hub.dir });
+      else await hub.gitx.mustRun(['update-ref', '--no-deref', REF_MAIN, sha, old], { cwd: hub.dir });
+      await hub.gitx.mustRun(['read-tree', '--reset', '-u', sha], { cwd: hub.dir });
+    },
+    async dirty() {
+      await hub.gitx.run(['update-index', '-q', '--refresh'], { cwd: hub.dir });
+      const r = await hub.gitx.mustRun(['status', '--porcelain=v1', '-z', '--untracked-files=all', '--no-renames'], { cwd: hub.dir });
+      return r.stdout.toString('utf8').split('\0').filter((x) => x.length > 3).map((x) => x.slice(3));
+    },
+    async seedAccepted(sha) {
+      await hub.trees.createRef(REF_ACCEPTED, sha);
+      await state.update((s) => {
+        s.accepted = sha;
+      });
+    },
+    applyDeps(over = {}) {
+      return {
+        ledgerDir: hub.dir,
+        gitx: hub.gitx,
+        store: hub.store,
+        trees: hub.trees,
+        state,
+        identity: hub.identity,
+        signing: hub.signing,
+        localDevice: hub.deviceId,
+        maxFormat: 2,
+        ...over,
+      };
+    },
+  };
+  return lh;
+}
+
+export interface FakeHost extends ApplyHost {
+  reindexed: string[][];
+  delivered: DeliverNotes[];
+  proposed: ProposedItem[][];
+  logs: string[];
+  flushes: number;
+  localNotes: { type: string; rule: string; device: string | null }[][];
+  /** `auto` = `clean` when the worktree is clean, else `held`. */
+  commitOutcome: 'auto' | CommitOutcome;
+  /** Runs inside `runExclusive` before `fn` (a "local write racing the apply"). */
+  beforeFn: (() => Promise<void>) | null;
+  /** Runs BEFORE the host takes R (a local write between validate and apply). */
+  beforeExclusive: (() => Promise<void>) | null;
+  exclusive: boolean;
+  inQueue: boolean;
+  /** Lock-order violations seen (queueRun outside runExclusive, nested runExclusive). */
+  violations: string[];
+  flushLocal(): Promise<void>;
+  noteLocal(notes: readonly { type: string; rule: string; device: string | null }[]): Promise<void>;
+  createProposed(items: readonly ProposedItem[]): Promise<void>;
+}
+
+export function fakeHost(lh: LedgerHub): FakeHost {
+  let rChain: Promise<unknown> = Promise.resolve();
+  let qChain: Promise<unknown> = Promise.resolve();
+  const host: FakeHost = {
+    reindexed: [],
+    delivered: [],
+    proposed: [],
+    logs: [],
+    flushes: 0,
+    localNotes: [],
+    commitOutcome: 'auto',
+    beforeFn: null,
+    beforeExclusive: null,
+    exclusive: false,
+    inQueue: false,
+    violations: [],
+    async runExclusive(fn) {
+      if (host.exclusive) {
+        host.violations.push('nested runExclusive');
+        throw new Error('nested runExclusive');
+      }
+      if (host.beforeExclusive !== null) await host.beforeExclusive();
+      const job = rChain.then(async () => {
+        host.exclusive = true;
+        try {
+          if (host.beforeFn !== null) await host.beforeFn();
+          return await fn({
+            commitNow: async (): Promise<CommitOutcome> => {
+              if (host.commitOutcome !== 'auto') return host.commitOutcome;
+              return (await lh.dirty()).length === 0 ? 'clean' : 'held';
+            },
+          });
+        } finally {
+          host.exclusive = false;
+        }
+      });
+      rChain = job.catch(() => undefined);
+      return job;
+    },
+    async queueRun(fn) {
+      if (!host.exclusive) host.violations.push('queueRun outside runExclusive');
+      const job = qChain.then(async () => {
+        host.inQueue = true;
+        try {
+          return await fn();
+        } finally {
+          host.inQueue = false;
+        }
+      });
+      qChain = job.catch(() => undefined);
+      return job;
+    },
+    async reindexPaths(paths) {
+      if (!host.inQueue) host.violations.push('reindexPaths without the queue');
+      host.reindexed.push([...paths]);
+    },
+    async deliver(n) {
+      host.delivered.push(n);
+    },
+    async createProposed(items) {
+      if (host.inQueue) host.violations.push('createProposed inside the queue');
+      host.proposed.push([...items]);
+    },
+    async flushLocal() {
+      host.flushes += 1;
+    },
+    async noteLocal(notes) {
+      host.localNotes.push([...notes]);
+    },
+    log(line) {
+      host.logs.push(line);
+    },
+  };
+  return host;
+}
+
+export interface ScriptedFailure {
+  stderr?: string;
+  code?: number;
+  timedOut?: boolean;
+}
+
+export interface FlakyRemote {
+  /** Use this as the hub's `gitx` in cycle deps. */
+  gitx: Gitx;
+  /** argv of every `exec` (network and local), for the "no force flag" assertions. */
+  argv: string[][];
+  fetchCalls: number;
+  pushCalls: number;
+  /** Make the next `times` fetches/pushes fail with this result (never reaches the real remote). */
+  failNext(kind: 'fetch' | 'push', f: ScriptedFailure, times?: number): void;
+  /** Hooks around the real network calls (a remote that moves between fetch and apply, etc.). */
+  afterFetch: (() => Promise<void>) | null;
+  beforePush: (() => Promise<void>) | null;
+  /** After the real push succeeded, report this failure instead (unknown outcome). */
+  lieAboutPush: ScriptedFailure | null;
+}
+
+/** Wraps a hub's `Gitx` so network calls can fail on demand. Everything else is the real hardened runner. */
+export function flakyRemote(real: Gitx): FlakyRemote {
+  const script: { fetch: ScriptedFailure[]; push: ScriptedFailure[] } = { fetch: [], push: [] };
+  const f: FlakyRemote = {
+    gitx: real,
+    argv: [],
+    fetchCalls: 0,
+    pushCalls: 0,
+    failNext(kind, fail, times = 1) {
+      for (let i = 0; i < times; i += 1) script[kind].push(fail);
+    },
+    afterFetch: null,
+    beforePush: null,
+    lieAboutPush: null,
+  };
+  const result = (x: ScriptedFailure): GitxResult => ({
+    ok: false,
+    code: x.code ?? 1,
+    stdout: Buffer.alloc(0),
+    stderr: x.stderr ?? '',
+    timedOut: x.timedOut === true,
+    capped: false,
+  });
+  const proxy: Gitx = new Proxy(real, {
+    get(target, prop) {
+      const v = Reflect.get(target, prop, target) as unknown;
+      if (typeof v !== 'function') return v;
+      if (prop === 'exec') {
+        return (args: readonly string[], ...rest: unknown[]) => {
+          f.argv.push([...args]);
+          return (v as (...a: unknown[]) => unknown).call(proxy, args, ...rest);
+        };
+      }
+      if (prop === 'fetch') {
+        return async (...a: unknown[]) => {
+          f.fetchCalls += 1;
+          const s = script.fetch.shift();
+          if (s !== undefined) return result(s);
+          const r = (await (v as (...x: unknown[]) => Promise<GitxResult>).apply(proxy, a));
+          if (f.afterFetch !== null) await f.afterFetch();
+          return r;
+        };
+      }
+      if (prop === 'push') {
+        return async (...a: unknown[]) => {
+          f.pushCalls += 1;
+          const s = script.push.shift();
+          if (s !== undefined) return result(s);
+          if (f.beforePush !== null) await f.beforePush();
+          const r = (await (v as (...x: unknown[]) => Promise<GitxResult>).apply(proxy, a));
+          if (f.lieAboutPush !== null && r.ok) return result(f.lieAboutPush);
+          return r;
+        };
+      }
+      return (v as (...x: unknown[]) => unknown).bind(proxy);
+    },
+  });
+  f.gitx = proxy;
+  return f;
+}
+
+export const FLEET_T0 = '2026-11-01T00:00:00.000Z';
+
+export interface Fleet {
+  kit: Kit;
+  hubs: LedgerHub[];
+  /** The first commit every hub shares (signed by hub 1, on the remote). */
+  base: string;
+  devicesText: string;
+}
+
+/** `n` ledger hubs sharing one history: hub 1 is the root (slot ""), the others get slots B, C, ...; every key
+ *  is registered in `devices.yml` and approved in every hub's `.hub/allowed_signers`; `accepted` = base. */
+export async function makeFleet(kit: Kit, n: number, extra: readonly RawFile[] = []): Promise<Fleet> {
+  const hubs: LedgerHub[] = [];
+  for (let i = 1; i <= n; i += 1) hubs.push(await makeLedgerHub(kit, i));
+  const root = hubs[0] as LedgerHub;
+  const entries: DeviceEntry[] = hubs.map((h, i) => ({
+    id: h.hub.deviceId,
+    label: h.hub.label,
+    slot: i === 0 ? '' : String.fromCharCode(65 + i),
+    pubkey: h.hub.pub.line,
+    added: FLEET_T0,
+    added_by: i === 0 ? h.hub.deviceId : root.hub.deviceId,
+    revoked: null,
+    role: 'owner',
+  }));
+  const devicesText = renderDevicesYaml({ devices: entries });
+  const files: TreeChange[] = [
+    { path: '.gitignore', content: PINNED_GITIGNORE },
+    { path: '.gitattributes', content: PINNED_GITATTRIBUTES },
+    { path: 'ledger.format', content: '2\n' },
+    { path: 'devices.yml', content: devicesText },
+    { path: 'acme/CONTEXT.md', content: '# acme\n' },
+    ...extra.map((f) => ({ path: f.path, content: f.content })),
+  ];
+  const base = await root.commitLocal(files, { message: 'base' });
+  const pushed = await root.hub.pushMain(kit.remote);
+  if (!pushed.ok) throw new Error('testkit: could not push the base commit');
+  const signers = renderAllowedSigners(hubs.map((h) => ({ id: h.hub.deviceId, pubkey: h.hub.pub.line })));
+  for (const h of hubs) {
+    if (h !== root) {
+      await h.hub.fetchIncoming(kit.remote);
+      await h.adopt(base);
+    }
+    const hubDir = nodePath.join(h.dir, '.hub');
+    await mkdir(hubDir, { recursive: true, mode: 0o700 });
+    await chmod(hubDir, 0o700);
+    await writeFile(nodePath.join(hubDir, 'allowed_signers'), signers, { mode: 0o600 });
+    await chmod(nodePath.join(hubDir, 'allowed_signers'), 0o600);
+    await h.seedAccepted(base);
+  }
+  return { kit, hubs, base, devicesText };
+}
+
+/** Cycle deps for a ledger hub against the kit's remote. `trusted` reads the hub's real `.hub/allowed_signers`. */
+export function cycleDeps(lh: LedgerHub, kit: Kit, over: Partial<CycleDeps> = {}): CycleDeps {
+  const host = (over.host as FakeHost | undefined) ?? fakeHost(lh);
+  return {
+    ...lh.applyDeps(),
+    remote: kit.remote.path,
+    host,
+    verify: 'enforce',
+    trusted: async () => new Set((await readSigners(deviceLayout(lh.dir))).map((s) => s.pubkey)),
+    log: (line) => host.log(line),
+    rnd: () => 0.5,
+    testLocalRemotes: [kit.remote.path],
+    ...over,
+  };
 }

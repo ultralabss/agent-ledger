@@ -337,7 +337,7 @@ export function parseInflight(text: string): Inflight {
   return res.data as Inflight;
 }
 
-/** Cap the lists that may grow without a security meaning (keep the newest). `seenSigning` is never trimmed. */
+/** Cap the lists (keep the newest). `seenSigning` is only trimmed by growth beyond its cap (oldest first), see `update`. */
 function normalise(s: SyncState): SyncState {
   const tail = <T>(a: T[], max: number): T[] => (a.length > max ? a.slice(a.length - max) : a);
   return {
@@ -345,6 +345,7 @@ function normalise(s: SyncState): SyncState {
     confirmations: tail(s.confirmations, MAX_CONFIRMATIONS),
     overrides: tail(s.overrides, MAX_OVERRIDES),
     noted: tail(s.noted, MAX_NOTED),
+    seenSigning: tail(s.seenSigning, MAX_SEEN_SIGNING),
   };
 }
 
@@ -484,7 +485,9 @@ export class StateStore {
       const before = await this.read();
       const draft = structuredClone(before);
       const out = fn(draft);
-      const next = normalise((out ?? draft) as SyncState);
+      const proposed = (out ?? draft) as SyncState;
+      const grewPastCap = Array.isArray(proposed.seenSigning) && proposed.seenSigning.length > MAX_SEEN_SIGNING;
+      const next = normalise(proposed);
       const text = JSON.stringify(next);
       let checked: SyncState;
       try {
@@ -493,7 +496,10 @@ export class StateStore {
         throw new StateError('INVALID', 'refusing to write an invalid sync state');
       }
       const now = new Set(checked.seenSigning);
-      if (before.seenSigning.some((id) => !now.has(id))) {
+      // The ratchet only grows. The single exception is the cap itself: more than 64 ids (the lifetime device
+      // cap is 25) evicts the OLDEST entries instead of throwing, so a registry abuse can neither make `update`
+      // fail forever nor silently shrink the list below the cap. Any other shrink is refused.
+      if (!grewPastCap && before.seenSigning.some((id) => !now.has(id))) {
         throw new StateError('INVARIANT', 'seenSigning only grows');
       }
       const body = `${JSON.stringify(checked)}\n`;

@@ -157,7 +157,6 @@ test('update refuses an invalid result (INVALID) and writes nothing', async () =
       (s) => { s.halt = halt({ detail: 'x'.repeat(201) }); },
       (s) => { s.backoff.failures = 1.5; },
       (s) => { (s as unknown as Record<string, unknown>).secret = 'x'; },
-      (s) => { s.seenSigning = Array.from({ length: 65 }, (_, i) => `d_${'abcdefghij'.slice(0, 9)}${String(i % 6 + 2)}`); },
     ];
     for (const a of attempts) {
       await assert.rejects(store.update(a), isState('INVALID'));
@@ -339,5 +338,21 @@ test('readSyncConfig: absent = null; strict schema, <= 4 KB, no YAML aliases, ho
       await put(t);
       await assert.rejects(readSyncConfig(dir), isState('CORRUPT'), t.slice(0, 40));
     }
+  });
+});
+
+test('seenSigning past its cap evicts the OLDEST ids (never throws, never silently empties); other shrinks stay refused', async () => {
+  await withDir(async (dir) => {
+    const store = await StateStore.open(dir);
+    const b32 = 'abcdefghijklmnopqrstuvwxyz234567';
+    const id = (i: number): string => `d_${b32[Math.floor(i / 32)] as string}${b32[i % 32] as string}aaaaaaaa`;
+    const full = Array.from({ length: 64 }, (_, i) => id(i));
+    await store.update((s) => { s.seenSigning = full; });
+    const out = await store.update((s) => { s.seenSigning = [...s.seenSigning, id(100), id(101)]; });
+    assert.equal(out.seenSigning.length, 64);
+    assert.deepEqual(out.seenSigning.slice(-2), [id(100), id(101)], 'newest kept');
+    assert.equal(out.seenSigning.includes(id(0)), false, 'oldest evicted');
+    assert.deepEqual(await store.read(), out);
+    await assert.rejects(store.update((s) => { s.seenSigning = s.seenSigning.slice(1); }), isState('INVARIANT'), 'an explicit shrink below the cap is still refused');
   });
 });
