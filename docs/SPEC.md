@@ -765,4 +765,4 @@ An old backlog markdown file can be imported by `ledger-keeper`: map its section
 - **Quality of the semantic check** rests on `intent` at claim time — without it `who` shows only files.
 - **Hook latency** — measure from phase 1, target ≤ 50 ms p95.
 - Sync warn mode (`LEDGER_SYNC_VERIFY=warn`, default) gives no cryptographic protection against a stolen deploy key; `ledger doctor` says so on an enrolled ledger and recommends `enforce` once every device is approved.
-- One machine today. Multiple machines (ledger sync, remote sessions) are specified in [multi-device-spec.md](multi-device-spec.md); until its sync phases ship, a ledger is still used from one machine.
+- Multi-device sync v0.3 (solo; `LEDGER_SYNC=1`, enrolment via `ledger sync init|join`, `ledger device add|approve`) is implemented per [multi-device-spec.md](multi-device-spec.md); live presence, remote claims/inbox (v0.4, AL-6) and team roles (v0.5+) are not. With `LEDGER_SYNC=0` and no enrolment behaviour is unchanged (unsigned commits, no network); an enrolled ledger signs every commit and skips the legacy push even then (AL-86). Windows sync is unverified beyond CI fixtures.

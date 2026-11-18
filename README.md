@@ -219,6 +219,8 @@ UI). Data layout:
 | `LEDGER_DIR` | `~/.ledger` | Ledger git repository (the data) |
 | `LEDGER_HUB_PORT` | `4747` | Hub port (loopback only) |
 | `LEDGER_HUB_URL` | `http://127.0.0.1:$LEDGER_HUB_PORT` | Where the CLI connects |
+| `LEDGER_SYNC` | `0` | `1` = multi-device sync loop on an enrolled ledger (see below) |
+| `LEDGER_SYNC_VERIFY` | `warn` | `warn` reports unsigned / unapproved commits; `enforce` quarantines them |
 | `LEDGER_PUSH` | `0` | `1` = hub pushes the ledger repo to `origin` periodically. Off by default: nothing leaves your machine |
 | `LEDGER_SESSION` | – | Session id used in logs and `claim` |
 | `LEDGER_AGENT` | `orchestrator` | Author of comments |
@@ -235,6 +237,38 @@ UI). Data layout:
 
 More (timers, trust pins for the headless binary): `docs/SPEC.md`, `packages/hub/src/config.ts`.
 Optional features answer HTTP 403 `{"error":"feature_disabled"}` when off.
+
+## Multi-device sync (v0.3, solo)
+
+One person, several machines, over a **private git remote you control** (ssh / scp form; no Ultra Labs server).
+Design and threat model: [docs/multi-device-spec.md](docs/multi-device-spec.md).
+
+```sh
+ledger sync init --remote <ssh-url>   # first device, hub stopped, EMPTY private remote
+ledger sync join <ssh-url>            # another device: verifies the ledger, prints what to run on a trusted one
+ledger device add '<pubkey>' --label <x> --fp <SHA256:...>   # on a trusted device
+ledger sync join --continue --add-commit <sha>               # on the joiner (the sha is required)
+ledger device approve <id> --fp <SHA256:...>                 # a third device must trust the new key locally
+LEDGER_SYNC=1 ledger ...              # turn the sync loop on (hub environment)
+ledger sync status | resume | accept <sha> | confirm-revocation <id> --fp <SHA256:...>
+```
+
+- Each device has an ed25519 key and an id slot (`ACME-W1` on a second machine; the first keeps `ACME-142`).
+  `ledger device list|revoke` manage the registry; revocation is permanent.
+- With `LEDGER_SYNC=1` every commit is signed by the device key (or not made); the loop fetches, validates, merges
+  in the hub (no git merge drivers) and pushes without force. `LEDGER_SYNC_VERIFY=enforce` quarantines unsigned or
+  unapproved commits; `warn` (default) only reports them and gives no protection against a stolen deploy key.
+- `ledger doctor` adds sync checks on an enrolled ledger: remote is private and differs from the code remote,
+  host key pinned, verify mode, halt state, pinned files, unapproved devices, slots, git >= 2.34.
+- Trust: the remote host key and the root device fingerprint are confirmed by a human on first contact (TOFU);
+  `sync init|join`, `sync accept`, `sync confirm-revocation` and `device add` need a terminal and make you retype
+  the fingerprint or commit id. A push is first-come (compare-and-swap); an invalid signature quarantines that tip.
+- Not yet: live presence and cross-device guard/inbox (v0.4, AL-6), team roles (v0.5+). Windows follows
+  [docs/windows-support-spec.md](docs/windows-support-spec.md) and the platform table above; a real
+  multi-machine run on Windows is unverified.
+- With `LEDGER_SYNC=0` (default) and a ledger that is not enrolled nothing changes: no network contact, commits
+  stay unsigned with the repo identity, the legacy `LEDGER_PUSH` backup works as before. An **enrolled** ledger
+  signs every commit (or makes none) and never uses the legacy push, even with `LEDGER_SYNC=0` (AL-86). The hub also refuses to start during a half-done enrolment.
 
 ## Security notes
 
@@ -257,7 +291,7 @@ Read [SECURITY.md](SECURITY.md) to report a vulnerability.
 
 ## Limits
 
-- Single user, single machine for now. No multi-user auth, no remote access, no TLS. Multi-device sync is designed (see [docs/multi-device-spec.md](docs/multi-device-spec.md)); only its local groundwork (ledger format 2, device identity, id slots) ships today.
+- Single user. Multi-device sync (v0.3, solo sync) is opt-in, see [Multi-device sync](#multi-device-sync-v03-solo); there is no multi-user auth, no TLS, and no live claims/inbox across machines yet (v0.4, AL-6): claims cross machines only through `claimed_by` in the item file. Without sync it is single machine.
 - macOS and Linux only for now. The Claude Code adapter is the only agent adapter shipped.
 - Guards only see what agents report through hooks; a process that ignores them can still
   edit files. Claims are cooperation, not a security boundary.
