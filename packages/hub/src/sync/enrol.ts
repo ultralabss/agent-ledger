@@ -45,6 +45,8 @@ import {
   resolveSshKeygen,
   safeOutput,
   withDeviceLock,
+  type DeviceEntry,
+  type DevicesFile,
   type Ed25519Pub,
   type GitSigningInput,
 } from '@agent-ledger/shared';
@@ -65,6 +67,7 @@ import {
   type EnrolMarker,
 } from './state.ts';
 import { TreeBuildError, TreeBuilder, type TreeChange } from './treebuild.ts';
+import { verifyCommitSignature } from './sigverify.ts';
 import { validateRange } from './validate.ts';
 
 /* ---------------- public contract (B4c calls these; the shapes are fixed by the plan §2.2) ---------------- */
@@ -97,6 +100,7 @@ export type EnrolErrorCode =
   | 'ROOT_REVOKED'
   | 'REVOKED'
   | 'ADD_COMMIT'
+  | 'ADD_COMMIT_REQUIRED'
   | 'PUSH_REJECTED'
   | 'PUSH_FAILED'
   | 'FETCH_FAILED'
@@ -141,7 +145,8 @@ const MESSAGES: Readonly<Record<string, string>> = {
   ROOT_FP_REFUSED: 'the root key fingerprint was not confirmed',
   ROOT_REVOKED: 'the root device of that ledger is revoked: joining is refused',
   REVOKED: 'this device is revoked in the registry',
-  ADD_COMMIT: 'the --add-commit is not part of the fetched history',
+  ADD_COMMIT: 'the --add-commit is not the commit by which a trusted device added this device (not in the fetched history, wrong signer or wrong change)',
+  ADD_COMMIT_REQUIRED: '--add-commit <sha> is required: pass the commit printed by `ledger device add` on the trusted device',
   PUSH_REJECTED: 'the remote refused the push (it already has history): nothing was forced; the local migration commit is kept',
   PUSH_FAILED: 'the push did not reach the remote: re-run the same command to retry',
   FETCH_FAILED: 'fetching from the remote failed',
@@ -223,7 +228,8 @@ export interface JoinInput extends BaseInput {
 export interface JoinContinueInput {
   ledgerDir: string;
   hubPort: number;
-  /** An add commit printed by the trusted device: must be part of the fetched history. */
+  /** MANDATORY (D5, T-B4-3; optional only in the type so a missing value is a refusal, not a compile error): the add commit
+   *  printed by `ledger device add` on the trusted device. Must be in F0..F1, signed by a still-active registered device, and add exactly this key. */
   addCommit?: string;
   seams?: EnrolSeams;
 }
@@ -714,7 +720,7 @@ function joinInstructions(io: EnrolIo, r: JoinResult): void {
   io.out(`fingerprint: ${r.fingerprint}`);
   io.out('on a trusted device run:');
   io.out(r.addCommand);
-  io.out('then run `ledger sync join --continue` here (optionally with --add-commit <sha> as printed there)');
+  io.out('then run `ledger sync join --continue --add-commit <sha>` here (the commit sha `ledger device add` prints there; required)');
 }
 
 async function joinResult(dir: string, bin: string, base: string): Promise<JoinResult> {
@@ -869,7 +875,46 @@ async function joinInner(o: JoinInput, io: EnrolIo, flow: Flow): Promise<JoinRes
 
 /* ---------------- phase 2 ---------------- */
 
-/** `ledger sync join --continue [--add-commit <sha>]`. */
+/** The `--add-commit` pin: a single-parent commit strictly between F0 and F1 (on top of F0), signed (valid ssh signature) by a
+ *  device that is registered and NOT revoked in its parent registry nor in F1, whose only change to `devices.yml` is adding
+ *  exactly THIS joiner's entry (as it is in F1). The range F0..F1 itself was validated by `validateRange` (bootstrap trust set). */
+async function verifyAddCommit(
+  c: Core,
+  dir: string,
+  v: { addCommit: string; F0: string; F1: string; own: string; ownEntry: DeviceEntry; registryF1: DevicesFile; sshKeygenBin?: string },
+): Promise<void> {
+  const bad = (): never => {
+    throw new EnrolError('ADD_COMMIT');
+  };
+  if (!(await c.store.hasCommit(v.addCommit))) bad();
+  if (v.addCommit === v.F0 || !(await c.store.isAncestor(v.F0, v.addCommit)) || !(await c.store.isAncestor(v.addCommit, v.F1))) bad();
+  const raw = await c.store.readCommitRaw(v.addCommit);
+  const sig = await verifyCommitSignature(raw, { tmpRoot: c.tmpRoot, ...(v.sshKeygenBin !== undefined ? { bin: v.sshKeygenBin } : {}) });
+  if (sig.reason === 'verifier-error') throw new EnrolError('SSH_KEYGEN');
+  if (!sig.valid || sig.pubkeyLine === null || sig.headers === null || sig.headers.parents.length !== 1) bad();
+  const parent = (sig.headers as { parents: string[] }).parents[0] as string;
+  const signer = parseEd25519Pub(sig.pubkeyLine as string)?.line;
+  if (signer === undefined || signer === v.own) bad(); // a device never vouches for itself
+  const before = await registryAt(c.store, c.gitx, dir, parent);
+  const after = await registryAt(c.store, c.gitx, dir, v.addCommit);
+  if (before === null || after === null) bad();
+  const b = (before as DevicesFile).devices;
+  const a = (after as DevicesFile).devices;
+  const sBefore = b.find((d) => d.pubkey === signer);
+  const sF1 = v.registryF1.devices.find((d) => d.pubkey === signer);
+  // revoked in the parent registry, or since (in F1): refused (the rollback this pin exists for)
+  if (sBefore === undefined || sBefore.revoked !== null || sF1 === undefined || sF1.revoked !== null) bad();
+  if (a.length !== b.length + 1) bad();
+  const added = a.filter((d) => !b.some((o) => o.id === d.id));
+  if (added.length !== 1 || (added[0] as DeviceEntry).pubkey !== v.own) bad();
+  if ((added[0] as DeviceEntry).id !== v.ownEntry.id) bad();
+  for (const o of b) {
+    const n = a.find((d) => d.id === o.id);
+    if (n === undefined || JSON.stringify({ ...n, last_seen: undefined }) !== JSON.stringify({ ...o, last_seen: undefined })) bad();
+  }
+}
+
+/** `ledger sync join --continue --add-commit <sha>` (the pin is mandatory: D5 / T-B4-3). */
 export async function syncJoinContinue(o: JoinContinueInput, io: EnrolIo): Promise<JoinContinueResult> {
   return guarded(() => continueInner(o, io));
 }
@@ -881,7 +926,9 @@ async function continueInner(o: JoinContinueInput, io: EnrolIo): Promise<JoinCon
     await seams?.crashAt?.(stage);
   };
   const dir = o.ledgerDir;
-  if (o.addCommit !== undefined && !isSha(o.addCommit)) throw new EnrolError('BAD_INPUT');
+  if (o.addCommit === undefined) throw new EnrolError('ADD_COMMIT_REQUIRED');
+  if (!isSha(o.addCommit)) throw new EnrolError('BAD_INPUT');
+  const addCommit = o.addCommit;
   if (await hubRunning(o)) throw new EnrolError('HUB_RUNNING');
   const marker = await readEnrolMarker(dir).catch((err: unknown) => {
     throw mapError(err);
@@ -933,9 +980,8 @@ async function continueInner(o: JoinContinueInput, io: EnrolIo): Promise<JoinCon
   if (reg === null || mine === undefined) return { status: 'waiting' };
   if (mine.id !== own.id) throw new EnrolError('DEVICE:id_mismatch');
   if (mine.revoked !== null) throw new EnrolError('REVOKED');
-  if (o.addCommit !== undefined) {
-    if (!(await c.store.hasCommit(o.addCommit)) || !(await c.store.isAncestor(o.addCommit, F1))) throw new EnrolError('ADD_COMMIT');
-  }
+  // T-B4-3 (D5): the pinned commit is what a rolled-back remote cannot forge
+  await verifyAddCommit(c, dir, { addCommit, F0, F1, own: own.pub.line, ownEntry: mine, registryF1: reg, ...(seams?.sshKeygenBin !== undefined ? { sshKeygenBin: seams.sshKeygenBin } : {}) });
 
   /* ---- 9. fast-forward tip -> F1 (refs by compare-and-swap) ---- */
   if (tip !== F1) {

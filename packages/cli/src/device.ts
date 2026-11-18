@@ -171,5 +171,6 @@ async function addCmd(args: Args, dir: string, io: DeviceIo): Promise<number> {
   else if (r.applied) io.out(`NOT approved yet: re-run this command, or \`ledger device approve ${r.id} --fp ${r.fp}\``);
   else io.out('pushed, but not applied locally yet (a later cycle does it): re-run this command afterwards to approve the key');
   if (r.commit !== null) io.out(`on the joining device: ledger sync join --continue --add-commit ${r.commit}`);
+  else if (r.existing) io.out('already registered earlier: on the joining device pass the commit that added it: ledger sync join --continue --add-commit <sha> (see `git log` of devices.yml in the ledger)');
   return 0;
 }

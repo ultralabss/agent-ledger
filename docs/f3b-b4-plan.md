@@ -35,7 +35,7 @@ Enrol marker `.hub/sync/enrol.json` `{v:1, kind:'init'|'join', stage, pid, start
 9. `createRef(accepted,M0)` then `state.accepted=M0`; delete marker. Print device id, root key fingerprint (for joiners), next step `LEDGER_SYNC=1`.
 Resume: re-run with a marker of the same kind and dead pid continues from `stage`; `--abort` removes marker and `sync.yml` only (never commits, keys, refs).
 
-### 1.2 `ledger sync join <url> [--label x] [--host-fp ..] [--root-fp ..]`, then `--continue [--add-commit <sha>]`
+### 1.2 `ledger sync join <url> [--label x] [--host-fp ..] [--root-fp ..]`, then `--continue --add-commit <sha>` (mandatory, D5)
 Phase 1:
 1. Preconditions: hub not running; ledger dir absent, empty, or holding only `.hub/` of an own interrupted join. Never a dir with items.
 2. Marker; `Gitx.initRepo(dir)` (`init --initial-branch=main`, UNVERIFIED on git 2.34); `initDevice(dir)` (non-root key).
@@ -45,7 +45,7 @@ Phase 1:
 6. `bootstrapSigners(dir, registry, rootFp)` (OQ-5); `read-tree -m -u <empty> F0` (UNVERIFIED form; fallback `read-tree --reset -u F0` on the empty worktree); `update-ref main F0 <zero>`; `createRef(accepted,F0)`; marker `stage:'awaiting-add', F0`.
 7. Print exactly: device id, canonical pubkey line, `SHA256:` fp, and the command for the trusted device `ledger device add '<pubkey>' --label <x> --fp <fp>`.
 Phase 2 (`--continue`):
-8. Fetch F1; `validateRange(A=F0, F=F1, L=F0)` with the bootstrap trust set and `verify=enforce` (join never runs in warn); own entry present, id == own key-derived id, not revoked; optional `--add-commit` must be an ancestor-or-equal of F1 (OQ-9).
+8. Fetch F1; `validateRange(A=F0, F=F1, L=F0)` with the bootstrap trust set and `verify=enforce` (join never runs in warn); own entry present, id == own key-derived id, not revoked; the MANDATORY `--add-commit <sha>` (D5; refused with `ADD_COMMIT_REQUIRED` when absent) must be a single-parent commit strictly after F0 and an ancestor of F1, validly signed by a device that is registered and not revoked in its parent registry nor in F1, whose only `devices.yml` change is adding exactly this joiner's entry (OQ-9 = B).
 9. FF worktree F0 -> F1 (`read-tree -m -u F0 F1`, `update-ref main F1 F0`, `update-ref accepted F1 F0`); `pruneRevokedSigners` under D.
 10. `adoptSlot(dir)`; add own key to `allowed_signers`; write `sync.yml`; `state.accepted=F1`; delete marker.
 Not yet added -> exit 2 "waiting for `ledger device add` on a trusted device", marker kept.
@@ -147,7 +147,7 @@ Human gate (OQ-2): `requireOwner` + session not `worker-*`/`headless-*`; CLI sid
 |---|---|---|---|
 | T-B4-1 | Enumeration: route answers reveal which device ids / fingerprints exist; status leaks URL; public remote lists the ledger | one `refused` answer + limiter; status has host token only; `sync_remote_anonymous` must fail before first push | `sync-routes.test` uniform answers, lockout; `remotecheck.test` anonymous success = fail; status snapshot has no URL |
 | T-B4-2 | Replay of route calls (`accept`, `confirm`, `device-add`) | bound to (tip) / (commit,id) / key; idempotent; stale tip -> refused | replay each request twice and after tip change |
-| T-B4-3 | Replay / rollback by the remote at join (stale history where a revoked device is active) | phase 2 requires own entry added by a trusted signer on top of F0; revocations in F0..F1 gated; optional `--add-commit` | `enrol.test` remote serves old tip, then forged branch; `--add-commit` mismatch |
+| T-B4-3 | Replay / rollback by the remote at join (stale history where a revoked device is active) | phase 2 requires own entry added by a trusted signer on top of F0; revocations in F0..F1 gated; MANDATORY verified `--add-commit` (D5) | `enrol.test` remote serves old tip, then forged branch; `--add-commit` mismatch |
 | T-B4-4 | Slot race: two trusted devices add different joiners at once | push-first CAS, retry with fresh slot, loser unreferenced; merge with duplicate slot quarantines (UNVERIFIED `merge/devices.ts` clash behaviour) | `deviceadd.test` two hubs racing 50 seeded rounds: distinct slots, no orphan in refs; hostile raw commit with duplicate slot quarantined |
 | T-B4-5 | TOCTOU slot adoption: hub starts mid-enrol, or mints ids before adopt | boot refusal on marker in every mode; `adoptSlot` refuses when counters exist | `server` test: marker -> no listen, no commit; `LEDGER_SYNC=0` too |
 | T-B4-6 | TOCTOU validate -> checkout at join | F resolved once; worktree written from validated sha; refs CAS | remote moves between fetch and checkout |
@@ -192,7 +192,7 @@ Not owned by B4 (stay with B5): `cli/doctor-checks.ts` stale `formatCheck`, brie
 - **OQ-6** Third device after an add elsewhere: A manual `device approve --fp`, doctor and status warn (recommended for B4); B auto-approve when the add commit is signed by a locally trusted key (changes APPLY, out of B4).
 - **OQ-7** Legacy `remote.origin` at init: A leave `.git/config` alone, print removal command, tolerate absolute path, refuse `https://` (recommended); B init removes it.
 - **OQ-8** `last_seen` write: A defer to B5 (recommended, keeps B4c small); B include in B4c.
-- **OQ-9** Anti-rollback at `join --continue`: A optional `--add-commit <sha>` printed by `device add` (recommended); B mandatory; C none.
+- **OQ-9** Anti-rollback at `join --continue`: A optional `--add-commit <sha>` printed by `device add`; B mandatory; C none. **DECIDED (D5): B, mandatory in v0.3.**
 
 ## 11. Risk
 | Batch | P(high-sev at audit) | Why |

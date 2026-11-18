@@ -41,7 +41,7 @@ export const ENROL_USAGE = `  ledger sync init --remote <url> [--label <x>] [--n
                                             first device: put this ledger on an EMPTY, private remote (hub stopped)
   ledger sync join <url> [--label <x>] [--host-fp <SHA256:…>] [--root-fp <SHA256:…>]
                                             another device: fetch + verify the ledger, print what to run on a trusted device
-  ledger sync join --continue [--add-commit <sha>]   finish after \`ledger device add\` ran on a trusted device
+  ledger sync join --continue --add-commit <sha>     (required) finish after \`ledger device add\` ran on a trusted device
   ledger sync join --abort                  drop an interrupted enrolment (marker + sync.yml only)
   Without a terminal --host-fp (and --root-fp for join) are mandatory; with one you retype the fingerprint.`;
 
@@ -263,14 +263,15 @@ async function join(args: Args, io: EnrolCliIo, ledgerDir: string, hubPort: numb
     return abort(io, ledgerDir);
   }
   if (f.has('continue')) {
-    if (f.size > 1 + (f.has('add-commit') ? 1 : 0) || args.positional.length > 2) return usageFail(io, '--continue takes only --add-commit <sha>');
+    if (f.size > 1 + (f.has('add-commit') ? 1 : 0) || args.positional.length > 2) return usageFail(io, '--continue takes only --add-commit <sha> (required)');
     const addCommit = f.get('add-commit');
-    if (addCommit !== undefined && !SHA_RE.test(addCommit)) return usageFail(io, '--add-commit must be a full commit id');
+    if (addCommit === undefined) return usageFail(io, '--continue requires --add-commit <sha>: the commit printed by `ledger device add` on the trusted device');
+    if (!SHA_RE.test(addCommit)) return usageFail(io, '--add-commit must be a full commit id');
     const r = await syncJoinContinue(
-      { ledgerDir, hubPort, ...(addCommit !== undefined ? { addCommit } : {}), ...(io.seams !== undefined ? { seams: io.seams } : {}) },
+      { ledgerDir, hubPort, addCommit, ...(io.seams !== undefined ? { seams: io.seams } : {}) },
       makeEnrolIo(io, ask),
     );
-    if (r.status === 'waiting') return fail(io, 'waiting for `ledger device add` on a trusted device (the enrolment is kept; re-run `ledger sync join --continue`)', EXIT_CONFLICT);
+    if (r.status === 'waiting') return fail(io, 'waiting for `ledger device add` on a trusted device (the enrolment is kept; re-run `ledger sync join --continue --add-commit <sha>`)', EXIT_CONFLICT);
     return EXIT_OK;
   }
   if (f.has('add-commit')) return usageFail(io, '--add-commit only goes with --continue');

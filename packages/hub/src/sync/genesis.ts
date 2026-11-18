@@ -18,7 +18,7 @@
  *     about the remote. Legacy commits BEFORE the introducing commit are unsigned and are history only: their
  *     content is covered by the full-tree check of `F` itself.
  *   - Residual: freshness. A first-time joiner cannot tell a stale-but-valid tip from the current one; phase 2
- *     of the join (own entry added by a trusted signer on top of F0, optional `--add-commit`) closes that gap.
+ *     of the join (own entry added by a trusted signer on top of F0, mandatory `--add-commit` (D5)) closes that gap.
  */
 
 import {

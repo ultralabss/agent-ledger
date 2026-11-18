@@ -164,6 +164,7 @@ test('argv: unsafe / malformed input is refused with exit 4 BEFORE any probe or 
     ['sync', 'join', SSH_URL, 'second'],
     ['sync', 'join', SSH_URL, '--root-fp', 'nope'],
     ['sync', 'join', SSH_URL, '--add-commit', 'a'.repeat(40)], // only with --continue
+    ['sync', 'join', '--continue'], // D5: --add-commit is mandatory
     ['sync', 'join', '--continue', '--add-commit', 'not-a-sha'],
     ['sync', 'join', '--continue', '--add-commit', 'a'.repeat(39)],
     ['sync', 'join', '--continue', SSH_URL],
@@ -381,6 +382,8 @@ test('--abort: removes the marker without a terminal; nothing to abort is a plai
 
   // continuing without anything in progress
   const r3 = await rig(t);
-  assert.equal(await r3.run(['sync', 'join', '--continue']), 2);
+  assert.equal(await r3.run(['sync', 'join', '--continue']), 4, 'D5: --add-commit is mandatory');
+  assert.match(r3.err.join('\n'), /--continue requires --add-commit/);
+  assert.equal(await r3.run(['sync', 'join', '--continue', '--add-commit', 'a'.repeat(40)]), 2);
   assert.match(r3.err.join('\n'), /no enrolment in progress/);
 });

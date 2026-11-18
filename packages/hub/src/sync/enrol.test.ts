@@ -6,7 +6,7 @@ import assert from 'node:assert/strict';
 import { lstat, mkdir, readFile, readdir, rm, writeFile } from 'node:fs/promises';
 import nodePath from 'node:path';
 import test from 'node:test';
-import { deviceLayout, parseEd25519Pub, readDevices, readSigners, revokeDevice, withDeviceLock } from '@agent-ledger/shared';
+import { addDevice, deviceLayout, parseEd25519Pub, readDevices, readSigners, revokeDevice, withDeviceLock } from '@agent-ledger/shared';
 import { skipOnWin32 } from '@agent-ledger/shared/testing';
 import { Ledger } from '../ledger/ledger.ts';
 import { tempConfig } from '../test-helpers.ts';
@@ -249,8 +249,8 @@ for (const stage of JOIN_CRASHES) {
       const io = mkIo();
       const r = await syncJoin(joinInput(jw), io);
       assert.equal((await readEnrolMarker(jw.jdir))?.stage, 'awaiting-add');
-      await trustedAdd(jw.a.dir, jw.kit.remote.path, { pubkey: r.pubkey, label: r.label, fingerprint: r.fingerprint });
-      const done = await syncJoinContinue(contInput(jw), mkIo());
+      const added = await trustedAdd(jw.a.dir, jw.kit.remote.path, { pubkey: r.pubkey, label: r.label, fingerprint: r.fingerprint });
+      const done = await syncJoinContinue(contInput(jw, { addCommit: added }), mkIo());
       await assertJoined(jw, r, done);
     } finally {
       await jw.cleanup();
@@ -264,10 +264,10 @@ for (const stage of CONT_CRASHES) {
     const jw = await joinWorld();
     try {
       const r = await syncJoin(joinInput(jw), mkIo());
-      await trustedAdd(jw.a.dir, jw.kit.remote.path, { pubkey: r.pubkey, label: r.label, fingerprint: r.fingerprint });
-      await assert.rejects(syncJoinContinue(contInput(jw, {}, { crashAt: crashAt(stage) }), mkIo()), (e: unknown) => e instanceof EnrolCrash && e.stage === stage);
+      const added = await trustedAdd(jw.a.dir, jw.kit.remote.path, { pubkey: r.pubkey, label: r.label, fingerprint: r.fingerprint });
+      await assert.rejects(syncJoinContinue(contInput(jw, { addCommit: added }, { crashAt: crashAt(stage) }), mkIo()), (e: unknown) => e instanceof EnrolCrash && e.stage === stage);
       assert.ok((await readEnrolMarker(jw.jdir)) !== null, 'marker still there: the hub stays down');
-      const done = await syncJoinContinue(contInput(jw), mkIo());
+      const done = await syncJoinContinue(contInput(jw, { addCommit: added }), mkIo());
       await assertJoined(jw, r, done);
     } finally {
       await jw.cleanup();
@@ -582,7 +582,7 @@ test('continue: before the add it is `waiting` (nothing moves, marker stays); af
     const r = await syncJoin(joinInput(jw), mkIo());
     const { store } = await core(jw.jdir);
     const f0 = await store.revParse(REF_MAIN);
-    assert.deepEqual(await syncJoinContinue(contInput(jw), mkIo()), { status: 'waiting' });
+    assert.deepEqual(await syncJoinContinue(contInput(jw, { addCommit: 'a'.repeat(40) }), mkIo()), { status: 'waiting' });
     assert.equal(await store.revParse(REF_MAIN), f0);
     assert.equal((await readEnrolMarker(jw.jdir))?.stage, 'awaiting-add');
     // a remote that advanced WITHOUT our entry is still `waiting`
@@ -592,8 +592,8 @@ test('continue: before the add it is `waiting` (nothing moves, marker stays); af
     const again = await syncJoin(joinInput(jw), io);
     assert.equal(again.pubkey, r.pubkey);
     assert.ok(io.lines.some((l) => l.includes(r.addCommand)));
-    await trustedAdd(jw.a.dir, jw.kit.remote.path, { pubkey: r.pubkey, label: r.label, fingerprint: r.fingerprint });
-    await assertJoined(jw, r, await syncJoinContinue(contInput(jw), mkIo()));
+    const addedHere = await trustedAdd(jw.a.dir, jw.kit.remote.path, { pubkey: r.pubkey, label: r.label, fingerprint: r.fingerprint });
+    await assertJoined(jw, r, await syncJoinContinue(contInput(jw, { addCommit: addedHere }), mkIo()));
   } finally {
     await jw.cleanup();
   }
@@ -612,15 +612,15 @@ test('continue (T-B4-3): a remote that is rolled back, rewritten or serves a for
     // the remote history was REWRITTEN (a fresh root, F0 is no longer an ancestor)
     const hub = await jw.kit.makeHub(8);
     const forged = await jw.kit.remote.rewriteHistory(hub);
-    await assert.rejects(syncJoinContinue(contInput(jw), mkIo()), (e: unknown) => e instanceof EnrolError && e.code === 'REMOTE_REWOUND');
+    await assert.rejects(syncJoinContinue(contInput(jw, { addCommit: added }), mkIo()), (e: unknown) => e instanceof EnrolError && e.code === 'REMOTE_REWOUND');
     assert.equal(await (await core(jw.jdir)).store.revParse(REF_MAIN), base);
     // rolled back to F0 (valid, stale): our entry is not in it
     void forged;
     await jw.kit.remote.forceMain(base);
-    assert.deepEqual(await syncJoinContinue(contInput(jw), mkIo()), { status: 'waiting' });
+    assert.deepEqual(await syncJoinContinue(contInput(jw, { addCommit: added }), mkIo()), { status: 'waiting' });
     // a forged continuation on top of F0: signed by a key the bootstrap does not trust
     await jw.kit.remote.pushSigned(hub, [{ path: 'acme/CONTEXT.md', content: '# forged\n' }]);
-    await assert.rejects(syncJoinContinue(contInput(jw), mkIo()), (e: unknown) => e instanceof EnrolError && String(e.code).startsWith('RANGE:'));
+    await assert.rejects(syncJoinContinue(contInput(jw, { addCommit: added }), mkIo()), (e: unknown) => e instanceof EnrolError && String(e.code).startsWith('RANGE:'));
     assert.equal(await (await core(jw.jdir)).store.revParse(REF_MAIN), base, 'still at F0');
     // the honest history, with the printed add commit
     await jw.kit.remote.forceMain(added);
@@ -635,7 +635,7 @@ test('continue: a device revoked BEFORE it adopts its slot is refused and nothin
   try {
     const r = await syncJoin(joinInput(jw), mkIo());
     const base = (await (await core(jw.jdir)).store.revParse(REF_MAIN)) as string;
-    await trustedAdd(jw.a.dir, jw.kit.remote.path, { pubkey: r.pubkey, label: r.label, fingerprint: r.fingerprint });
+    const added = await trustedAdd(jw.a.dir, jw.kit.remote.path, { pubkey: r.pubkey, label: r.label, fingerprint: r.fingerprint });
     // the trusted device revokes it right away and pushes
     await revokeDevice(jw.a.dir, r.deviceId, 'stolen before adoption');
     const { store: aStore } = await core(jw.a.dir);
@@ -657,10 +657,106 @@ test('continue: a device revoked BEFORE it adopts its slot is refused and nothin
     });
     await trees.updateRef(REF_MAIN, rev, tip);
     assert.ok((await ag.push(jw.a.dir, jw.kit.remote.path, rev)).ok);
-    await assert.rejects(syncJoinContinue(contInput(jw), mkIo()), (e: unknown) => e instanceof EnrolError && e.code === 'REVOKED');
+    await assert.rejects(syncJoinContinue(contInput(jw, { addCommit: added }), mkIo()), (e: unknown) => e instanceof EnrolError && e.code === 'REVOKED');
     const { store } = await core(jw.jdir);
     assert.equal(await store.revParse(REF_MAIN), base, 'main not moved');
     assert.equal(await store.revParse(REF_ACCEPTED), base);
+    assert.equal((await readEnrolMarker(jw.jdir))?.stage, 'awaiting-add');
+    assert.equal(await readSyncConfig(jw.jdir), null, 'not enrolled');
+  } finally {
+    await jw.cleanup();
+  }
+});
+
+/** A commit signed by the ROOT device's key holding only `devices.yml` = `text`, on top of `parent`, pushed to the kit remote. */
+async function rootSignedDevices(jw: JoinWorld, parent: string, text: string): Promise<string> {
+  const { Gitx: G } = await import('./gitx.ts');
+  const { TreeBuilder } = await import('./treebuild.ts');
+  const { resolveSshKeygen, readDeviceFile } = await import('@agent-ledger/shared');
+  const ag = await G.open({ syncDir: nodePath.join(jw.a.dir, '.hub', 'sync'), testLocalRemotes: [jw.kit.remote.path] });
+  const trees = new TreeBuilder(ag, jw.a.dir, nodePath.join(jw.a.dir, '.hub', 'sync', 'tmp'));
+  const l = deviceLayout(jw.a.dir);
+  const self = await readDeviceFile(l);
+  assert.ok((await ag.fetch(jw.a.dir, jw.kit.remote.path, { src: REF_MAIN, dst: REF_INCOMING, timeoutMs: 60_000 })).ok, 'the root fetches the remote-built parent');
+  const tree = await trees.buildTree(parent, [{ path: 'devices.yml', content: text }]);
+  const sha = await trees.commitTree({
+    tree,
+    parents: [parent],
+    message: 'testkit: root devices change',
+    identity: { name: self?.label ?? 'a', email: `${jw.root.deviceId}@devices.agent-ledger.invalid` },
+    signing: { sshKeygenBin: await resolveSshKeygen(), keyFile: l.keyFile, allowedSignersFile: l.allowedSigners },
+  });
+  assert.ok((await ag.push(jw.a.dir, jw.kit.remote.path, sha)).ok);
+  await jw.kit.remote.forceMain(sha);
+  return sha;
+}
+
+/* ---- D5 / T-B4-3: --add-commit is mandatory and verified ---- */
+
+test('continue (D5): --add-commit is REQUIRED (fixed message, no remote URL), refused before any fetch or state change; a wrong pin is refused; the correct one adopts', { skip }, async () => {
+  const jw = await joinWorld();
+  try {
+    const r = await syncJoin(joinInput(jw), mkIo());
+    const base = (await (await core(jw.jdir)).store.revParse(REF_MAIN)) as string;
+    const added = await trustedAdd(jw.a.dir, jw.kit.remote.path, { pubkey: r.pubkey, label: r.label, fingerprint: r.fingerprint });
+    // missing: refused although the honest add is on the remote
+    await assert.rejects(syncJoinContinue(contInput(jw), mkIo()), (e: unknown) => {
+      assert.ok(e instanceof EnrolError && e.code === 'ADD_COMMIT_REQUIRED');
+      assert.ok(!(e as Error).message.includes(jw.kit.remote.path), 'no URL in the message');
+      assert.match((e as Error).message, /--add-commit/);
+      return true;
+    });
+    // not a commit id at all
+    await assert.rejects(syncJoinContinue(contInput(jw, { addCommit: 'nope' }), mkIo()), (e: unknown) => e instanceof EnrolError && e.code === 'BAD_INPUT');
+    // mismatch: F0 itself (not strictly after F0), an object that does not exist
+    for (const bad of [base, 'b'.repeat(40)]) {
+      await assert.rejects(syncJoinContinue(contInput(jw, { addCommit: bad }), mkIo()), (e: unknown) => e instanceof EnrolError && e.code === 'ADD_COMMIT');
+    }
+    const { store } = await core(jw.jdir);
+    assert.equal(await store.revParse(REF_MAIN), base, 'nothing moved');
+    assert.equal((await readEnrolMarker(jw.jdir))?.stage, 'awaiting-add');
+    assert.equal(await readSyncConfig(jw.jdir), null, 'not enrolled');
+    // correct
+    await assertJoined(jw, r, await syncJoinContinue(contInput(jw, { addCommit: added }), mkIo()));
+  } finally {
+    await jw.cleanup();
+  }
+});
+
+test('continue (D5): a commit that is in F0..F1 but is NOT the add of this device (a later commit, or one that adds another key) is refused', { skip }, async () => {
+  const jw = await joinWorld();
+  try {
+    const r = await syncJoin(joinInput(jw), mkIo());
+    const other = await jw.kit.makeHub(6);
+    // the trusted device adds ANOTHER device first, then the joiner
+    const otherAdd = await trustedAdd(jw.a.dir, jw.kit.remote.path, { pubkey: other.pub.line, label: 'other', fingerprint: other.pub.fingerprint });
+    const added = await trustedAdd(jw.a.dir, jw.kit.remote.path, { pubkey: r.pubkey, label: r.label, fingerprint: r.fingerprint });
+    await assert.rejects(syncJoinContinue(contInput(jw, { addCommit: otherAdd }), mkIo()), (e: unknown) => e instanceof EnrolError && e.code === 'ADD_COMMIT');
+    assert.equal(await (await core(jw.jdir)).store.revParse(REF_MAIN) !== added, true, 'nothing moved');
+    const done = await syncJoinContinue(contInput(jw, { addCommit: added }), mkIo());
+    assert.equal(done.status, 'done'); // (slot B: the other device took A)
+  } finally {
+    await jw.cleanup();
+  }
+});
+
+test('continue (D5, T-B4-3): an add commit signed by a key that is revoked (before or since) is refused and nothing moves', { skip }, async () => {
+  const jw = await joinWorld();
+  try {
+    const r = await syncJoin(joinInput(jw), mkIo());
+    const base = (await (await core(jw.jdir)).store.revParse(REF_MAIN)) as string;
+    const x = await jw.kit.makeHub(7);
+    // root registers X; X "adds" the joiner (devices.yml signed by X); root then revokes X
+    const cx = await trustedAdd(jw.a.dir, jw.kit.remote.path, { pubkey: x.pub.line, label: 'xdev', fingerprint: x.pub.fingerprint });
+    await addDevice(jw.a.dir, r.pubkey, r.label, r.fingerprint);
+    const withJoiner = await readFile(deviceLayout(jw.a.dir).devicesYml, 'utf8');
+    const cy = await jw.kit.remote.rawCommit({ files: [{ path: 'devices.yml', content: withJoiner }], signer: x, parents: [cx], identity: x.identity });
+    await revokeDevice(jw.a.dir, x.deviceId, 'compromised');
+    const revoked = await readFile(deviceLayout(jw.a.dir).devicesYml, 'utf8');
+    await rootSignedDevices(jw, cy, revoked);
+    await assert.rejects(syncJoinContinue(contInput(jw, { addCommit: cy }), mkIo()), (e: unknown) => e instanceof EnrolError && (e.code === 'ADD_COMMIT' || String(e.code).startsWith('RANGE:'))); // the range gate (unapproved device) fires first; the signer check is defence in depth
+    const { store } = await core(jw.jdir);
+    assert.equal(await store.revParse(REF_MAIN), base, 'main not moved');
     assert.equal((await readEnrolMarker(jw.jdir))?.stage, 'awaiting-add');
     assert.equal(await readSyncConfig(jw.jdir), null, 'not enrolled');
   } finally {
