@@ -22,7 +22,7 @@ jobs:
   test:
     name: test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 45
+    timeout-minutes: 55
     strategy:
       fail-fast: false
       matrix:
@@ -59,6 +59,24 @@ jobs:
         run: ./scripts/ci-win-nonelevated.ps1
       - name: Supply-chain script tests
         run: node --test scripts/*.test.mjs
+      # Long randomised sync soak (docs/f3b-b6-plan.md): the default `pnpm test` run is the short 30-op version.
+      # Reproduce a failure with the SOAK_SEED printed in the log.
+      - name: Soak (long)
+        if: runner.os == 'Linux'
+        env:
+          SOAK_ITERATIONS: '400'
+          SOAK_BUDGET_MS: '240000'
+        run: node --test --test-timeout=600000 packages/hub/src/sync/soak.test.ts
+      # Report-only via the script's own -NoFail (scripts/workflow-pins.test.mjs forbids continue-on-error): do the sync threat + soak suites even run on Windows? (the sync tests are POSIX-gated
+      # unless LEDGER_TEST_SYNC_WIN32=1). UNVERIFIED: brace glob handling of the non-elevated runner (fallback:
+      # two steps) and whether the env reaches the non-elevated child.
+      - name: Sync threat + soak (Windows, report-only)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          LEDGER_TEST_SYNC_WIN32: '1'
+          SOAK_ITERATIONS: '40'
+        run: ./scripts/ci-win-nonelevated.ps1 -Files 'packages/hub/src/sync/{threat.*,soak}.test.ts' -ExtraArgs '--test-concurrency=1' -MaxMinutes 8 -NoFail
       # Weak-filesystem tests: a loop-mounted vfat image (no POSIX modes, no
       # owner, no hardlinks). The vfat-gated tests are added later; until then
       # LEDGER_TEST_VFAT is ignored and this re-runs the suite unchanged.
