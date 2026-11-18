@@ -114,11 +114,11 @@ Human gate (OQ-2): `requireOwner` + session not `worker-*`/`headless-*`; CLI sid
 5. Nothing fetched is checked out, parsed as config, or executed before `validateGenesis` / `validateRange` passed. Enrol never writes `.git/config`; a fresh join config has no `remote.*`.
 6. No force, no ref move without expected-old, no remote name, no URL from a route, env, or fetched content. URL sources: CLI argv, `.hub/sync.yml`, enrol marker.
 7. Remote URL, git stderr, key material and prompts never reach journal, state, logs or route bodies; sanitised host token and `SHA256:` fingerprints only.
-8. Sync commits by this device carry `deviceEmail(id)` and a valid signature or are not made (init included).
+8. Every commit of an enrolled ledger (`devices.yml` or device key present) carries `deviceEmail(id)` and a valid signature or is not made (init included), independent of `LEDGER_SYNC`; the identity provider is asked at every commit (AL-86). An enrolled ledger never uses the legacy `git push` either.
 9. D is never held across network or human input; every enrol lock has a bounded wait and a stale rule.
 10. Human-only routes never widen what `SyncLoop` already permits (OQ-B/OQ-C rules unchanged).
 11. `approve` always follows a fingerprint the human supplied in the same command; join bootstrap trust derives only from the confirmed root.
-12. With `LEDGER_SYNC=0` and no marker, B4 adds no network contact and no behaviour change.
+12. For a NON-enrolled ledger with `LEDGER_SYNC=0` and no marker, B4 adds no network contact and no behaviour change (commit argv, identity and legacy push as before). An enrolled ledger with sync off still signs (inv. 8) and starts normally; only the network stays untouched.
 
 ## 5. Inputs
 | Input | Source | Validation | Cap | Sink |

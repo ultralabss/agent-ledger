@@ -24,7 +24,7 @@ import { SyncLoop } from './loop.ts';
 import type { ProposedItem } from './merge/tree.ts';
 import { cleanText } from './notes.ts';
 import { ObjectStore } from './objects.ts';
-import { StateStore, readEnrolMarker, readSyncConfig, type Inflight } from './state.ts';
+import { StateStore, SYNC_CONFIG_FILE, readEnrolMarker, readSyncConfig, type Inflight } from './state.ts';
 import { TreeBuilder } from './treebuild.ts';
 
 export interface BootReplay {
@@ -115,7 +115,12 @@ export async function startSync(o: {
   testLocalRemotes?: readonly string[];
 }): Promise<SyncLoop | null> {
   const { ledger, store, config, log } = o;
-  if (!config.sync) return null;
+  if (!config.sync) {
+    // AL-86: sync off, but an enrolled ledger still signs every commit (state-driven, see Ledger.syncCommitIdentity).
+    const present = await lstat(nodePath.join(ledger.paths.root, SYNC_CONFIG_FILE)).then(() => true, () => false);
+    if (present) log('sync: enrolled, LEDGER_SYNC off — commits are signed, nothing is synchronised');
+    return null;
+  }
   let cfg;
   try {
     cfg = await readSyncConfig(ledger.paths.root);

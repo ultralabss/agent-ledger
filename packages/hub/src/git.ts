@@ -578,9 +578,11 @@ export interface LedgerGitOptions {
   /** `LEDGER_SYNC=1` (F3b). The only push is then `Gitx.push` from the sync cycle: `maybePush` never
    *  spawns, and a commit is signed with the device key or not made at all. */
   sync?: boolean;
-  /** Who signs a sync-mode commit. `null` = this ledger is not enrolled yet → commit as before
-   *  (unsigned, global identity). Anything else is signed or the commit is NOT made (no unsigned
-   *  fallback). May throw: treated as an error outcome, never as "not enrolled". */
+  /** Who signs a commit (AL-86: asked at EVERY commit and by `maybePush`, whatever `sync` says — enforcement
+   *  follows the ledger state, not the env). `null` = this ledger is not enrolled → commit as before
+   *  (unsigned, global identity, legacy push when `push` is on). Anything else is signed or the commit is NOT
+   *  made (no unsigned fallback), and an enrolled ledger never uses the legacy push. May throw: treated as an
+   *  error outcome (and "no push"), never as "not enrolled". */
   syncCommit?: () => SyncCommitIdentity | null | Promise<SyncCommitIdentity | null>;
   /** APPLY crash marker (`.hub/sync/inflight.json`). ALWAYS checked, sync on or off: while it exists the
    *  worktree may sit between two trees and `add -A` would commit a revert (T-B3-3). */
@@ -1521,18 +1523,20 @@ export class LedgerGit {
     }
     if (scan.scanner === null && scan.note !== null) this.opts.log(scan.note);
 
-    // F3b: sync-mode commits are made as THIS device and signed, or not made. No unsigned retry, ever.
+    // AL-86: enforcement follows the LEDGER STATE, not the env. When an identity provider exists it is asked
+    // at EVERY commit (no cache): enrolled → this device's identity + a valid signature, or no commit at all
+    // (no unsigned retry, ever); `null` = not enrolled → commit as before.
     let signedArgs: string[] = [];
     let signed = false;
     if (this.opts.sync === true && this.opts.syncCommit === undefined) {
       // Sync mode without an identity provider is a wiring bug: never fall back to an unsigned commit.
       this.summaries = summary === 'changes' ? [] : [summary];
-      this.opts.log('ledger: sync commit refused — no signing identity provider; nothing committed');
+      this.opts.log('ledger: signed commit refused — no signing identity provider; nothing committed');
       return 'error';
     }
-    if (this.opts.sync === true && this.opts.syncCommit !== undefined) {
+    if (this.opts.syncCommit !== undefined) {
       try {
-        const who = await this.opts.syncCommit();
+        const who = await this.signingIdentity();
         if (who !== null) {
           if (!DEVICE_ID_RE.test(who.deviceId) || !labelSchema.safeParse(who.label).success) {
             throw new Error('device identity is not valid');
@@ -1548,7 +1552,7 @@ export class LedgerGit {
         }
       } catch (err) {
         this.summaries = summary === 'changes' ? [] : [summary];
-        this.opts.log(`ledger: sync commit refused — no signing identity (${logSafeErr(err)}); nothing committed`);
+        this.opts.log(`ledger: signed commit refused — no signing identity (${logSafeErr(err)}); nothing committed`);
         return 'error';
       }
     }
@@ -1619,6 +1623,14 @@ export class LedgerGit {
     return true;
   }
 
+  /** Asks the identity provider (no cache — a key or `devices.yml` may appear or vanish between commits).
+   *  Throws when the provider does; callers treat that as "refuse", never as "not enrolled". */
+  private async signingIdentity(): Promise<SyncCommitIdentity | null> {
+    const provider = this.opts.syncCommit;
+    if (provider === undefined) return null;
+    return await provider();
+  }
+
   private async maybePush(): Promise<void> {
     if (!this.opts.push) return;
     if (this.opts.sync === true) {
@@ -1629,6 +1641,27 @@ export class LedgerGit {
         this.opts.log('ledger: LEDGER_SYNC=1 — legacy push disabled, the sync cycle pushes');
       }
       return;
+    }
+    if (this.opts.syncCommit !== undefined) {
+      // AL-86: an enrolled ledger (asked now, no cache) never uses the legacy push even with LEDGER_SYNC off —
+      // it would bypass every sync gate. A provider failure = fail closed (no push).
+      let enrolled = true;
+      try {
+        enrolled = (await this.signingIdentity()) !== null;
+      } catch (err) {
+        if (!this.syncPushLogged) {
+          this.syncPushLogged = true;
+          this.opts.log(`ledger: legacy push disabled — enrolment state unreadable (${logSafeErr(err)})`);
+        }
+        return;
+      }
+      if (enrolled) {
+        if (!this.syncPushLogged) {
+          this.syncPushLogged = true;
+          this.opts.log('ledger: enrolled ledger — legacy push disabled, only the sync cycle pushes');
+        }
+        return;
+      }
     }
     const remotes = await git(this.opts.root, ['remote']);
     if (!remotes.stdout.split('\n').some((r) => r.trim() === 'origin')) return;

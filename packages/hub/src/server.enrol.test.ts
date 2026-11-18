@@ -8,6 +8,7 @@ import { chmod, lstat, mkdir, readFile, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import test from 'node:test';
 import { ENROL_EXIT_CODE, ENROL_REFUSAL, EnrolInProgressError, startHub } from './server.ts';
+import { writeSyncConfig } from './sync/state.ts';
 import { tempConfig } from './test-helpers.ts';
 
 const posix = process.platform !== 'win32';
@@ -67,4 +68,24 @@ test('boot order: the crash replay of an interrupted APPLY (phase 1) runs BEFORE
   const check = src.indexOf('await enrolMarkerPresent(ledger)');
   const init = src.indexOf('await ledger.init()');
   assert.ok(replay > 0 && check > replay && init > check, `replay ${String(replay)} < marker check ${String(check)} < init ${String(init)}`);
+});
+
+test('AL-86: enrolled (.hub/sync.yml) + LEDGER_SYNC off → the hub STARTS (no boot refusal), no sync loop, /v1/sync/* answer 409 SYNC_OFF, one info line', { skip: !posix }, async () => {
+  const tmp = await tempConfig({ sync: false });
+  const logs: string[] = [];
+  try {
+    await writeSyncConfig(tmp.dir, 'git@example.com:me/ledger.git');
+    const hub = await startHub({ config: tmp.config, log: (l) => logs.push(l), watch: false, periodic: false });
+    try {
+      assert.equal(hub.sync, null);
+      const res = await fetch(`${hub.url}/v1/sync/status`, { headers: { 'x-hub-token': hub.token } });
+      assert.equal(res.status, 409);
+      assert.equal(logs.filter((l) => /enrolled, LEDGER_SYNC off — commits are signed, nothing is synchronised/.test(l)).length, 1);
+      assert.ok(!logs.some((l) => l.includes('example.com')), 'no remote URL in the log');
+    } finally {
+      await hub.close();
+    }
+  } finally {
+    await tmp.cleanup();
+  }
 });

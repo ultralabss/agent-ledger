@@ -264,7 +264,7 @@ test('sync on + devices.yml but the key is GONE: the commit is refused, never ma
   assert.ok(fx.logs.some((l) => /git commit failed/.test(l)), 'refused by the signing step, not skipped');
 });
 
-test('sync off: commits stay unsigned even when a device key exists', { skip }, async (t) => {
+test('AL-86 sync off + device key (enrolled): commits are STILL signed by this device', { skip }, async (t) => {
   const fx = await open(false);
   t.after(fx.cleanup);
   const { ledger } = fx;
@@ -274,7 +274,23 @@ test('sync off: commits stay unsigned even when a device key exists', { skip }, 
   await generateKeyPair(join(keyDir, 'key'), await resolveSshKeygen());
   await ledger.createItem({ ...base, repo: 'ops', title: 'local only' });
   await ledger.git.flush();
-  assert.doesNotMatch((await git(fx.dir, ['cat-file', 'commit', 'HEAD'])).stdout, /gpgsig/);
+  const raw = Buffer.from((await git(fx.dir, ['cat-file', 'commit', 'HEAD'])).stdout, 'utf8');
+  const v = await verifyCommitSignature(raw, { tmpRoot: ledger.paths.syncDir });
+  assert.equal(v.valid, true, v.reason);
+  const email = (await git(fx.dir, ['log', '-1', '--format=%ce'])).stdout.trim();
+  assert.equal(email, `${ledger.device.device_id}@devices.agent-ledger.invalid`);
+});
+
+test('AL-86 sync off + devices.yml but the key is GONE: the commit is refused, never made unsigned', { skip }, async (t) => {
+  const fx = await open(false);
+  t.after(fx.cleanup);
+  const { ledger } = fx;
+  await ledger.git.flush();
+  const before = (await git(fx.dir, ['rev-parse', 'HEAD'])).stdout.trim();
+  await writeFile(join(ledger.paths.root, 'devices.yml'), '# enrolled once\n');
+  await ledger.createItem({ ...base, repo: 'ops', title: 'must not go out unsigned' });
+  await ledger.git.flush();
+  assert.equal((await git(fx.dir, ['rev-parse', 'HEAD'])).stdout.trim(), before);
 });
 
 /* ---------------- lock order: nothing inside queue.run awaits the git chain (§3 rule 1) ---------------- */

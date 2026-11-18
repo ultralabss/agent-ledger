@@ -632,12 +632,109 @@ async function seed0(fx: Fx): Promise<string> {
   return fx.head();
 }
 
-test('sync off: commits stay unsigned and use the repo identity', async (t) => {
+test('sync off, NOT enrolled: commits stay unsigned and use the repo identity', async (t) => {
   const fx = await fixture(t);
   await writeTracked(fx);
   assert.equal(await fx.commit(), 'committed');
   assert.doesNotMatch((await headRaw(fx.dir)).toString('utf8'), /gpgsig/);
   assert.equal((await git(fx.dir, ['log', '-1', '--format=%cn'])).stdout.trim(), 'agent-ledger test');
+});
+
+/* ---------------- AL-86: enforcement follows the ledger state, not LEDGER_SYNC ---------------- */
+
+test('AL-86 T1 sync:false + enrolled identity → signed, verifies, made as the device', { skip }, async (t) => {
+  const fx = await fixture(t);
+  const id = await identity(fx.dir);
+  fx.opts.sync = false;
+  fx.opts.syncCommit = () => id.who;
+  await writeTracked(fx);
+  assert.equal(await fx.commit(), 'committed');
+  const v = await verifyCommitSignature(await headRaw(fx.dir), { tmpRoot: join(fx.dir, '.hub', 'sync') });
+  assert.equal(v.valid, true, v.reason);
+  const em = (await git(fx.dir, ['log', '-1', '--format=%ae|%ce'])).stdout.trim();
+  assert.equal(em, `${id.who.deviceId}@devices.agent-ledger.invalid|${id.who.deviceId}@devices.agent-ledger.invalid`);
+});
+
+test('AL-86 T2 sync:false + enrolled + deleted key → error, HEAD unchanged, summary kept; key back → signed', { skip }, async (t) => {
+  const fx = await fixture(t);
+  const before = await seed(fx);
+  const id = await identity(fx.dir);
+  fx.opts.sync = false;
+  fx.opts.syncCommit = () => id.who;
+  const keyBytes = await readFile(id.keyFile);
+  await rm(id.keyFile);
+  await writeTracked(fx);
+  fx.lg.touch('needs the key');
+  assert.equal(await fx.commit(), 'error');
+  assert.equal(await fx.head(), before);
+  assert.equal(fx.lg.status.pendingSummaries, 1);
+  await writeFile(id.keyFile, keyBytes, { mode: 0o600 });
+  assert.equal(await fx.commit(), 'committed');
+  assert.equal((await verifyCommitSignature(await headRaw(fx.dir), { tmpRoot: join(fx.dir, '.hub', 'sync') })).valid, true);
+});
+
+test('AL-86 T3 provider null then identity (same process, no cache) → 1st unsigned, 2nd signed', { skip }, async (t) => {
+  const fx = await fixture(t);
+  const id = await identity(fx.dir);
+  let who: SyncCommitIdentity | null = null;
+  fx.opts.sync = false;
+  fx.opts.syncCommit = () => who;
+  await writeTracked(fx, 'one.md');
+  assert.equal(await fx.commit(), 'committed');
+  assert.doesNotMatch((await headRaw(fx.dir)).toString('utf8'), /gpgsig/);
+  who = id.who;
+  await writeTracked(fx, 'two.md');
+  assert.equal(await fx.commit(), 'committed');
+  assert.equal((await verifyCommitSignature(await headRaw(fx.dir), { tmpRoot: join(fx.dir, '.hub', 'sync') })).valid, true);
+});
+
+test('AL-86 T4 sync:false + enrolled + push:true → legacy push never runs (origin untouched), one log line', { skip }, async (t) => {
+  const remote = await mkdtemp(join(await realpath(tmpdir()), 'agl-al86-remote-'));
+  t.after(() => rm(remote, { recursive: true, force: true }));
+  assert.equal((await git(remote, ['init', '-q', '--bare', '-b', 'main'])).code, 0);
+  const fx = await fixture(t, { push: true, sync: false });
+  const id = await identity(fx.dir);
+  fx.opts.syncCommit = () => id.who;
+  assert.equal((await git(fx.dir, ['remote', 'add', 'origin', remote])).code, 0);
+  await writeTracked(fx);
+  assert.equal(await fx.commit(), 'committed');
+  await writeTracked(fx, 'b.md');
+  assert.equal(await fx.commit(), 'committed');
+  assert.equal((await git(remote, ['for-each-ref'])).stdout.trim(), '');
+  assert.equal(fx.lg.status.lastPushAt, null);
+  assert.equal(fx.logs.filter((l) => /legacy push disabled/.test(l)).length, 1);
+});
+
+test('AL-86 T5 provider throws (sync:false) → error, no commit, no push', { skip }, async (t) => {
+  const remote = await mkdtemp(join(await realpath(tmpdir()), 'agl-al86-remote-'));
+  t.after(() => rm(remote, { recursive: true, force: true }));
+  assert.equal((await git(remote, ['init', '-q', '--bare', '-b', 'main'])).code, 0);
+  const fx = await fixture(t, { push: true, sync: false });
+  const before = await seed(fx);
+  fx.opts.syncCommit = () => {
+    throw new Error('enrolment state unreadable');
+  };
+  assert.equal((await git(fx.dir, ['remote', 'add', 'origin', remote])).code, 0);
+  await writeTracked(fx, 'b.md');
+  fx.lg.touch('x');
+  assert.equal(await fx.commit(), 'error');
+  assert.equal(await fx.head(), before);
+  assert.equal(fx.lg.status.pendingSummaries, 1);
+  assert.ok(fx.logs.some((l) => /signed commit refused/.test(l)));
+  assert.equal((await git(remote, ['for-each-ref'])).stdout.trim(), '');
+});
+
+test('AL-86 T6 non-enrolled sync:false (provider null) → unsigned, repo identity, legacy push as before', { skip }, async (t) => {
+  const remote = await mkdtemp(join(await realpath(tmpdir()), 'agl-al86-remote-'));
+  t.after(() => rm(remote, { recursive: true, force: true }));
+  assert.equal((await git(remote, ['init', '-q', '--bare', '-b', 'main'])).code, 0);
+  const fx = await fixture(t, { push: true, sync: false, syncCommit: () => null });
+  assert.equal((await git(fx.dir, ['remote', 'add', 'origin', remote])).code, 0);
+  await writeTracked(fx);
+  assert.equal(await fx.commit(), 'committed');
+  assert.doesNotMatch((await headRaw(fx.dir)).toString('utf8'), /gpgsig/);
+  assert.equal((await git(fx.dir, ['log', '-1', '--format=%cn'])).stdout.trim(), 'agent-ledger test');
+  assert.match((await git(remote, ['for-each-ref'])).stdout, /refs\/heads\/main/);
 });
 
 test('onCommitted fires once per commit, never on clean; a throwing hook cannot fail the commit', async (t) => {

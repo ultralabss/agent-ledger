@@ -220,8 +220,10 @@ export class Ledger {
       },
       ...(deps.heavyAllowed === undefined ? {} : { heavyAllowed: deps.heavyAllowed }),
       ...(deps.heavyRetryInMs === undefined ? {} : { heavyRetryInMs: deps.heavyRetryInMs }),
-      // F3b: with LEDGER_SYNC=1 commits are signed by this device and the legacy push is off; the APPLY
-      // marker pauses commits in every mode.
+      // F3b: with LEDGER_SYNC=1 the legacy push is off; the APPLY marker pauses commits in every mode.
+      // AL-86: the identity provider is ALWAYS passed and asked at every commit: an enrolled ledger
+      // (devices.yml / device key present) signs every commit or makes none and never legacy-pushes,
+      // whatever LEDGER_SYNC says; a non-enrolled one commits as before.
       sync: deps.config.sync,
       inflightMarker: this.paths.inflightMarker,
       syncCommit: () => this.syncCommitIdentity(),
@@ -229,7 +231,7 @@ export class Ledger {
   }
 
   /**
-   * Who signs a sync-mode commit; lazy because the device identity only exists after `init()`.
+   * Who signs a commit (AL-86: every commit, sync on or off); lazy because the device identity only exists after `init()`.
    * `null` = this ledger is not enrolled (no `devices.yml`, no device key) → commits stay as before.
    * "Enrolled" is deliberately NOT "the key file exists": a deleted key under an existing `devices.yml`
    * must end in a refused commit (`syncCommit` throws on the missing key via git), never in an unsigned one.
